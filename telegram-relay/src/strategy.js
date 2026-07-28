@@ -48,14 +48,31 @@ export function smoothedMA(values, len) {
   return out;
 }
 
-export function computeTrend(closes, maLens = MA_LENS) {
+// CONFIRM_BARS requires the trend condition to hold for this many consecutive
+// 5-minute bars (not just the current one) before it counts. A single sharp
+// spike can flip the raw MA stack for one bar even while the broader move is
+// still the other way - requiring it to persist filters that out.
+export const CONFIRM_BARS = 6; // 30 minutes at 5-min candles
+
+export function computeTrend(closes, maLens = MA_LENS, confirmBars = CONFIRM_BARS) {
   const ma21 = smoothedMA(closes, maLens.fast);
   const ma50 = smoothedMA(closes, maLens.mid);
   const ma200 = smoothedMA(closes, maLens.slow);
-  const i = closes.length - 1;
-  if (ma21[i] == null || ma50[i] == null || ma200[i] == null) return "none";
-  if (closes[i] > ma200[i] && ma21[i] > ma50[i] && ma50[i] > ma200[i]) return "up";
-  if (closes[i] < ma200[i] && ma21[i] < ma50[i] && ma50[i] < ma200[i]) return "down";
+  const n = closes.length;
+  const start = n - confirmBars;
+  if (start < 0) return "none";
+
+  let allUp = true;
+  let allDown = true;
+  for (let i = start; i < n; i++) {
+    if (ma21[i] == null || ma50[i] == null || ma200[i] == null) return "none";
+    const up = closes[i] > ma200[i] && ma21[i] > ma50[i] && ma50[i] > ma200[i];
+    const down = closes[i] < ma200[i] && ma21[i] < ma50[i] && ma50[i] < ma200[i];
+    if (!up) allUp = false;
+    if (!down) allDown = false;
+  }
+  if (allUp) return "up";
+  if (allDown) return "down";
   return "none";
 }
 
