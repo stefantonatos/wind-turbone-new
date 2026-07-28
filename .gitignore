@@ -2,3 +2,6 @@ node_modules/
 __pycache__/
 *.pyc
 .wrangler/
+copier/config.py
+copier/*.session
+copier/*.session-journal
