@@ -20,6 +20,16 @@ const PAIRS = [
 const INTERVAL = "5min";
 const OUTPUT_SIZE = 300; // bars of warmup history for the 200-period MA
 
+// Secrets Store bindings expose the value via an async .get() rather than as
+// a plain string on env - this works whether a binding came from Secrets
+// Store (dashboard) or a plain `wrangler secret put` string binding.
+async function resolveSecret(binding) {
+  if (binding == null) return undefined;
+  if (typeof binding === "string") return binding;
+  if (typeof binding.get === "function") return await binding.get();
+  return undefined;
+}
+
 // Trading window: 08:00 to 02:30 (next day), Europe/London local time.
 // Wraps past midnight, so "active" means >= start OR <= end.
 function isWithinTradingWindow(now = new Date()) {
@@ -57,10 +67,12 @@ async function fetchCandles(symbol, apiKey) {
 }
 
 async function sendTelegram(env, text) {
-  const resp = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  const token = await resolveSecret(env.TELEGRAM_BOT_TOKEN);
+  const chatId = await resolveSecret(env.TELEGRAM_CHAT_ID);
+  const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "Markdown" }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
   });
   if (!resp.ok) {
     throw new Error(`Telegram error: ${await resp.text()}`);
@@ -68,7 +80,8 @@ async function sendTelegram(env, text) {
 }
 
 async function checkPair(env, pair) {
-  const candles = await fetchCandles(pair.symbol, env.TWELVEDATA_API_KEY);
+  const apiKey = await resolveSecret(env.TWELVEDATA_API_KEY);
+  const candles = await fetchCandles(pair.symbol, apiKey);
   if (candles.length < MA_LENS.slow + 5) {
     return { symbol: pair.symbol, skipped: "not enough history" };
   }
@@ -135,7 +148,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     const secret = url.searchParams.get("secret");
-    if (!env.WEBHOOK_SECRET || secret !== env.WEBHOOK_SECRET) {
+    const expectedSecret = await resolveSecret(env.WEBHOOK_SECRET);
+    if (!expectedSecret || secret !== expectedSecret) {
       return new Response("Unauthorized", { status: 401 });
     }
     if (url.searchParams.get("ping") === "1") {
