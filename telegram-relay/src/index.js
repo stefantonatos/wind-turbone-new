@@ -48,7 +48,10 @@ function isWithinTradingWindow(now = new Date()) {
 }
 
 async function fetchCandles(symbol, apiKey, outputSize = OUTPUT_SIZE) {
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${INTERVAL}&outputsize=${outputSize}&apikey=${apiKey}`;
+  // timezone=UTC is explicit here - without it we were trusting TwelveData's
+  // default (not verified to be UTC) and then mislabeling whatever it gave
+  // us as "UTC" in the alert message, which produced wrong/confusing times.
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${INTERVAL}&outputsize=${outputSize}&timezone=UTC&apikey=${apiKey}`;
   const resp = await fetch(url);
   const data = await resp.json();
   if (!data.values) {
@@ -113,10 +116,14 @@ async function checkPair(env, pair) {
   const tpPips = Math.round(slPips * 2 * 10) / 10;
   const emoji = side === "BUY" ? "\u{1F7E2}" : "\u{1F534}";
 
+  // current.time is now a true UTC "YYYY-MM-DD HH:MM:SS" string (timezone=UTC
+  // on the request), so this is safe to parse as UTC directly.
+  const candleAgeMinutes = Math.round((Date.now() - Date.parse(`${current.time}Z`)) / 60000);
+
   const text = [
     `${emoji} *${side} SETUP* - ${pair.symbol}`,
     `Candle close (${INTERVAL}): ${current.close}`,
-    `Time: ${current.time} UTC`,
+    `Time: ${current.time} UTC (~${candleAgeMinutes} min ago)`,
     `Trend: ${trend}, RSI: ${currentRSI.toFixed(1)}`,
     `Suggested SL: ${slPips} pips, TP: ${tpPips} pips (2:1)`,
   ].join("\n");
