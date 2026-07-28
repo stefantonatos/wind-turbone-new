@@ -5,7 +5,9 @@
 // the Telegram bot sends you.
 //
 // Setup = trend-aligned arrow (3 Line Strike or Engulfing) + RSI vs 50,
-// gated by a 21/50/200 smoothed-MA trend stack.
+// gated by a 21/50/200 smoothed-MA trend stack that must hold for 6
+// consecutive bars (30 min at 5-min candles) - a single-bar spike no
+// longer counts as a trend flip.
 //@version=4
 study(title="Combined Buy/Sell Setup (visual reference)", shorttitle="Setup Ref", overlay=true)
 
@@ -19,8 +21,12 @@ ma21 = smmaOf(close, 21)
 ma50 = smmaOf(close, 50)
 ma200 = smmaOf(close, 200)
 
-uptrend = close > ma200 and ma21 > ma50 and ma50 > ma200
-downtrend = close < ma200 and ma21 < ma50 and ma50 < ma200
+upAt(offset) => close[offset] > ma200[offset] and ma21[offset] > ma50[offset] and ma50[offset] > ma200[offset]
+downAt(offset) => close[offset] < ma200[offset] and ma21[offset] < ma50[offset] and ma50[offset] < ma200[offset]
+
+// CONFIRM_BARS = 6: the trend must hold for the current bar plus the 5 before it.
+uptrend = upAt(0) and upAt(1) and upAt(2) and upAt(3) and upAt(4) and upAt(5)
+downtrend = downAt(0) and downAt(1) and downAt(2) and downAt(3) and downAt(4) and downAt(5)
 
 // --- Arrow: 3 Line Strike or Engulfing ---
 strike3Bull = close[3] < open[3] and close[2] < open[2] and close[1] < open[1] and close > open[1]
