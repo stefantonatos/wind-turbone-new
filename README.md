@@ -89,12 +89,15 @@ this candle), or errored.
 
 ## Changing pairs, timeframe, or window
 
-Everything lives in `telegram-relay/src/index.js`:
+Most of this lives in `telegram-relay/src/index.js`:
 
 - `PAIRS` — symbol list and pip size per symbol
 - `INTERVAL` — candle timeframe (must be a value TwelveData supports:
   `1min`, `5min`, `15min`, `30min`, `1h`, `4h`, ...)
 - `isWithinTradingWindow` — active hours
-- `RSI_LEN`, `MA_LENS` — indicator periods
+
+Indicator periods (`RSI_LEN`, `MA_LENS`, `CONFIRM_BARS`) live in
+`telegram-relay/src/strategy.js` instead, since that file is shared
+with the backtester.
 
 Redeploy with `npx wrangler deploy` after any change.
