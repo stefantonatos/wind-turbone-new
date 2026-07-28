@@ -47,8 +47,8 @@ function isWithinTradingWindow(now = new Date()) {
   return minutesNow >= startMinutes || minutesNow <= endMinutes;
 }
 
-async function fetchCandles(symbol, apiKey) {
-  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${INTERVAL}&outputsize=${OUTPUT_SIZE}&apikey=${apiKey}`;
+async function fetchCandles(symbol, apiKey, outputSize = OUTPUT_SIZE) {
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${INTERVAL}&outputsize=${outputSize}&apikey=${apiKey}`;
   const resp = await fetch(url);
   const data = await resp.json();
   if (!data.values) {
@@ -64,6 +64,12 @@ async function fetchCandles(symbol, apiKey) {
       close: Number(v.close),
     }))
     .reverse();
+}
+
+function candlesToCSV(candles) {
+  const header = "datetime,open,high,low,close";
+  const rows = candles.map((c) => `${c.time},${c.open},${c.high},${c.low},${c.close}`);
+  return [header, ...rows].join("\n");
 }
 
 async function sendTelegram(env, text) {
@@ -155,6 +161,15 @@ export default {
     if (url.searchParams.get("ping") === "1") {
       await sendTelegram(env, "✅ Test message from the forex setup alert worker.");
       return new Response("Sent test message", { status: 200 });
+    }
+    // Manual historical export for backtesting: GET /?secret=...&export=EUR/USD
+    const exportSymbol = url.searchParams.get("export");
+    if (exportSymbol) {
+      const apiKey = await resolveSecret(env.TWELVEDATA_API_KEY);
+      const candles = await fetchCandles(exportSymbol, apiKey, 5000);
+      return new Response(candlesToCSV(candles), {
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
     }
     const summary = await runAllChecks(env);
     return new Response(JSON.stringify(summary, null, 2), {
