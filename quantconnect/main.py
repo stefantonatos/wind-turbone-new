@@ -49,6 +49,22 @@ class CombinedSetupStrategy(QCAlgorithm):
         self.lows = []
         self.closes = []
 
+        # Persisted trend MAs - updated once per bar, never recomputed from
+        # a trimmed window (a prior version recomputed SmoothedMA from a
+        # ~226-bar rolling buffer every bar, which re-seeds relative to
+        # wherever that window currently starts; with only 26 bars of
+        # margin over a 200-length MA, ~88% of ma200's value was still the
+        # stale re-seed, not the true long-decay average strategy.js
+        # computes over full history. These persist across the whole
+        # backtest instead.)
+        self.ma21_val = None
+        self.ma50_val = None
+        self.ma200_val = None
+        self.ma21_seed = []
+        self.ma50_seed = []
+        self.ma200_seed = []
+        self.trend_hist = []  # last CONFIRM_BARS (close, ma21, ma50, ma200) tuples
+
         self.longSL = None
         self.longTP = None
         self.shortSL = None
@@ -57,10 +73,11 @@ class CombinedSetupStrategy(QCAlgorithm):
         # Explicit flag instead of trusting Portfolio.Invested's timing -
         # if a fill doesn't register in the portfolio instantly, relying on
         # Invested alone risks placing a second (third, fourth...) order
-        # before the first is "seen" as open, stacking position size far
-        # past the intended 1% risk. This flag is set the instant an order
-        # is placed and cleared the instant liquidation is requested, with
-        # no dependency on fill timing.
+        # before the first is "seen" as open/closed, stacking position size
+        # far past the intended 1% risk. Set the instant an entry order is
+        # placed; only cleared once a flat position + no pending orders is
+        # actually confirmed (not merely requested) - true for both a
+        # completed exit and a failed entry.
         self.in_position = False
 
         consolidator = QuoteBarConsolidator(timedelta(minutes=5))
@@ -69,15 +86,20 @@ class CombinedSetupStrategy(QCAlgorithm):
 
     # --- indicator math: direct translations of strategy.js ---
 
-    def SmoothedMA(self, values, length):
-        n = len(values)
-        out = [None] * n
-        for i in range(length - 1, n):
-            if out[i - 1] is None:
-                out[i] = sum(values[i - length + 1:i + 1]) / length
-            else:
-                out[i] = (out[i - 1] * (length - 1) + values[i]) / length
-        return out
+    # Incrementally updates one smoothed MA: accumulates a seed buffer until
+    # `length` values are in, seeds with their plain average, then applies
+    # Wilder-style recursive smoothing forever after - mathematically
+    # identical to strategy.js's smoothedMA() run over the full history from
+    # bar 0, since both are the same seed-then-recurse rule applied in the
+    # same order, just computed incrementally here instead of by batch
+    # recomputing an array each time.
+    def UpdateSMMA(self, current, seed_buf, new_value, length):
+        if current is None:
+            seed_buf.append(new_value)
+            if len(seed_buf) < length:
+                return None, seed_buf
+            return sum(seed_buf) / length, []
+        return (current * (length - 1) + new_value) / length, seed_buf
 
     def WilderRSI(self, closes, length):
         n = len(closes)
@@ -104,22 +126,19 @@ class CombinedSetupStrategy(QCAlgorithm):
             rsi[i] = 100 if avg_loss == 0 else 100 - 100 / (1 + avg_gain / avg_loss)
         return rsi
 
-    def ComputeTrend(self, closes):
-        ma21 = self.SmoothedMA(closes, self.MA_FAST)
-        ma50 = self.SmoothedMA(closes, self.MA_MID)
-        ma200 = self.SmoothedMA(closes, self.MA_SLOW)
-        n = len(closes)
-        start = n - self.CONFIRM_BARS
-        if start < 0:
+    # Trend from the small rolling history of already-computed (persisted)
+    # MA values, rather than recomputing MAs from a trimmed closes array.
+    def ComputeTrendFromHistory(self):
+        if len(self.trend_hist) < self.CONFIRM_BARS:
             return "none"
 
         all_up = True
         all_down = True
-        for i in range(start, n):
-            if ma21[i] is None or ma50[i] is None or ma200[i] is None:
+        for close, ma21, ma50, ma200 in self.trend_hist:
+            if ma21 is None or ma50 is None or ma200 is None:
                 return "none"
-            up = closes[i] > ma200[i] and ma21[i] > ma50[i] and ma50[i] > ma200[i]
-            down = closes[i] < ma200[i] and ma21[i] < ma50[i] and ma50[i] < ma200[i]
+            up = close > ma200 and ma21 > ma50 and ma50 > ma200
+            down = close < ma200 and ma21 < ma50 and ma50 < ma200
             if not up:
                 all_up = False
             if not down:
@@ -158,6 +177,16 @@ class CombinedSetupStrategy(QCAlgorithm):
             self.lows.pop(0)
             self.closes.pop(0)
 
+        # Update the persisted trend MAs every bar, unconditionally, so they
+        # carry forward across the whole backtest instead of being reseeded
+        # from a trimmed window.
+        self.ma21_val, self.ma21_seed = self.UpdateSMMA(self.ma21_val, self.ma21_seed, bar.Close, self.MA_FAST)
+        self.ma50_val, self.ma50_seed = self.UpdateSMMA(self.ma50_val, self.ma50_seed, bar.Close, self.MA_MID)
+        self.ma200_val, self.ma200_seed = self.UpdateSMMA(self.ma200_val, self.ma200_seed, bar.Close, self.MA_SLOW)
+        self.trend_hist.append((bar.Close, self.ma21_val, self.ma50_val, self.ma200_val))
+        if len(self.trend_hist) > self.CONFIRM_BARS:
+            self.trend_hist.pop(0)
+
         holding = self.Portfolio[self.symbol]
 
         # Manage an existing position: check this bar's range against the
@@ -169,25 +198,25 @@ class CombinedSetupStrategy(QCAlgorithm):
             if holding.IsLong:
                 if bar.Low <= self.longSL or bar.High >= self.longTP:
                     self.Liquidate(self.symbol)
-                    self.in_position = False
+                    # NOT clearing in_position here - only once the exit is
+                    # actually confirmed flat (below), same discipline as
+                    # the entry side. Clearing it here on the mere request
+                    # to liquidate (before the fill is confirmed) would
+                    # recreate the exact stacking bug this flag prevents,
+                    # just on the exit side instead of the entry side.
             elif holding.IsShort:
                 if bar.High >= self.shortSL or bar.Low <= self.shortTP:
                     self.Liquidate(self.symbol)
-                    self.in_position = False
             elif not holding.Invested and len(self.Transactions.GetOpenOrders(self.symbol)) == 0:
-                # Only clear the flag if there's genuinely no fill AND no
-                # order still pending - "not invested yet" on its own just
-                # means the fill hasn't registered this bar, and clearing
-                # the flag for that would recreate the exact stacking bug
-                # this flag exists to prevent.
-                self.Debug(f"{self.Time} order for {self.symbol} appears to have failed, clearing flag")
+                # Confirmed flat with nothing pending - safe to clear,
+                # whether this was a completed exit or a failed entry order.
                 self.in_position = False
             return  # don't look for new signals while a trade is open/pending
 
         if len(self.closes) < self.MA_SLOW + self.CONFIRM_BARS:
             return
 
-        trend = self.ComputeTrend(self.closes)
+        trend = self.ComputeTrendFromHistory()
         bull_arrow, bear_arrow = self.ComputeArrows(self.opens, self.closes)
         rsi_series = self.WilderRSI(self.closes, self.RSI_LEN)
         current_rsi = rsi_series[-1]
