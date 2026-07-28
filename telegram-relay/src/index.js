@@ -3,6 +3,13 @@
 // 21/50/200 smoothed-MA trend stack), and messages Telegram when it fires.
 // Runs on a Cloudflare Cron Trigger (see wrangler.toml) - no TradingView
 // alert / paid plan involved.
+//
+// The indicator/strategy math itself (RSI, smoothed MAs, trend gate, arrow
+// patterns, buy/sell setup combination) lives in ./strategy.js so the
+// offline backtester (backtester/backtest.js) can reuse the exact same
+// logic instead of a re-derived copy.
+
+import { MA_LENS, evaluateSetup } from "./strategy.js";
 
 const PAIRS = [
   { symbol: "EUR/USD", pip: 0.0001 },
@@ -12,8 +19,6 @@ const PAIRS = [
 
 const INTERVAL = "5min";
 const OUTPUT_SIZE = 300; // bars of warmup history for the 200-period MA
-const RSI_LEN = 14;
-const MA_LENS = { fast: 21, mid: 50, slow: 200 };
 
 // Trading window: 08:00 to 02:30 (next day), Europe/London local time.
 // Wraps past midnight, so "active" means >= start OR <= end.
@@ -30,75 +35,6 @@ function isWithinTradingWindow(now = new Date()) {
   const startMinutes = 8 * 60; // 08:00
   const endMinutes = 2 * 60 + 30; // 02:30
   return minutesNow >= startMinutes || minutesNow <= endMinutes;
-}
-
-// Wilder's RSI - matches Pine's built-in rsi().
-function wilderRSI(closes, len) {
-  const rsi = new Array(closes.length).fill(null);
-  if (closes.length < len + 1) return rsi;
-  let gainSum = 0;
-  let lossSum = 0;
-  for (let i = 1; i <= len; i++) {
-    const change = closes[i] - closes[i - 1];
-    if (change >= 0) gainSum += change;
-    else lossSum -= change;
-  }
-  let avgGain = gainSum / len;
-  let avgLoss = lossSum / len;
-  rsi[len] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-  for (let i = len + 1; i < closes.length; i++) {
-    const change = closes[i] - closes[i - 1];
-    const gain = change > 0 ? change : 0;
-    const loss = change < 0 ? -change : 0;
-    avgGain = (avgGain * (len - 1) + gain) / len;
-    avgLoss = (avgLoss * (len - 1) + loss) / len;
-    rsi[i] = avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss);
-  }
-  return rsi;
-}
-
-// Matches the smma pattern from the source Pine scripts: seeded with an
-// SMA(len), then Wilder-style smoothing from there on.
-function smoothedMA(values, len) {
-  const out = new Array(values.length).fill(null);
-  for (let i = len - 1; i < values.length; i++) {
-    if (out[i - 1] == null) {
-      let sum = 0;
-      for (let j = i - len + 1; j <= i; j++) sum += values[j];
-      out[i] = sum / len;
-    } else {
-      out[i] = (out[i - 1] * (len - 1) + values[i]) / len;
-    }
-  }
-  return out;
-}
-
-function computeTrend(closes) {
-  const ma21 = smoothedMA(closes, MA_LENS.fast);
-  const ma50 = smoothedMA(closes, MA_LENS.mid);
-  const ma200 = smoothedMA(closes, MA_LENS.slow);
-  const i = closes.length - 1;
-  if (ma21[i] == null || ma50[i] == null || ma200[i] == null) return "none";
-  if (closes[i] > ma200[i] && ma21[i] > ma50[i] && ma50[i] > ma200[i]) return "up";
-  if (closes[i] < ma200[i] && ma21[i] < ma50[i] && ma50[i] < ma200[i]) return "down";
-  return "none";
-}
-
-function computeArrows(candles) {
-  const n = candles.length - 1;
-  if (n < 3) return { bull: false, bear: false };
-  const c0 = candles[n];
-  const c1 = candles[n - 1];
-  const c2 = candles[n - 2];
-  const c3 = candles[n - 3];
-
-  const strike3Bull = c3.close < c3.open && c2.close < c2.open && c1.close < c1.open && c0.close > c1.open;
-  const strike3Bear = c3.close > c3.open && c2.close > c2.open && c1.close > c1.open && c0.close < c1.open;
-
-  const engulfBull = c0.open <= c1.close && c0.open < c1.open && c0.close > c1.open;
-  const engulfBear = c0.open >= c1.close && c0.open > c1.open && c0.close < c1.open;
-
-  return { bull: strike3Bull || engulfBull, bear: strike3Bear || engulfBear };
 }
 
 async function fetchCandles(symbol, apiKey) {
@@ -137,15 +73,8 @@ async function checkPair(env, pair) {
     return { symbol: pair.symbol, skipped: "not enough history" };
   }
 
-  const closes = candles.map((c) => c.close);
-  const trend = computeTrend(closes);
-  const arrows = computeArrows(candles);
-  const rsi = wilderRSI(closes, RSI_LEN);
   const current = candles[candles.length - 1];
-  const currentRSI = rsi[rsi.length - 1];
-
-  const buySetup = trend === "up" && arrows.bull && currentRSI > 50;
-  const sellSetup = trend === "down" && arrows.bear && currentRSI < 50;
+  const { trend, currentRSI, buySetup, sellSetup } = evaluateSetup(candles);
 
   if (!buySetup && !sellSetup) {
     return { symbol: pair.symbol, skipped: "no setup", trend, currentRSI };
