@@ -25,7 +25,7 @@ class CombinedSetupStrategy(QCAlgorithm):
 
     def Initialize(self):
         self.SetStartDate(2024, 1, 1)
-        self.SetEndDate(2025, 1, 1)
+        self.SetEndDate(2024, 1, 3)  # TEMPORARY: short diagnostic window, see OnOrderEvent below. Revert to 2025,1,1 once the order-fill bug is confirmed/fixed.
         self.SetCash(10000)
 
         self.symbol = self.AddForex("EURUSD", Resolution.Minute, Market.Oanda).Symbol
@@ -163,6 +163,17 @@ class CombinedSetupStrategy(QCAlgorithm):
     # sit resting against a position that no longer exists (which would
     # otherwise open an unwanted new position later if price reached it).
     def OnOrderEvent(self, order_event):
+        # DIAGNOSTIC: log every status transition (Submitted, Filled,
+        # Invalid, Canceled, ...) - not just Filled - to find out whether
+        # entry orders are actually being filled at all. The last backtest
+        # showed equity frozen bit-for-bit across 25+ consecutive "ENTRY"
+        # log lines, which only happens if those orders had zero effect on
+        # the portfolio - i.e. they're very likely never filling.
+        self.Debug(
+            f"{self.Time} ORDER id={order_event.OrderId} status={order_event.Status} "
+            f"symbol={order_event.Symbol.Value} fill_qty={order_event.FillQuantity} "
+            f"fill_price={order_event.FillPrice} msg={order_event.Message}"
+        )
         if order_event.Status != OrderStatus.Filled:
             return
         if self.sl_ticket is not None and order_event.OrderId == self.sl_ticket.OrderId:
