@@ -49,6 +49,11 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         self.shortSL = None
         self.shortTP = None
 
+        # Explicit flag instead of trusting Portfolio.Invested's timing - see
+        # main.py for why: a lagging fill could let a second order stack on
+        # top of the first, blowing past the intended 1% risk.
+        self.in_position = False
+
         consolidator = QuoteBarConsolidator(timedelta(minutes=5))
         consolidator.DataConsolidated += self.OnFiveMinuteBar
         self.SubscriptionManager.AddConsolidator(self.symbol, consolidator)
@@ -94,14 +99,18 @@ class DonchianBreakoutStrategy(QCAlgorithm):
 
         holding = self.Portfolio[self.symbol]
 
-        if holding.Invested:
+        if self.in_position:
             if holding.IsLong:
                 if bar.Low <= self.longSL or bar.High >= self.longTP:
                     self.Liquidate(self.symbol)
+                    self.in_position = False
             elif holding.IsShort:
                 if bar.High >= self.shortSL or bar.Low <= self.shortTP:
                     self.Liquidate(self.symbol)
-            return  # don't look for new signals while a trade is open
+                    self.in_position = False
+            elif not holding.Invested:
+                self.in_position = False
+            return  # don't look for new signals while a trade is open/pending
 
         min_needed = max(self.DONCHIAN_LEN, self.ATR_LEN) + 1
         if len(self.closes) < min_needed:
@@ -138,11 +147,18 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         max_quantity = (equity * self.MAX_LEVERAGE) / price
         quantity = min(quantity, max_quantity)
 
+        self.Debug(
+            f"{self.Time} ENTRY {'BUY' if buy_setup else 'SELL'} equity={equity:.2f} "
+            f"qty={quantity:.0f} sl_dist={sl_distance:.5f} risk$={risk_amount:.2f}"
+        )
+
         if buy_setup:
             self.longSL = price - sl_distance
             self.longTP = price + tp_distance
+            self.in_position = True
             self.MarketOrder(self.symbol, quantity)
         elif sell_setup:
             self.shortSL = price + sl_distance
             self.shortTP = price - tp_distance
+            self.in_position = True
             self.MarketOrder(self.symbol, -quantity)

@@ -54,6 +54,15 @@ class CombinedSetupStrategy(QCAlgorithm):
         self.shortSL = None
         self.shortTP = None
 
+        # Explicit flag instead of trusting Portfolio.Invested's timing -
+        # if a fill doesn't register in the portfolio instantly, relying on
+        # Invested alone risks placing a second (third, fourth...) order
+        # before the first is "seen" as open, stacking position size far
+        # past the intended 1% risk. This flag is set the instant an order
+        # is placed and cleared the instant liquidation is requested, with
+        # no dependency on fill timing.
+        self.in_position = False
+
         consolidator = QuoteBarConsolidator(timedelta(minutes=5))
         consolidator.DataConsolidated += self.OnFiveMinuteBar
         self.SubscriptionManager.AddConsolidator(self.symbol, consolidator)
@@ -152,15 +161,25 @@ class CombinedSetupStrategy(QCAlgorithm):
         holding = self.Portfolio[self.symbol]
 
         # Manage an existing position: check this bar's range against the
-        # SL/TP locked in when the trade opened.
-        if holding.Invested:
+        # SL/TP locked in when the trade opened. Uses self.in_position (set
+        # the instant an order is placed) rather than holding.Invested,
+        # which may lag the actual fill by a bar and allow a second order to
+        # stack on top of the first.
+        if self.in_position:
             if holding.IsLong:
                 if bar.Low <= self.longSL or bar.High >= self.longTP:
                     self.Liquidate(self.symbol)
+                    self.in_position = False
             elif holding.IsShort:
                 if bar.High >= self.shortSL or bar.Low <= self.shortTP:
                     self.Liquidate(self.symbol)
-            return  # don't look for new signals while a trade is open
+                    self.in_position = False
+            elif not holding.Invested:
+                # Order was placed but doesn't appear to have filled and
+                # there's nothing open - clear the flag so the strategy
+                # doesn't get stuck refusing to trade forever.
+                self.in_position = False
+            return  # don't look for new signals while a trade is open/pending
 
         if len(self.closes) < self.MA_SLOW + self.CONFIRM_BARS:
             return
@@ -199,11 +218,18 @@ class CombinedSetupStrategy(QCAlgorithm):
         max_quantity = (equity * self.MAX_LEVERAGE) / price
         quantity = min(quantity, max_quantity)
 
+        self.Debug(
+            f"{self.Time} ENTRY {'BUY' if buy_setup else 'SELL'} equity={equity:.2f} "
+            f"qty={quantity:.0f} sl_dist={sl_distance:.5f} risk$={risk_amount:.2f}"
+        )
+
         if buy_setup:
             self.longSL = price - sl_distance
             self.longTP = price + tp_distance
+            self.in_position = True
             self.MarketOrder(self.symbol, quantity)
         elif sell_setup:
             self.shortSL = price + sl_distance
             self.shortTP = price - tp_distance
+            self.in_position = True
             self.MarketOrder(self.symbol, -quantity)
