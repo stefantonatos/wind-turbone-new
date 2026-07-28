@@ -34,6 +34,8 @@ class CombinedSetupStrategy(QCAlgorithm):
         self.REVERSE_SIGNALS = False  # flip to True to test the reversed direction
         self.REWARD_RISK = 1.0        # TP distance = SL distance x this. 2.0 = the original 2:1 rule
         self.RISK_PERCENT = 0.01      # fraction of equity risked per trade
+        self.MIN_SL_PIPS = 3          # floor so a near-zero candle range can't blow up position size
+        self.MAX_LEVERAGE = 10        # safety cap: position notional can't exceed this x equity
         self.RSI_LEN = 14
         self.MA_FAST = 21
         self.MA_MID = 50
@@ -182,12 +184,20 @@ class CombinedSetupStrategy(QCAlgorithm):
 
         price = bar.Close
 
-        sl_distance = current_range * 2
+        # Floor prevents a near-zero candle range from producing an absurd
+        # position size (e.g. a 0.3-pip range would otherwise size a
+        # "1%-risk" trade at 10+ standard lots on a $10k account).
+        sl_distance = max(current_range * 2, self.MIN_SL_PIPS * self.PIP)
         tp_distance = sl_distance * self.REWARD_RISK
 
         equity = self.Portfolio.TotalPortfolioValue
         risk_amount = equity * self.RISK_PERCENT
         quantity = risk_amount / sl_distance
+
+        # Second safety net: cap notional exposure regardless of how the
+        # risk math worked out.
+        max_quantity = (equity * self.MAX_LEVERAGE) / price
+        quantity = min(quantity, max_quantity)
 
         if buy_setup:
             self.longSL = price - sl_distance

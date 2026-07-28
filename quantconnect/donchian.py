@@ -33,6 +33,9 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         self.REVERSE_SIGNALS = False  # flip to True to fade the breakout instead
         self.REWARD_RISK = 2.0        # TP distance = SL distance x this
         self.RISK_PERCENT = 0.01      # fraction of equity risked per trade
+        self.MIN_SL_PIPS = 3          # floor so a near-zero ATR can't blow up position size
+        self.MAX_LEVERAGE = 10        # safety cap: position notional can't exceed this x equity
+        self.PIP = 0.0001
         self.DONCHIAN_LEN = 20
         self.ATR_LEN = 14
 
@@ -120,12 +123,20 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         if not buy_setup and not sell_setup:
             return
 
-        sl_distance = current_atr * 2
+        # Floor prevents a near-zero ATR from producing an absurd position
+        # size (ATR got as low as 0.7 pips in real data, which unfloored
+        # would size a "1%-risk" trade at 7+ standard lots on a $10k account).
+        sl_distance = max(current_atr * 2, self.MIN_SL_PIPS * self.PIP)
         tp_distance = sl_distance * self.REWARD_RISK
 
         equity = self.Portfolio.TotalPortfolioValue
         risk_amount = equity * self.RISK_PERCENT
         quantity = risk_amount / sl_distance
+
+        # Second safety net: cap notional exposure regardless of how the
+        # risk math worked out.
+        max_quantity = (equity * self.MAX_LEVERAGE) / price
+        quantity = min(quantity, max_quantity)
 
         if buy_setup:
             self.longSL = price - sl_distance
