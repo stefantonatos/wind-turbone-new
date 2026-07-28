@@ -174,10 +174,13 @@ class CombinedSetupStrategy(QCAlgorithm):
                 if bar.High >= self.shortSL or bar.Low <= self.shortTP:
                     self.Liquidate(self.symbol)
                     self.in_position = False
-            elif not holding.Invested:
-                # Order was placed but doesn't appear to have filled and
-                # there's nothing open - clear the flag so the strategy
-                # doesn't get stuck refusing to trade forever.
+            elif not holding.Invested and len(self.Transactions.GetOpenOrders(self.symbol)) == 0:
+                # Only clear the flag if there's genuinely no fill AND no
+                # order still pending - "not invested yet" on its own just
+                # means the fill hasn't registered this bar, and clearing
+                # the flag for that would recreate the exact stacking bug
+                # this flag exists to prevent.
+                self.Debug(f"{self.Time} order for {self.symbol} appears to have failed, clearing flag")
                 self.in_position = False
             return  # don't look for new signals while a trade is open/pending
 

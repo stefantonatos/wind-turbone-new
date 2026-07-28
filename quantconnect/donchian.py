@@ -108,7 +108,11 @@ class DonchianBreakoutStrategy(QCAlgorithm):
                 if bar.High >= self.shortSL or bar.Low <= self.shortTP:
                     self.Liquidate(self.symbol)
                     self.in_position = False
-            elif not holding.Invested:
+            elif not holding.Invested and len(self.Transactions.GetOpenOrders(self.symbol)) == 0:
+                # Only clear if genuinely no fill AND no order still
+                # pending - see main.py for why "not invested yet" alone
+                # isn't safe to treat as a failed order.
+                self.Debug(f"{self.Time} order for {self.symbol} appears to have failed, clearing flag")
                 self.in_position = False
             return  # don't look for new signals while a trade is open/pending
 
