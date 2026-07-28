@@ -1,0 +1,83 @@
+// Combined Buy/Sell Setup - TradingView Strategy Tester version
+// Same rules as pine/combined-setup-alert.pine (trend-aligned 3 Line Strike
+// / Engulfing arrow + RSI vs 50, gated by a 21/50/200 smoothed-MA trend
+// stack held for 6 consecutive bars), but declared as a strategy() so it
+// gets a Strategy Tester tab (Overview / Performance Summary / List of
+// Trades) instead of just plotting shapes.
+//
+// Caveats:
+// - TradingView's free plan only backtests ~5000 bars of history (roughly
+//   2-3 weeks on 5-min candles). Full history needs a paid "Deep
+//   Backtesting" plan.
+// - The dollar P&L TradingView shows is NOT precise for forex without
+//   proper lot/contract sizing - treat win rate, R-multiples, and the
+//   trade list as the meaningful numbers to compare against the offline
+//   backtester (backtester/backtest.js), not the $ figures.
+// - This does not place any real trades - it's a TradingView-side
+//   simulation only, same as any other strategy script.
+//@version=4
+strategy(title="Combined Buy/Sell Setup - Backtest", shorttitle="Setup Strategy", overlay=true, pyramiding=0, default_qty_type=strategy.fixed, default_qty_value=100000, calc_on_every_tick=false)
+
+// --- Trend: 21/50/200 smoothed MA stack + price vs 200 ---
+smmaOf(src, len) =>
+	out = 0.0
+	out := na(out[1]) ? sma(src, len) : (out[1] * (len - 1) + src) / len
+	out
+
+ma21 = smmaOf(close, 21)
+ma50 = smmaOf(close, 50)
+ma200 = smmaOf(close, 200)
+
+upAt(offset) => close[offset] > ma200[offset] and ma21[offset] > ma50[offset] and ma50[offset] > ma200[offset]
+downAt(offset) => close[offset] < ma200[offset] and ma21[offset] < ma50[offset] and ma50[offset] < ma200[offset]
+
+// CONFIRM_BARS = 6: the trend must hold for the current bar plus the 5 before it.
+uptrend = upAt(0) and upAt(1) and upAt(2) and upAt(3) and upAt(4) and upAt(5)
+downtrend = downAt(0) and downAt(1) and downAt(2) and downAt(3) and downAt(4) and downAt(5)
+
+// --- Arrow: 3 Line Strike or Engulfing ---
+strike3Bull = close[3] < open[3] and close[2] < open[2] and close[1] < open[1] and close > open[1]
+strike3Bear = close[3] > open[3] and close[2] > open[2] and close[1] > open[1] and close < open[1]
+
+openPrev = open[1]
+closePrev = close[1]
+engulfBull = open <= closePrev and open < openPrev and close > openPrev
+engulfBear = open >= closePrev and open > openPrev and close < openPrev
+
+arrowBull = strike3Bull or engulfBull
+arrowBear = strike3Bear or engulfBear
+
+// --- RSI vs 50 (plain, no smoothing) ---
+osc = rsi(close, 14)
+rsiBullish = osc > 50
+rsiBearish = osc < 50
+
+// --- Combined setup ---
+buySetup = uptrend and arrowBull and rsiBullish
+sellSetup = downtrend and arrowBear and rsiBearish
+
+plotshape(buySetup, title="Buy Setup", style=shape.labelup, location=location.belowbar, color=color.green, textcolor=color.white, text="BUY", size=size.small)
+plotshape(sellSetup, title="Sell Setup", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, text="SELL", size=size.small)
+
+// --- Entries + SL/TP (2x range SL, 4x range TP - 2:1), same formula as the
+// live Telegram alert. Levels are locked in at entry time via var so they
+// don't drift on later bars while a trade is still open. ---
+sigRange = high - low
+
+var float longSL = na
+var float longTP = na
+var float shortSL = na
+var float shortTP = na
+
+if buySetup
+    longSL := close - sigRange * 2
+    longTP := close + sigRange * 4
+    strategy.entry("Buy", strategy.long)
+
+if sellSetup
+    shortSL := close + sigRange * 2
+    shortTP := close - sigRange * 4
+    strategy.entry("Sell", strategy.short)
+
+strategy.exit("Buy Exit", from_entry="Buy", stop=longSL, limit=longTP)
+strategy.exit("Sell Exit", from_entry="Sell", stop=shortSL, limit=shortTP)

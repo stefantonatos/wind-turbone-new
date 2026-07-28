@@ -29,6 +29,14 @@ indicator, purely so you can visually sanity-check the `BUY`/`SELL`
 labels against what the bot sends you. It is **not** wired to any
 TradingView alert — no paid plan needed anywhere in this setup.
 
+`pine/combined-setup-strategy.pine` is the same rules again, but declared
+as a `strategy()` so TradingView's own Strategy Tester (Performance
+Summary, List of Trades) can backtest it directly on the chart. Free-plan
+history is limited to ~5000 bars (~2-3 weeks on 5-min candles), and the
+dollar P&L it shows isn't precise for forex without proper lot sizing —
+treat win rate and trade count as the numbers worth comparing against
+`backtester/backtest.js`'s output, not the $ figures.
+
 ## 1. Get a free TwelveData API key
 
 1. Sign up at https://twelvedata.com/pricing (Basic/free plan — email
