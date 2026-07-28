@@ -109,3 +109,66 @@ export function evaluateSetup(candles, { rsiLen = RSI_LEN, maLens = MA_LENS } = 
 
   return { trend, arrows, currentRSI, buySetup, sellSetup };
 }
+
+// --- Donchian channel breakout (Turtle Trading style) ---
+// The most credibly-evidenced mechanical strategy out of everything
+// researched: a real documented 1980s track record. Breakout of an N-bar
+// high/low, with an ATR-based stop instead of the candle-range heuristic
+// used above - ATR is the standard volatility measure this style of
+// system actually uses.
+
+export const DONCHIAN_LEN = 20; // bars in the breakout channel
+export const ATR_LEN = 14;
+
+// Wilder's ATR - same smoothing pattern as wilderRSI.
+export function atr(candles, len = ATR_LEN) {
+  const out = new Array(candles.length).fill(null);
+  if (candles.length < len + 1) return out;
+
+  const tr = new Array(candles.length).fill(null);
+  for (let i = 1; i < candles.length; i++) {
+    const c = candles[i];
+    const prevClose = candles[i - 1].close;
+    tr[i] = Math.max(c.high - c.low, Math.abs(c.high - prevClose), Math.abs(c.low - prevClose));
+  }
+
+  let sum = 0;
+  for (let i = 1; i <= len; i++) sum += tr[i];
+  let avg = sum / len;
+  out[len] = avg;
+  for (let i = len + 1; i < candles.length; i++) {
+    avg = (avg * (len - 1) + tr[i]) / len;
+    out[i] = avg;
+  }
+  return out;
+}
+
+// Highest high / lowest low over the `len` bars BEFORE the current one
+// (excludes the current bar, so today's own high/low can't count as its
+// own breakout level - that would make every bar trivially a "breakout").
+export function donchianChannel(candles, len = DONCHIAN_LEN) {
+  const n = candles.length;
+  const i = n - 1;
+  if (i - len < 0) return { upper: null, lower: null };
+
+  let upper = -Infinity;
+  let lower = Infinity;
+  for (let j = i - len; j < i; j++) {
+    if (candles[j].high > upper) upper = candles[j].high;
+    if (candles[j].low < lower) lower = candles[j].low;
+  }
+  return { upper, lower };
+}
+
+// candles must be ascending-chronological; evaluated against the last candle.
+export function evaluateBreakout(candles, { donchianLen = DONCHIAN_LEN, atrLen = ATR_LEN } = {}) {
+  const current = candles[candles.length - 1];
+  const { upper, lower } = donchianChannel(candles, donchianLen);
+  const atrSeries = atr(candles, atrLen);
+  const currentATR = atrSeries[atrSeries.length - 1];
+
+  const buySetup = upper != null && currentATR != null && current.close > upper;
+  const sellSetup = lower != null && currentATR != null && current.close < lower;
+
+  return { upper, lower, currentATR, buySetup, sellSetup };
+}
