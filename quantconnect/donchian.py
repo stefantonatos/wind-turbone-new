@@ -58,15 +58,15 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         self.atr_seed = []
         self.prev_close = None
 
-        self.longSL = None
-        self.longTP = None
-        self.shortSL = None
-        self.shortTP = None
-
-        # Explicit flag instead of trusting Portfolio.Invested's timing - see
-        # main.py for why: a lagging fill could let a second order stack on
-        # top of the first, blowing past the intended 1% risk.
-        self.in_position = False
+        # SL/TP are placed as real StopMarketOrder/LimitOrder brackets (see
+        # OnFiveMinuteBar and OnOrderEvent) rather than manually checked
+        # against bar ranges - a custom flag guessing exact fill timing
+        # kept reintroducing the same stacking bug via different paths (see
+        # main.py's history). Whether we're "in a trade" is read directly
+        # from QC's own state every bar: Portfolio quantity and open order
+        # count. No separate flag to get wrong.
+        self.sl_ticket = None
+        self.tp_ticket = None
 
         consolidator = QuoteBarConsolidator(timedelta(minutes=5))
         consolidator.DataConsolidated += self.OnFiveMinuteBar
@@ -101,6 +101,22 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         lower = min(lows[i - length:i])
         return upper, lower
 
+    # Cancel the sibling SL/TP order once one of them fills, so it doesn't
+    # sit resting against a position that no longer exists.
+    def OnOrderEvent(self, order_event):
+        if order_event.Status != OrderStatus.Filled:
+            return
+        if self.sl_ticket is not None and order_event.OrderId == self.sl_ticket.OrderId:
+            if self.tp_ticket is not None:
+                self.tp_ticket.Cancel()
+            self.sl_ticket = None
+            self.tp_ticket = None
+        elif self.tp_ticket is not None and order_event.OrderId == self.tp_ticket.OrderId:
+            if self.sl_ticket is not None:
+                self.sl_ticket.Cancel()
+            self.sl_ticket = None
+            self.tp_ticket = None
+
     # --- main bar handler ---
 
     def OnFiveMinuteBar(self, sender, bar):
@@ -115,25 +131,10 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         # Update persisted ATR every bar, unconditionally.
         current_atr = self.UpdateATR(bar.High, bar.Low, bar.Close, self.ATR_LEN)
 
-        holding = self.Portfolio[self.symbol]
-
-        if self.in_position:
-            if holding.IsLong:
-                if bar.Low <= self.longSL or bar.High >= self.longTP:
-                    self.Liquidate(self.symbol)
-                    # NOT clearing in_position here - only once the exit is
-                    # actually confirmed flat (below). Clearing it on the
-                    # mere request to liquidate, before the fill is
-                    # confirmed, would recreate the exact stacking bug this
-                    # flag prevents, just on the exit side.
-            elif holding.IsShort:
-                if bar.High >= self.shortSL or bar.Low <= self.shortTP:
-                    self.Liquidate(self.symbol)
-            elif not holding.Invested and len(self.Transactions.GetOpenOrders(self.symbol)) == 0:
-                # Confirmed flat with nothing pending - safe to clear,
-                # whether this was a completed exit or a failed entry order.
-                self.in_position = False
-            return  # don't look for new signals while a trade is open/pending
+        # Single source of truth: actual position size, or a bracket order
+        # still resting.
+        if self.Portfolio[self.symbol].Quantity != 0 or len(self.Transactions.GetOpenOrders(self.symbol)) > 0:
+            return
 
         if len(self.closes) < self.DONCHIAN_LEN + 1:
             return
@@ -173,12 +174,10 @@ class DonchianBreakoutStrategy(QCAlgorithm):
         )
 
         if buy_setup:
-            self.longSL = price - sl_distance
-            self.longTP = price + tp_distance
-            self.in_position = True
             self.MarketOrder(self.symbol, quantity)
+            self.sl_ticket = self.StopMarketOrder(self.symbol, -quantity, price - sl_distance)
+            self.tp_ticket = self.LimitOrder(self.symbol, -quantity, price + tp_distance)
         elif sell_setup:
-            self.shortSL = price + sl_distance
-            self.shortTP = price - tp_distance
-            self.in_position = True
             self.MarketOrder(self.symbol, -quantity)
+            self.sl_ticket = self.StopMarketOrder(self.symbol, quantity, price + sl_distance)
+            self.tp_ticket = self.LimitOrder(self.symbol, quantity, price - tp_distance)

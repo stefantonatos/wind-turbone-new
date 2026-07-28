@@ -65,20 +65,15 @@ class CombinedSetupStrategy(QCAlgorithm):
         self.ma200_seed = []
         self.trend_hist = []  # last CONFIRM_BARS (close, ma21, ma50, ma200) tuples
 
-        self.longSL = None
-        self.longTP = None
-        self.shortSL = None
-        self.shortTP = None
-
-        # Explicit flag instead of trusting Portfolio.Invested's timing -
-        # if a fill doesn't register in the portfolio instantly, relying on
-        # Invested alone risks placing a second (third, fourth...) order
-        # before the first is "seen" as open/closed, stacking position size
-        # far past the intended 1% risk. Set the instant an entry order is
-        # placed; only cleared once a flat position + no pending orders is
-        # actually confirmed (not merely requested) - true for both a
-        # completed exit and a failed entry.
-        self.in_position = False
+        # SL/TP are placed as real StopMarketOrder/LimitOrder brackets (see
+        # OnFiveMinuteBar and OnOrderEvent) rather than manually checked
+        # against bar ranges - a custom flag trying to guess exact fill
+        # timing (two previous attempts) kept reintroducing the same
+        # stacking bug via different paths. Whether we're "in a trade" is
+        # now read directly from QC's own state every bar: Portfolio
+        # quantity and open order count. No separate flag to get wrong.
+        self.sl_ticket = None
+        self.tp_ticket = None
 
         consolidator = QuoteBarConsolidator(timedelta(minutes=5))
         consolidator.DataConsolidated += self.OnFiveMinuteBar
@@ -164,6 +159,23 @@ class CombinedSetupStrategy(QCAlgorithm):
 
         return (strike3_bull or engulf_bull), (strike3_bear or engulf_bear)
 
+    # Cancel the sibling SL/TP order once one of them fills, so it doesn't
+    # sit resting against a position that no longer exists (which would
+    # otherwise open an unwanted new position later if price reached it).
+    def OnOrderEvent(self, order_event):
+        if order_event.Status != OrderStatus.Filled:
+            return
+        if self.sl_ticket is not None and order_event.OrderId == self.sl_ticket.OrderId:
+            if self.tp_ticket is not None:
+                self.tp_ticket.Cancel()
+            self.sl_ticket = None
+            self.tp_ticket = None
+        elif self.tp_ticket is not None and order_event.OrderId == self.tp_ticket.OrderId:
+            if self.sl_ticket is not None:
+                self.sl_ticket.Cancel()
+            self.sl_ticket = None
+            self.tp_ticket = None
+
     # --- main bar handler ---
 
     def OnFiveMinuteBar(self, sender, bar):
@@ -187,31 +199,12 @@ class CombinedSetupStrategy(QCAlgorithm):
         if len(self.trend_hist) > self.CONFIRM_BARS:
             self.trend_hist.pop(0)
 
-        holding = self.Portfolio[self.symbol]
-
-        # Manage an existing position: check this bar's range against the
-        # SL/TP locked in when the trade opened. Uses self.in_position (set
-        # the instant an order is placed) rather than holding.Invested,
-        # which may lag the actual fill by a bar and allow a second order to
-        # stack on top of the first.
-        if self.in_position:
-            if holding.IsLong:
-                if bar.Low <= self.longSL or bar.High >= self.longTP:
-                    self.Liquidate(self.symbol)
-                    # NOT clearing in_position here - only once the exit is
-                    # actually confirmed flat (below), same discipline as
-                    # the entry side. Clearing it here on the mere request
-                    # to liquidate (before the fill is confirmed) would
-                    # recreate the exact stacking bug this flag prevents,
-                    # just on the exit side instead of the entry side.
-            elif holding.IsShort:
-                if bar.High >= self.shortSL or bar.Low <= self.shortTP:
-                    self.Liquidate(self.symbol)
-            elif not holding.Invested and len(self.Transactions.GetOpenOrders(self.symbol)) == 0:
-                # Confirmed flat with nothing pending - safe to clear,
-                # whether this was a completed exit or a failed entry order.
-                self.in_position = False
-            return  # don't look for new signals while a trade is open/pending
+        # Single source of truth for "are we already exposed to this
+        # symbol": actual position size, or an SL/TP bracket order still
+        # resting (which stays open for as long as the position is open).
+        # No custom flag, no guessing about fill timing.
+        if self.Portfolio[self.symbol].Quantity != 0 or len(self.Transactions.GetOpenOrders(self.symbol)) > 0:
+            return
 
         if len(self.closes) < self.MA_SLOW + self.CONFIRM_BARS:
             return
@@ -256,12 +249,10 @@ class CombinedSetupStrategy(QCAlgorithm):
         )
 
         if buy_setup:
-            self.longSL = price - sl_distance
-            self.longTP = price + tp_distance
-            self.in_position = True
             self.MarketOrder(self.symbol, quantity)
+            self.sl_ticket = self.StopMarketOrder(self.symbol, -quantity, price - sl_distance)
+            self.tp_ticket = self.LimitOrder(self.symbol, -quantity, price + tp_distance)
         elif sell_setup:
-            self.shortSL = price + sl_distance
-            self.shortTP = price - tp_distance
-            self.in_position = True
             self.MarketOrder(self.symbol, -quantity)
+            self.sl_ticket = self.StopMarketOrder(self.symbol, quantity, price + sl_distance)
+            self.tp_ticket = self.LimitOrder(self.symbol, quantity, price - tp_distance)
