@@ -33,6 +33,7 @@ class CombinedSetupStrategy(QCAlgorithm):
         # --- config: mirrors telegram-relay/src/strategy.js exactly ---
         self.REVERSE_SIGNALS = False  # flip to True to test the reversed direction
         self.REWARD_RISK = 1.0        # TP distance = SL distance x this. 2.0 = the original 2:1 rule
+        self.RISK_PERCENT = 0.01      # fraction of equity risked per trade
         self.RSI_LEN = 14
         self.MA_FAST = 21
         self.MA_MID = 50
@@ -184,11 +185,15 @@ class CombinedSetupStrategy(QCAlgorithm):
         sl_distance = current_range * 2
         tp_distance = sl_distance * self.REWARD_RISK
 
+        equity = self.Portfolio.TotalPortfolioValue
+        risk_amount = equity * self.RISK_PERCENT
+        quantity = risk_amount / sl_distance
+
         if buy_setup:
             self.longSL = price - sl_distance
             self.longTP = price + tp_distance
-            self.SetHoldings(self.symbol, 1.0)
+            self.MarketOrder(self.symbol, quantity)
         elif sell_setup:
             self.shortSL = price + sl_distance
             self.shortTP = price - tp_distance
-            self.SetHoldings(self.symbol, -1.0)
+            self.MarketOrder(self.symbol, -quantity)
