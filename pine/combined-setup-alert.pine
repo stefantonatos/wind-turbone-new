@@ -1,29 +1,31 @@
-// Combined Buy/Sell Setup Alert
-// Merges the arrow signals from "TMA Overlay" (3 Line Strike + Engulfing Candle)
-// with the RSI confirmation from "TMA - RSI Divergence Indicator"
-// (RSI line vs its own 50-period smoothed average) into a single alert-firing
-// script. Add this to your chart alongside your existing indicators, then
-// create a TradingView alert on "Buy Setup" / "Sell Setup" with a webhook URL.
+// Combined Buy/Sell Setup - visual reference only
+// This mirrors the logic the Cloudflare Worker (telegram-relay/) runs on its
+// own poll of price data - it is NOT wired to any TradingView alert. Add it
+// to your chart to visually sanity-check the BUY/SELL labels against what
+// the Telegram bot sends you.
+//
+// Setup = trend-aligned arrow (3 Line Strike or Engulfing) + RSI vs 50,
+// gated by a 21/50/200 smoothed-MA trend stack.
 //@version=4
-study(title="Combined Buy/Sell Setup Alert", shorttitle="Setup Alert", overlay=true)
+study(title="Combined Buy/Sell Setup (visual reference)", shorttitle="Setup Ref", overlay=true)
 
-// --- RSI + smoothed RSI (from TMA - RSI Divergence Indicator) ---
-rsiLen = 14
-osc = rsi(close, rsiLen)
+// --- Trend: 21/50/200 smoothed MA stack + price vs 200 ---
+smmaOf(src, len) =>
+	out = 0.0
+	out := na(out[1]) ? sma(src, len) : (out[1] * (len - 1) + src) / len
+	out
 
-smmaLen = 50
-smma = 0.0
-smma := na(smma[1]) ? sma(osc, smmaLen) : (smma[1] * (smmaLen - 1) + osc) / smmaLen
+ma21 = smmaOf(close, 21)
+ma50 = smmaOf(close, 50)
+ma200 = smmaOf(close, 200)
 
-rsiBullish = osc > smma  // yellow line above white line
-rsiBearish = osc < smma  // yellow line below white line
+uptrend = close > ma200 and ma21 > ma50 and ma50 > ma200
+downtrend = close < ma200 and ma21 < ma50 and ma50 < ma200
 
-// --- Arrow patterns (from TMA Overlay) ---
-// 3 Line Strike: three same-direction candles reversed by a fourth
+// --- Arrow: 3 Line Strike or Engulfing ---
 strike3Bull = close[3] < open[3] and close[2] < open[2] and close[1] < open[1] and close > open[1]
 strike3Bear = close[3] > open[3] and close[2] > open[2] and close[1] > open[1] and close < open[1]
 
-// Engulfing candle
 openPrev = open[1]
 closePrev = close[1]
 engulfBull = open <= closePrev and open < openPrev and close > openPrev
@@ -32,15 +34,14 @@ engulfBear = open >= closePrev and open > openPrev and close < openPrev
 arrowBull = strike3Bull or engulfBull
 arrowBear = strike3Bear or engulfBear
 
+// --- RSI vs 50 (plain, no smoothing) ---
+osc = rsi(close, 14)
+rsiBullish = osc > 50
+rsiBearish = osc < 50
+
 // --- Combined setup ---
-buySetup = arrowBull and rsiBullish
-sellSetup = arrowBear and rsiBearish
+buySetup = uptrend and arrowBull and rsiBullish
+sellSetup = downtrend and arrowBear and rsiBearish
 
 plotshape(buySetup, title="Buy Setup", style=shape.labelup, location=location.belowbar, color=color.green, textcolor=color.white, text="BUY", size=size.small)
 plotshape(sellSetup, title="Sell Setup", style=shape.labeldown, location=location.abovebar, color=color.red, textcolor=color.white, text="SELL", size=size.small)
-
-// Replace REPLACE_WITH_YOUR_SECRET with the same value you set as WEBHOOK_SECRET
-// on the relay (see telegram-relay/). This stops randoms from spamming your bot
-// if they ever guess your webhook URL.
-alertcondition(buySetup, title="Buy Setup", message="{\"side\":\"BUY\",\"symbol\":\"{{ticker}}\",\"interval\":\"{{interval}}\",\"price\":\"{{close}}\",\"time\":\"{{time}}\",\"secret\":\"REPLACE_WITH_YOUR_SECRET\"}")
-alertcondition(sellSetup, title="Sell Setup", message="{\"side\":\"SELL\",\"symbol\":\"{{ticker}}\",\"interval\":\"{{interval}}\",\"price\":\"{{close}}\",\"time\":\"{{time}}\",\"secret\":\"REPLACE_WITH_YOUR_SECRET\"}")
