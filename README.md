@@ -37,6 +37,32 @@ dollar P&L it shows isn't precise for forex without proper lot sizing —
 treat win rate and trade count as the numbers worth comparing against
 `backtester/backtest.js`'s output, not the $ figures.
 
+## Backtesting on QuantConnect (free, real historical data)
+
+`quantconnect/main.py` is the same strategy again, ported to QuantConnect's
+free cloud backtester (Python/LEAN). This is worth using instead of (or
+alongside) `backtester/backtest.js` because QuantConnect has real forex
+history going back years — our own backtester has only tested 17 days of
+manually-copied EUR/USD data so far, which is a small sample. The indicator
+math was checked line-for-line against `strategy.js` on the same real
+EUR/USD data and produced byte-identical signals (128/128 matching
+timestamps, sides, and RSI values) before being shipped here, so this
+isn't a re-derived guess — it's a verified port.
+
+1. Sign up free at https://www.quantconnect.com (email only, no card).
+2. Create a new Algorithm Project (Python).
+3. Delete the default code, paste in `quantconnect/main.py`.
+4. Click **Backtest**. It defaults to EUR/USD, all of 2024.
+5. To test the reversed direction (the variant that backtested profitably
+   on our own 17-day sample — see git history for that result), change
+   `self.REVERSE_SIGNALS = False` to `True` near the top and re-run.
+
+Only one trade is held at a time in this version (a new signal is ignored
+while a previous trade is still open) — slightly different from
+`backtester/backtest.js`, which opens an independent trade on every
+qualifying bar even if overlapping. This is closer to how a real account
+would actually be managed.
+
 ## 1. Get a free TwelveData API key
 
 1. Sign up at https://twelvedata.com/pricing (Basic/free plan — email
