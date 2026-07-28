@@ -1,13 +1,16 @@
 # QuantConnect (LEAN) backtest of the same strategy as
 # telegram-relay/src/strategy.js - trend-aligned 3 Line Strike / Engulfing
 # arrow + RSI vs 50, gated by a 21/50/200 smoothed-MA trend stack held for
-# CONFIRM_BARS consecutive 5-min bars. SL/TP use the same 2x/4x signal-candle
-# range formula (2:1 reward:risk) as the live Telegram alert.
+# CONFIRM_BARS consecutive 5-min bars. SL distance = 2x the signal candle's
+# range; TP distance = SL distance x REWARD_RISK (2.0 = the original 2:1
+# rule the live Telegram alert uses; set to 1.0 to test 1:1 instead).
 #
-# Set REVERSE_SIGNALS = True to test the reversed direction, which is the
-# variant that backtested profitably (+60%) against 17 days of EUR/USD data
-# via our own offline backtester - this lets that result be checked against
-# QuantConnect's own historical data over a much longer window.
+# Set REVERSE_SIGNALS = True to test the reversed direction. Note: over a
+# full year of real QuantConnect/OANDA data, BOTH the original and reversed
+# 2:1 variants lost money (-20.8% and -4.6%) - the earlier +60% "reverse it"
+# finding from our own 17-day sample did not hold up and was very likely a
+# fluke of that short window, not a real edge. Testing other REWARD_RISK
+# values is exploring whether the 2:1 ratio itself was the problem.
 #
 # Only one position at a time (a new signal is ignored while a trade from a
 # previous signal is still open) - this differs slightly from the raw
@@ -29,6 +32,7 @@ class CombinedSetupStrategy(QCAlgorithm):
 
         # --- config: mirrors telegram-relay/src/strategy.js exactly ---
         self.REVERSE_SIGNALS = False  # flip to True to test the reversed direction
+        self.REWARD_RISK = 1.0        # TP distance = SL distance x this. 2.0 = the original 2:1 rule
         self.RSI_LEN = 14
         self.MA_FAST = 21
         self.MA_MID = 50
@@ -177,11 +181,14 @@ class CombinedSetupStrategy(QCAlgorithm):
 
         price = bar.Close
 
+        sl_distance = current_range * 2
+        tp_distance = sl_distance * self.REWARD_RISK
+
         if buy_setup:
-            self.longSL = price - current_range * 2
-            self.longTP = price + current_range * 4
+            self.longSL = price - sl_distance
+            self.longTP = price + tp_distance
             self.SetHoldings(self.symbol, 1.0)
         elif sell_setup:
-            self.shortSL = price + current_range * 2
-            self.shortTP = price - current_range * 4
+            self.shortSL = price + sl_distance
+            self.shortTP = price - tp_distance
             self.SetHoldings(self.symbol, -1.0)
