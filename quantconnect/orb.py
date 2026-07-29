@@ -10,7 +10,7 @@
 # and let REVERSE_SIGNALS make straight-vs-fade a one-line comparison
 # rather than a guess.
 #
-# Rules (see README.md for the research this is based on):
+# Rules:
 #   - Opening range = high/low of the first RANGE_MINUTES after SESSION_START
 #     (default: 08:00 UTC, the London open - matches this project's live
 #     bot's trading window).
@@ -71,6 +71,35 @@ class OpeningRangeBreakoutStrategy(QCAlgorithm):
         self.MIN_RANGE_ATR_MULT = 0.5
         self.MAX_RANGE_ATR_MULT = 3.0
 
+        # Impulsive-candle filter: require the breakout bar's own High-Low
+        # range to be unusually large vs its recent average - a weak, drifty
+        # close past the level is a common source of false breakouts.
+        self.IMPULSE_FILTER = True
+        self.RANGE_AVG_LEN = 20
+        self.IMPULSE_RANGE_MULT = 1.3
+
+        # Relative-volume filter: require above-average participation on the
+        # breakout bar. CAVEAT: spot forex has no real centralized volume -
+        # Oanda's feed through QC may only give a tick-count proxy, or
+        # nothing usable at all. This fails OPEN (doesn't block trades) if
+        # the observed volume data looks degenerate (see the one-time
+        # DIAGNOSTIC log in OnFiveMinuteBar) rather than silently killing
+        # every single trade if the field turns out to be always zero.
+        self.VOLUME_FILTER = True
+        self.VOLUME_AVG_LEN = 20
+        self.RVOL_MULT = 1.3
+
+        # Volatility-regime filter: classifies current ATR against its own
+        # longer-run baseline (not the same as RANGE_ATR_FILTER above, which
+        # compares the opening range's size to current ATR). Dead/low-vol
+        # regimes are excluded by default - research flags them as
+        # producing weak breakouts that quickly reverse.
+        self.VOLATILITY_REGIME_FILTER = True
+        self.ATR_BASELINE_LEN = 100
+        self.LOW_VOL_MULT = 0.7
+        self.HIGH_VOL_MULT = 1.5
+        self.ALLOWED_REGIMES = {"normal", "high"}
+
         # --- persisted indicators (updated every bar, never re-windowed -
         # see main.py/donchian.py's comments on why a trimmed rolling
         # buffer silently corrupts a long MA/ATR) ---
@@ -79,6 +108,13 @@ class OpeningRangeBreakoutStrategy(QCAlgorithm):
         self.atr_val = None
         self.atr_seed = []
         self.prev_close = None
+        self.range_avg_val = None
+        self.range_avg_seed = []
+        self.volume_avg_val = None
+        self.volume_avg_seed = []
+        self.atr_baseline_val = None
+        self.atr_baseline_seed = []
+        self._volume_diagnostic_logged = False
 
         # --- per-day state ---
         self.current_day = None
@@ -116,6 +152,15 @@ class OpeningRangeBreakoutStrategy(QCAlgorithm):
                 self.atr_val = (self.atr_val * (length - 1) + tr) / length
         self.prev_close = close
         return self.atr_val
+
+    def VolatilityRegime(self, current_atr):
+        if current_atr is None or self.atr_baseline_val is None or self.atr_baseline_val <= 0:
+            return "normal"  # not enough history to classify yet - don't block on it
+        if current_atr > self.HIGH_VOL_MULT * self.atr_baseline_val:
+            return "high"
+        if current_atr < self.LOW_VOL_MULT * self.atr_baseline_val:
+            return "low"
+        return "normal"
 
     def RangeEndTime(self):
         base = datetime.combine(date.min, self.SESSION_START)
@@ -157,6 +202,22 @@ class OpeningRangeBreakoutStrategy(QCAlgorithm):
         # Persisted indicators, updated every bar unconditionally.
         self.ma_val, self.ma_seed = self.UpdateSMMA(self.ma_val, self.ma_seed, bar.Close, self.TREND_MA_LEN)
         current_atr = self.UpdateATR(bar.High, bar.Low, bar.Close, self.ATR_LEN)
+        self.range_avg_val, self.range_avg_seed = self.UpdateSMMA(
+            self.range_avg_val, self.range_avg_seed, bar.High - bar.Low, self.RANGE_AVG_LEN)
+        bar_volume = getattr(bar, "Volume", 0) or 0
+        self.volume_avg_val, self.volume_avg_seed = self.UpdateSMMA(
+            self.volume_avg_val, self.volume_avg_seed, bar_volume, self.VOLUME_AVG_LEN)
+        if current_atr is not None:
+            self.atr_baseline_val, self.atr_baseline_seed = self.UpdateSMMA(
+                self.atr_baseline_val, self.atr_baseline_seed, current_atr, self.ATR_BASELINE_LEN)
+
+        if not self._volume_diagnostic_logged and self.volume_avg_val is not None:
+            self.Debug(
+                f"{self.Time} DIAGNOSTIC: {self.VOLUME_AVG_LEN}-bar avg 5-min bar Volume = "
+                f"{self.volume_avg_val:.2f} - if this is 0 (or stays 0), Oanda forex data has no "
+                f"usable volume here and VOLUME_FILTER is failing open (not blocking trades)"
+            )
+            self._volume_diagnostic_logged = True
 
         # Flatten at session end regardless of anything else - day-trade
         # only, no overnight swap/gap risk.
@@ -205,6 +266,26 @@ class OpeningRangeBreakoutStrategy(QCAlgorithm):
 
         if self.RANGE_ATR_FILTER and current_atr:
             if range_size < self.MIN_RANGE_ATR_MULT * current_atr or range_size > self.MAX_RANGE_ATR_MULT * current_atr:
+                self.traded_today = True
+                return
+
+        if self.VOLATILITY_REGIME_FILTER:
+            regime = self.VolatilityRegime(current_atr)
+            if regime not in self.ALLOWED_REGIMES:
+                self.traded_today = True
+                return
+
+        if self.IMPULSE_FILTER and self.range_avg_val:
+            bar_range = bar.High - bar.Low
+            if bar_range < self.IMPULSE_RANGE_MULT * self.range_avg_val:
+                self.traded_today = True
+                return
+
+        # Fails open: if avg volume is None/0 (warmup not done, or the field
+        # is genuinely always zero for this data), this does NOT block the
+        # trade. See the DIAGNOSTIC log above for whether it's real data.
+        if self.VOLUME_FILTER and self.volume_avg_val and self.volume_avg_val > 0:
+            if bar_volume < self.RVOL_MULT * self.volume_avg_val:
                 self.traded_today = True
                 return
 
