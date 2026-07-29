@@ -45,7 +45,7 @@ INTRADAY_INTERVAL = "5m"
 INTRADAY_PERIOD = "60d"     # Yahoo's hard cap for 5m data - can't get more history this way
 ORB_BARS = 3                # 3 x 5min = first 15 minutes of the session
 REWARD_RISK = 1.0           # target distance = risk distance x this (measured-move target)
-REVERSE_SIGNALS = False     # flip to True to fade the breakout instead of taking it
+REVERSE_SIGNALS = True      # currently testing the fade - flip back to False to test the straight breakout
 MIN_RANGE_PCT = 0.05        # opening range must be at least this % of price (scales across tickers, unlike a flat $ floor)
 RANGE_ATR_MIN_MULT = 0.3
 RANGE_ATR_MAX_MULT = 2.5
