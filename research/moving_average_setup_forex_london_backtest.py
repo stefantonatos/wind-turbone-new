@@ -48,7 +48,7 @@ RSI_LEN = 14
 CONFIRM_BARS = 6
 REWARD_RISK = 2.0         # TP distance = SL distance x this. 2.0 = the original taught 2:1 rule
 MIN_SL_PCT = 0.05         # SL distance floor as % of price
-REVERSE_SIGNALS = False
+REVERSE_SIGNALS = True    # currently testing the fade - flip back to False to test the straight setup
 MAX_HOLD_BARS = 500       # ~a week of 5-min bars - a trade open longer than this gets closed out and scored
 
 
