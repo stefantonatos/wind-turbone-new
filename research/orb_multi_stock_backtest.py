@@ -45,6 +45,7 @@ INTRADAY_INTERVAL = "5m"
 INTRADAY_PERIOD = "60d"     # Yahoo's hard cap for 5m data - can't get more history this way
 ORB_BARS = 3                # 3 x 5min = first 15 minutes of the session
 REWARD_RISK = 1.0           # target distance = risk distance x this (measured-move target)
+REVERSE_SIGNALS = False     # flip to True to fade the breakout instead of taking it
 MIN_RANGE_PCT = 0.05        # opening range must be at least this % of price (scales across tickers, unlike a flat $ floor)
 RANGE_ATR_MIN_MULT = 0.3
 RANGE_ATR_MAX_MULT = 2.5
@@ -103,22 +104,34 @@ def simulate_day(day_df, atr_asof_yesterday, ticker_price_ref):
             continue
 
         close = float(row["Close"])
-        side = None
+        raw_side = None
         if close > orb_high:
-            side = "LONG"
+            raw_side = "LONG"
         elif close < orb_low:
-            side = "SHORT"
-        if side is None:
+            raw_side = "SHORT"
+        if raw_side is None:
             continue
 
         entry = close
-        if side == "LONG":
-            stop, target = orb_low, entry + (entry - orb_low) * REWARD_RISK
-        else:
-            stop, target = orb_high, entry - (orb_high - entry) * REWARD_RISK
-        risk = abs(entry - stop)
+        # Risk distance comes from the RAW breakout geometry (distance to
+        # the opposite side of the range from wherever price actually broke
+        # out) - computed before any REVERSE_SIGNALS flip, and always
+        # positive by construction. Computing it after flipping direction
+        # would reuse the wrong boundary (e.g. a raw upside breakout, faded
+        # short, would wrongly measure "distance to orb_high" from a price
+        # that's already above orb_high - negative, nonsensical).
+        risk = (entry - orb_low) if raw_side == "LONG" else (orb_high - entry)
         if risk <= 0:
-            return None
+            continue
+
+        side = raw_side
+        if REVERSE_SIGNALS:
+            side = "SHORT" if raw_side == "LONG" else "LONG"
+
+        if side == "LONG":
+            stop, target = entry - risk, entry + risk * REWARD_RISK
+        else:
+            stop, target = entry + risk, entry - risk * REWARD_RISK
 
         future = post_orb.iloc[i + 1:]
         for _, bar in future.iterrows():
