@@ -250,12 +250,31 @@ def main():
         return
 
     df = pd.DataFrame(all_trades)
-    wins = (df["r"] > 0).sum()
     total_r = df["r"].sum()
+    tp_count = (df["outcome"] == "TP").sum()
+    sl_count = (df["outcome"] == "SL").sum()
+    timeout_df = df[df["outcome"] == "TIMEOUT"]
+    timeout_pos = (timeout_df["r"] > 0).sum()
+    timeout_neg = len(timeout_df) - timeout_pos
 
-    print(f"Win rate: {wins/len(df)*100:.1f}%  ({wins}/{len(df)})")
-    print(f"Total: {total_r:+.2f}R   Average: {total_r/len(df):+.3f}R/trade")
-    print(f"Outcome breakdown: {df['outcome'].value_counts().to_dict()}")
+    # THIS is the number that determines profitability - not the win-rate
+    # percentage below, which is easy to misread as directly comparable to
+    # the clean-payout breakeven threshold (1/(1+REWARD_RISK)) when it
+    # isn't, once TIMEOUT trades are in the mix (see note below).
+    print(f"Total: {total_r:+.2f}R   Average: {total_r/len(df):+.3f}R/trade   <- this decides profitability, not win rate")
+    print(f"\nOutcome breakdown ({len(df)} trades):")
+    print(f"  TP  (+{REWARD_RISK:.1f}R each): {tp_count:5d}  ({tp_count/len(df)*100:.1f}%)")
+    print(f"  SL  (-1.0R each):  {sl_count:5d}  ({sl_count/len(df)*100:.1f}%)")
+    print(f"  Timed out:         {len(timeout_df):5d}  ({len(timeout_df)/len(df)*100:.1f}%)  "
+          f"[{timeout_pos} closed positive, {timeout_neg} closed negative - neither for the full R amount]")
+
+    breakeven_wr = 1 / (1 + REWARD_RISK) * 100
+    naive_win_rate = (df["r"] > 0).sum() / len(df) * 100
+    print(f"\n'Win rate' (any trade that closed r>0, including partial-R timeouts): {naive_win_rate:.1f}%")
+    print(f"This is NOT directly comparable to the {breakeven_wr:.1f}% breakeven line for a clean {REWARD_RISK:.0f}:1 "
+          f"payout - that comparison only holds if every trade were exactly -1R or +{REWARD_RISK:.0f}R, and "
+          f"{len(timeout_df)} of these weren't. Total R above already accounts for the real size of every trade; "
+          f"win rate on its own does not.")
     print("\nNo commission/spread/slippage modeled above - real results will be worse than this.")
 
     print("\nPer-pair:")

@@ -212,13 +212,29 @@ def main():
         return
 
     df = pd.DataFrame(all_trades)
-    wins = (df["r"] > 0).sum()
     total_r = df["r"].sum()
-    win_rate = wins / len(df) * 100
+    tp_count = (df["outcome"] == "TP").sum()
+    sl_count = (df["outcome"] == "SL").sum()
+    flat_df = df[df["outcome"] == "FLAT"]
+    flat_pos = (flat_df["r"] > 0).sum()
+    flat_neg = len(flat_df) - flat_pos
 
-    print(f"Win rate: {win_rate:.1f}%  ({wins}/{len(df)})")
-    print(f"Total: {total_r:+.2f}R   Average: {total_r/len(df):+.3f}R/trade")
-    print(f"Outcome breakdown: {df['outcome'].value_counts().to_dict()}")
+    # THIS is the number that determines profitability - not the win-rate
+    # percentage below. At REWARD_RISK=1.0 the two happen to track closely
+    # since the payout is symmetric, but "win rate" still isn't the same
+    # thing as total R once FLAT (session-end-flatten) trades are in the
+    # mix - those can close anywhere between -1R and +1R, not just at the
+    # two clean extremes.
+    print(f"Total: {total_r:+.2f}R   Average: {total_r/len(df):+.3f}R/trade   <- this decides profitability, not win rate")
+    print(f"\nOutcome breakdown ({len(df)} trades):")
+    print(f"  TP   (+{REWARD_RISK:.1f}R each): {tp_count:5d}  ({tp_count/len(df)*100:.1f}%)")
+    print(f"  SL   (-1.0R each):  {sl_count:5d}  ({sl_count/len(df)*100:.1f}%)")
+    print(f"  FLAT (session-end): {len(flat_df):5d}  ({len(flat_df)/len(df)*100:.1f}%)  "
+          f"[{flat_pos} closed positive, {flat_neg} closed negative - neither for the full R amount]")
+
+    naive_win_rate = (df["r"] > 0).sum() / len(df) * 100
+    print(f"\n'Win rate' (any trade that closed r>0, including partial-R FLAT exits): {naive_win_rate:.1f}%")
+    print(f"Total R above already accounts for the real size of every trade; win rate on its own does not.")
     print(f"\nNo commission/spread/slippage modeled above - real results will be worse than this.")
 
     print("\nPer-ticker:")
