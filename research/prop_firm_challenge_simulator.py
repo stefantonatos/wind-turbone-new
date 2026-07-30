@@ -319,8 +319,9 @@ def full_history_equity_curve(trades, initial_balance=INITIAL_BALANCE, risk_pct_
     current_day = None
     day_start_equity = equity
     max_daily_drawdown_pct = 0.0
+    wiped_out_at_trade = None
 
-    for trade in trades:
+    for idx, trade in enumerate(trades):
         day = trade["date"]
         if day != current_day:
             current_day = day
@@ -334,10 +335,23 @@ def full_history_equity_curve(trades, initial_balance=INITIAL_BALANCE, risk_pct_
         daily_loss_pct = (day_start_equity - equity) / initial_balance * 100
         max_daily_drawdown_pct = max(max_daily_drawdown_pct, daily_loss_pct)
 
+        # A real account can't go below $0 - it would have been margin-called
+        # and stopped out long before this, not kept trading with the same
+        # fixed dollar risk into negative territory. Stop the walkthrough
+        # here rather than let equity run further into nonsense negative
+        # numbers - this function deliberately ignores challenge drawdown
+        # rules to show the raw path, but going broke is a hard floor no
+        # matter what.
+        if equity <= 0:
+            wiped_out_at_trade = idx + 1
+            equity = 0.0
+            break
+
     total_return_pct = (equity - initial_balance) / initial_balance * 100
     return {
         "final_equity": equity, "total_return_pct": total_return_pct,
         "max_drawdown_pct": max_drawdown_pct, "max_daily_drawdown_pct": max_daily_drawdown_pct,
+        "wiped_out_at_trade": wiped_out_at_trade,
     }
 
 
@@ -382,6 +396,11 @@ def main():
     curve = full_history_equity_curve(all_trades, initial_balance=INITIAL_BALANCE,
                                        risk_pct_per_trade=RISK_PCT_PER_TRADE)
     print(f"\nFull-history walkthrough (no challenge rules applied, just the raw path):")
+    if curve["wiped_out_at_trade"] is not None:
+        print(f"  ACCOUNT WIPED OUT on trade {curve['wiped_out_at_trade']} of {len(all_trades)} - "
+              f"equity hit $0 at fixed {RISK_PCT_PER_TRADE:.1f}% risk/trade well before the full "
+              f"history played out. Nothing past that point is real - a real account would have been "
+              f"margin-called and stopped, not kept trading.")
     print(f"  Total return: {curve['total_return_pct']:+.2f}%   Final equity: ${curve['final_equity']:,.2f}")
     print(f"  Max drawdown (peak to trough): {curve['max_drawdown_pct']:.2f}%")
     print(f"  Max single-day drawdown seen: {curve['max_daily_drawdown_pct']:.2f}%")
