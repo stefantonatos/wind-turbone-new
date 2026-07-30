@@ -9,16 +9,23 @@
 # Same core rules as quantconnect/orb.py (close-confirmed breakout of the
 # opening range, SL = opposite side of the range floored as a % of
 # price, TP = SL x REWARD_RISK, one trade/day, session-end flatten),
-# ported to plain Python/pandas here rather than a QC algorithm. Skips
-# the impulse/volume/regime filters quantconnect/orb.py later added, to
-# keep this initial index port a manageable, directly-comparable-to-
-# research baseline - those could be added the same way if this looks
-# promising.
+# ported to plain Python/pandas here rather than a QC algorithm - now
+# including the full filter set orb.py has (range-vs-ATR, impulsive
+# candle, relative volume, volatility regime), not just the bare
+# breakout rule.
 #
 # Each index has its own home-market session, unlike round-the-clock
 # forex, so this needs a real per-index (timezone, local session-open
 # time) mapping - not just one "London session" gate like the forex
 # scripts use.
+#
+# VOLUME_FILTER caveat: unlike spot forex, index CFD data from Dukascopy
+# does return a volume column, but whether it's meaningful (real traded
+# volume vs. a tick-count proxy vs. just zero) isn't verified from this
+# sandbox (same situation as every other live data question here - can't
+# reach Dukascopy's servers to check). This fails OPEN (doesn't block
+# trades) if volume looks degenerate, with a one-time diagnostic print
+# per index so the first real run settles whether it's usable.
 
 # !pip install --upgrade dukascopy-python -q   # uncomment this line in Colab
 
@@ -52,11 +59,84 @@ REWARD_RISK = 1.0              # classic measured-move target
 MIN_RANGE_PCT = 0.05           # SL distance floor as % of price
 REVERSE_SIGNALS = False
 
+ATR_LEN = 14
+RANGE_ATR_FILTER = True
+MIN_RANGE_ATR_MULT = 0.5
+MAX_RANGE_ATR_MULT = 3.0
+
+IMPULSE_FILTER = True
+RANGE_AVG_LEN = 20
+IMPULSE_RANGE_MULT = 1.3
+
+VOLUME_FILTER = True
+VOLUME_AVG_LEN = 20
+RVOL_MULT = 1.3
+
+VOLATILITY_REGIME_FILTER = True
+ATR_BASELINE_LEN = 100
+LOW_VOL_MULT = 0.7
+HIGH_VOL_MULT = 1.5
+ALLOWED_REGIMES = {"normal", "high"}
+
 
 def to_local_time(index, tz_name):
     if index.tz is None:
         index = index.tz_localize("UTC")
     return index.tz_convert(tz_name)
+
+
+def persisted_avg(values, length, start_index=0):
+    """Same seed-then-recurse SMMA rule used throughout this project,
+    generalized here to average bar-range/volume/ATR series (not just
+    price) - reused for IMPULSE_FILTER, VOLUME_FILTER, and
+    VOLATILITY_REGIME_FILTER's baseline.
+
+    start_index skips leading values that aren't valid yet (e.g. ATR's
+    own warmup period) - substituting a placeholder like 0.0 for those
+    instead would corrupt the seed average with fake data; this instead
+    only starts averaging once the source series itself has real values."""
+    n = len(values)
+    out = [None] * n
+    usable = values[start_index:]
+    if len(usable) < length:
+        return out
+    seed = sum(usable[:length]) / length
+    out[start_index + length - 1] = seed
+    prev = seed
+    for i in range(start_index + length, n):
+        prev = (prev * (length - 1) + values[i]) / length
+        out[i] = prev
+    return out
+
+
+def compute_atr_series(highs, lows, closes, length):
+    n = len(closes)
+    atr = [None] * n
+    tr_seed = []
+    atr_val = None
+    prev_close = None
+    for i in range(n):
+        if prev_close is not None:
+            tr = max(highs[i] - lows[i], abs(highs[i] - prev_close), abs(lows[i] - prev_close))
+            if atr_val is None:
+                tr_seed.append(tr)
+                if len(tr_seed) >= length:
+                    atr_val = sum(tr_seed) / length
+            else:
+                atr_val = (atr_val * (length - 1) + tr) / length
+        atr[i] = atr_val
+        prev_close = closes[i]
+    return atr
+
+
+def volatility_regime(current_atr, baseline):
+    if current_atr is None or baseline is None or baseline <= 0:
+        return "normal"
+    if current_atr > HIGH_VOL_MULT * baseline:
+        return "high"
+    if current_atr < LOW_VOL_MULT * baseline:
+        return "low"
+    return "normal"
 
 
 def backtest_index(label, instrument_const, tz_name, session_start):
@@ -67,8 +147,19 @@ def backtest_index(label, instrument_const, tz_name, session_start):
     df.index = to_local_time(df.index, tz_name)
 
     highs, lows, closes = df["High"].tolist(), df["Low"].tolist(), df["Close"].tolist()
+    volumes = df["volume"].tolist() if "volume" in df.columns else [0] * len(df)
     times = df.index
     n = len(closes)
+
+    atr = compute_atr_series(highs, lows, closes, ATR_LEN)
+    bar_ranges = [h - l for h, l in zip(highs, lows)]
+    range_avg = persisted_avg(bar_ranges, RANGE_AVG_LEN)
+    volume_avg = persisted_avg(volumes, VOLUME_AVG_LEN)
+    atr_first_valid = next((idx for idx, a in enumerate(atr) if a is not None), len(atr))
+    atr_baseline = persisted_avg([a if a is not None else 0.0 for a in atr], ATR_BASELINE_LEN,
+                                  start_index=atr_first_valid)
+
+    volume_diagnostic_shown = False
 
     range_end = (datetime.datetime.combine(datetime.date.min, session_start)
                  + datetime.timedelta(minutes=RANGE_MINUTES)).time()
@@ -91,6 +182,11 @@ def backtest_index(label, instrument_const, tz_name, session_start):
             current_day = today
             range_high = range_low = None
             traded_today = False
+
+        if not volume_diagnostic_shown and volume_avg[i] is not None:
+            print(f"  [{label}] DIAGNOSTIC: {VOLUME_AVG_LEN}-bar avg volume = {volume_avg[i]:.2f} - if this "
+                  f"is 0 (or stays 0), volume isn't usable here and VOLUME_FILTER is failing open (not blocking trades)")
+            volume_diagnostic_shown = True
 
         if session_end < session_start and tod < session_start:
             pass  # session wraps past midnight - not handled specially, rare for these 6 indices' home sessions
@@ -127,6 +223,36 @@ def backtest_index(label, instrument_const, tz_name, session_start):
             continue
 
         range_size = range_high - range_low
+        current_atr = atr[i]
+
+        if RANGE_ATR_FILTER and current_atr:
+            if range_size < MIN_RANGE_ATR_MULT * current_atr or range_size > MAX_RANGE_ATR_MULT * current_atr:
+                traded_today = True
+                i += 1
+                continue
+
+        if VOLATILITY_REGIME_FILTER:
+            regime = volatility_regime(current_atr, atr_baseline[i])
+            if regime not in ALLOWED_REGIMES:
+                traded_today = True
+                i += 1
+                continue
+
+        if IMPULSE_FILTER and range_avg[i]:
+            bar_range = highs[i] - lows[i]
+            if bar_range < IMPULSE_RANGE_MULT * range_avg[i]:
+                traded_today = True
+                i += 1
+                continue
+
+        # Fails open: if avg volume is None/0 (warmup not done, or the
+        # field is genuinely always zero), this does NOT block the trade.
+        if VOLUME_FILTER and volume_avg[i] and volume_avg[i] > 0:
+            if volumes[i] < RVOL_MULT * volume_avg[i]:
+                traded_today = True
+                i += 1
+                continue
+
         sl_distance = max(range_size, (MIN_RANGE_PCT / 100.0) * price)
         tp_distance = sl_distance * REWARD_RISK
         side = "LONG" if buy_setup else "SHORT"
