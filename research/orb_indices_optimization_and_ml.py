@@ -48,9 +48,13 @@ INDICES = [
     ("NIKKEI225", dki.INSTRUMENT_IDX_ASIA_E_N225JAP, "Asia/Tokyo", pd.Timestamp("09:00").time()),
 ]
 
-FETCH_START = datetime.datetime(2021, 1, 1)
+FETCH_START = datetime.datetime(2016, 1, 1)   # widened from 2021 - the ML step only had 4,525 in-sample
+                                               # candidates last run, too thin to learn robust signal from;
+                                               # this roughly doubles in-sample history (8 years vs 3)
 FETCH_END = datetime.datetime(2025, 1, 1)
 SPLIT_DATE = datetime.date(2024, 1, 1)   # everything before this = in-sample, on/after = out-of-sample
+                                          # (unchanged - keeps the out-of-sample year identical to the
+                                          # last run, so this result is directly comparable, not a new test)
 DUKASCOPY_INTERVAL = dukascopy_python.INTERVAL_MIN_5
 DUKASCOPY_OFFER_SIDE = dukascopy_python.OFFER_SIDE_BID
 
@@ -328,9 +332,11 @@ def run_backtest(df, ind, tz_name, session_start, range_minutes, reward_risk,
 
 
 def main():
+    years = (FETCH_END - FETCH_START).days / 365
     print(f"This runs a {len(RANGE_MINUTES_GRID)}x{len(REWARD_RISK_GRID)} grid search across "
-          f"{len(INDICES)} indices over 4 years of 5-min data, plus ML training - expect roughly "
-          f"15-20 minutes total, not a hang.\n")
+          f"{len(INDICES)} indices over ~{years:.0f} years of 5-min data, plus ML training on a much "
+          f"bigger training set than before - expect roughly 30-45 minutes total (longer than last "
+          f"time, since there's about twice the history to grid-search over), not a hang.\n")
     print(f"Downloading {len(INDICES)} indices from Dukascopy ({FETCH_START.date()} to {FETCH_END.date()})...")
     data = {}
     for label, instrument_const, tz_name, session_start in INDICES:
