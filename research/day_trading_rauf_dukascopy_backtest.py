@@ -78,14 +78,33 @@
 # No parameter grid search either - this is one fixed rule set, tested for
 # whether it holds up, not tuned to this data.
 
-# !pip install --upgrade dukascopy-python -q   # uncomment this line in Colab
+# !pip install --upgrade dukascopy-python tqdm -q   # uncomment this line in Colab
 
 import datetime
+import logging
+import os
+import pickle
 
 import numpy as np
 import pandas as pd
 import dukascopy_python
 from dukascopy_python import instruments as dki
+
+from tqdm.auto import tqdm   # auto-picks the Colab/Jupyter widget bar when available, a plain terminal bar otherwise
+
+# dukascopy_python logs an "INFO:DUKASCRIPT:current timestamp:..." line for every internal
+# download chunk - useful for debugging a stuck fetch, just noisy for normal runs. Silenced
+# here in favor of the tqdm progress bars below; set back to logging.INFO to see it again.
+logging.getLogger("DUKASCRIPT").setLevel(logging.WARNING)
+
+# Fetched data is cached to disk per (instrument, interval, date range) - the FIRST run of a
+# given range still has to download it all, but every run after that (e.g. after tweaking a
+# parameter below) loads from disk instantly instead of re-downloading ~650k+ bars per
+# instrument. In Colab this cache lives in the ephemeral runtime by default and is lost when
+# the runtime resets; point CACHE_DIR at a mounted Google Drive path to persist it across
+# sessions instead (drive.mount('/content/drive') first, then e.g. "/content/drive/MyDrive/dukascopy_cache").
+CACHE_DIR = "dukascopy_cache"
+FETCH_CHUNK_MONTHS = 3   # how finely to split the download for progress-bar granularity
 
 INSTRUMENTS = [
     ("EURUSD", dki.INSTRUMENT_FX_MAJORS_EUR_USD),
@@ -115,12 +134,43 @@ def to_ny_time(index):
     return index.tz_convert("America/New_York")
 
 
-def fetch_instrument_data(instrument_const):
-    df = dukascopy_python.fetch(instrument_const, DUKASCOPY_INTERVAL, DUKASCOPY_OFFER_SIDE, FETCH_START, FETCH_END)
-    if df.empty:
+def _month_chunks(start, end, months_per_chunk):
+    chunk_start = start
+    while chunk_start < end:
+        month_index = chunk_start.month - 1 + months_per_chunk
+        chunk_end = chunk_start.replace(year=chunk_start.year + month_index // 12, month=month_index % 12 + 1)
+        yield chunk_start, min(chunk_end, end)
+        chunk_start = chunk_end
+
+
+def fetch_instrument_data(label, instrument_const):
+    """Downloads in FETCH_CHUNK_MONTHS-sized pieces (shows real progress instead of one long
+    silent call) and caches the combined result to disk, so re-running this script after
+    changing a strategy parameter below loads instantly instead of re-downloading everything."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, f"{label}_5min_{FETCH_START.date()}_{FETCH_END.date()}.pkl")
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    chunks = []
+    chunk_bounds = list(_month_chunks(FETCH_START, FETCH_END, FETCH_CHUNK_MONTHS))
+    for chunk_start, chunk_end in tqdm(chunk_bounds, desc=f"{label}: downloading {DUKASCOPY_INTERVAL} bars",
+                                        unit="chunk"):
+        chunk = dukascopy_python.fetch(instrument_const, DUKASCOPY_INTERVAL, DUKASCOPY_OFFER_SIDE,
+                                        chunk_start, chunk_end)
+        if not chunk.empty:
+            chunks.append(chunk)
+
+    if not chunks:
         return None
+    df = pd.concat(chunks)
+    df = df[~df.index.duplicated(keep="first")].sort_index()   # chunk boundaries may overlap by one bar
     df = df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
     df.index = to_ny_time(df.index)
+
+    with open(cache_path, "wb") as f:
+        pickle.dump(df, f)
     return df
 
 
@@ -270,21 +320,21 @@ def backtest_instrument(label, df):
 def main():
     years = (FETCH_END - FETCH_START).days / 365
     print(f"Downloading {len(INSTRUMENTS)} instruments from Dukascopy over ~{years:.0f} years "
-          f"({FETCH_START.date()} to {FETCH_END.date()}) - expect roughly 10-20 minutes.\n")
+          f"({FETCH_START.date()} to {FETCH_END.date()}) - cached to disk after the first run, "
+          f"so this is only slow once.\n")
 
     data = {}
-    for label, instrument_const in INSTRUMENTS:
-        print(f"{label}...", end=" ")
+    for label, instrument_const in tqdm(INSTRUMENTS, desc="Instruments", unit="instrument"):
         try:
-            df = fetch_instrument_data(instrument_const)
+            df = fetch_instrument_data(label, instrument_const)
         except Exception as exc:
-            print(f"failed ({exc})")
+            print(f"{label}: failed ({exc})")
             continue
         if df is None:
-            print("no data")
+            print(f"{label}: no data")
             continue
         data[label] = df
-        print(f"{len(df)} bars")
+        print(f"{label}: {len(df)} bars")
 
     if not data:
         print("No data downloaded - check output above.")
