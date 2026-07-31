@@ -292,9 +292,36 @@ def main():
         print(f"  {label:10s}: {len(trades):4d} trades, {r:+8.2f}R")
 
     z = (total_r / n_trades) / (1 / (n_trades ** 0.5)) if n_trades else 0
-    print(f"\nApprox z-score: {z:.2f} (rule of thumb: |z| > 1.96 for ~95% confidence this isn't chance)")
+    print(f"\nApprox z-score: {z:.2f} (rule of thumb: |z| > 1.96 for ~95% confidence this isn't chance - "
+          f"but R-multiples here are heavily skewed by variable-target-distance wins, so treat this as "
+          f"suggestive, not exact - a normal-distribution z-score is an approximation on skewed data.)")
     if n_trades < 100:
         print(f"CAVEAT: only {n_trades} trades - too few to trust regardless of the z-score.")
+
+    win_rs = sorted(t["r"] for t in all_trades if t["outcome"] == "TP")
+    if win_rs:
+        median_win_r = win_rs[len(win_rs) // 2]
+        mean_win_r = sum(win_rs) / len(win_rs)
+        print(f"\nMedian winning trade's R-multiple: {median_win_r:.2f} (vs mean win of {mean_win_r:.2f} - "
+              f"a big gap here means a few huge-target wins are doing a lot of the work, not a broadly "
+              f"repeatable payout).")
+
+    all_trades_sorted = sorted(all_trades, key=lambda t: t["date"])
+    midpoint_date = all_trades_sorted[len(all_trades_sorted) // 2]["date"]
+    first_half = [t for t in all_trades_sorted if t["date"] < midpoint_date]
+    second_half = [t for t in all_trades_sorted if t["date"] >= midpoint_date]
+    print(f"\nSPLIT-PERIOD CHECK (does the SAME rule, same fixed parameters, hold up in both halves "
+          f"of the sample, not just overall):")
+    for label, half in [("First half", first_half), ("Second half", second_half)]:
+        if not half:
+            continue
+        r = sum(t["r"] for t in half)
+        n = len(half)
+        z_half = (r / n) / (1 / (n ** 0.5)) if n else 0
+        print(f"  {label} ({half[0]['date']} to {half[-1]['date']}): {n} trades, {r:+.2f}R, "
+              f"{r/n:+.4f}R/trade, z={z_half:.2f}")
+    print(f"  If one half is strongly positive and the other flat or negative, that's the same warning "
+          f"sign flagged elsewhere in this project - don't trust the combined number over both halves.")
 
     print("\nNo commission/spread/slippage modeled. Entry is simulated at the daily close of the bar that "
           "tests the zone - a real discretionary trader would place a limit order inside the zone itself, "
