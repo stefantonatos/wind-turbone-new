@@ -5,3 +5,4 @@ __pycache__/
 copier/config.py
 copier/*.session
 copier/*.session-journal
+.claude/worktrees/
