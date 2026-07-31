@@ -93,9 +93,19 @@ from dukascopy_python import instruments as dki
 from tqdm.auto import tqdm   # auto-picks the Colab/Jupyter widget bar when available, a plain terminal bar otherwise
 
 # dukascopy_python logs an "INFO:DUKASCRIPT:current timestamp:..." line for every internal
-# download chunk - useful for debugging a stuck fetch, just noisy for normal runs. Silenced
-# here in favor of the tqdm progress bars below; set back to logging.INFO to see it again.
-logging.getLogger("DUKASCRIPT").setLevel(logging.WARNING)
+# download chunk - useful for debugging a stuck fetch, just noisy for normal runs. A plain
+# logger.setLevel(WARNING) does NOT work here: the library's own fetch() call resets the
+# "DUKASCRIPT" logger's level back to INFO internally on every single call (confirmed by
+# reading dukascopy_python/__init__.py's _get_custom_logger - it unconditionally calls
+# logger.setLevel(...) each time), silently undoing a one-time setLevel before it ever helps.
+# A logging Filter survives that reset (the library never touches .filters), so that's what's
+# used instead. Remove this filter to see the raw log again.
+class _SuppressDukascopyInfoFilter(logging.Filter):
+    def filter(self, record):
+        return record.levelno >= logging.WARNING
+
+
+logging.getLogger("DUKASCRIPT").addFilter(_SuppressDukascopyInfoFilter())
 
 # Fetched data is cached to disk per (instrument, interval, date range) - the FIRST run of a
 # given range still has to download it all, but every run after that (e.g. after tweaking a
