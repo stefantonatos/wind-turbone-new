@@ -109,11 +109,15 @@ logging.getLogger("DUKASCRIPT").addFilter(_SuppressDukascopyInfoFilter())
 
 # Fetched data is cached to disk per (instrument, interval, date range) - the FIRST run of a
 # given range still has to download it all, but every run after that (e.g. after tweaking a
-# parameter below) loads from disk instantly instead of re-downloading ~650k+ bars per
-# instrument. In Colab this cache lives in the ephemeral runtime by default and is lost when
-# the runtime resets; point CACHE_DIR at a mounted Google Drive path to persist it across
-# sessions instead (drive.mount('/content/drive') first, then e.g. "/content/drive/MyDrive/dukascopy_cache").
-CACHE_DIR = "dukascopy_cache"
+# parameter below, or a DIFFERENT script that happens to need the same instrument/interval/
+# range) loads from disk instantly instead of re-downloading ~650k+ bars per instrument. Auto-
+# detects a mounted Google Drive (run `from google.colab import drive; drive.mount('/content/
+# drive')` once at the top of your notebook, before this cell) and uses that instead of the
+# ephemeral local disk if present - this is what makes the cache survive runtime resets AND
+# get shared across every script in this project that uses the same instruments/date range,
+# not just repeat runs of this one file. Falls back to a local (session-only) cache if Drive
+# isn't mounted, so this still works without any setup, just without the persistence.
+CACHE_DIR = "/content/drive/MyDrive/dukascopy_cache" if os.path.isdir("/content/drive/MyDrive") else "dukascopy_cache"
 FETCH_CHUNK_MONTHS = 3   # how finely to split the download for progress-bar granularity
 
 INSTRUMENTS = [
