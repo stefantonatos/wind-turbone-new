@@ -75,6 +75,12 @@ MAX_TARGET_DISTANCE_ATR_MULT = 20.0   # cap on how far away an opposite zone can
 FALLBACK_REWARD_RISK = 2.0       # used only when no opposite zone exists within the cap
 MAX_HOLD_BARS = 60               # ~3 months of daily bars - this is meant to be a swing/position style, not a scalp
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data (Dukascopy's OHLC endpoint doesn't expose historical bid/ask spread), just a few bracketing
+# assumptions to see how much cost this edge can absorb before it disappears. 0.01% is roughly an
+# ECN-style FX major spread; 0.05% is closer to a wider retail/CFD spread on less liquid instruments.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def fetch_daily_ohlc(instrument_const):
     df = dukascopy_python.fetch(instrument_const, DUKASCOPY_INTERVAL, DUKASCOPY_OFFER_SIDE, FETCH_START, FETCH_END)
@@ -178,7 +184,8 @@ def backtest_instrument(label, df):
 
             if open_trade["outcome"] is not None:
                 trades.append({"side": side, "outcome": open_trade["outcome"], "r": open_trade["exit_r"],
-                                "date": times[i].date()})
+                                "date": times[i].date(), "entry": open_trade["entry"],
+                                "sl_distance": open_trade["sl_distance"]})
                 for z in active_zones:
                     if z is open_trade["zone"]:
                         z["in_trade"] = False
@@ -323,9 +330,18 @@ def main():
     print(f"  If one half is strongly positive and the other flat or negative, that's the same warning "
           f"sign flagged elsewhere in this project - don't trust the combined number over both halves.")
 
-    print("\nNo commission/spread/slippage modeled. Entry is simulated at the daily close of the bar that "
-          "tests the zone - a real discretionary trader would place a limit order inside the zone itself, "
-          "which could fill at a better or worse price depending on how the bar unfolds intraday.")
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data - "
+          f"see COST_PCT_SCENARIOS comment):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) * t["entry"] / t["sl_distance"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
+
+    print("\nEntry is simulated at the daily close of the bar that tests the zone - a real discretionary "
+          "trader would place a limit order inside the zone itself, which could fill at a better or worse "
+          "price depending on how the bar unfolds intraday.")
 
 
 if __name__ == "__main__":
