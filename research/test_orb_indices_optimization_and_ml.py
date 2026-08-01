@@ -32,6 +32,16 @@
 #      without crashing, plus a WIDE_SEARCH smoke run. Deliberately NOT a
 #      real Dukascopy download - this project's convention is to validate
 #      correctness via unit tests plus a synthetic smoke run.
+#   8. LOCKBOX WIRING: research/optimization_engine.py's split_lockbox()/
+#      lockbox_confirm() landed in a parallel commit partway through this
+#      upgrade and were wired into the WIDE_SEARCH path per the task spec -
+#      TestLockboxWiring checks split_lockbox() produces the exact search/
+#      lockbox boundaries this file's own module-level FETCH_START/
+#      FETCH_END/LOCKBOX_MONTHS config implies, and exercises
+#      lockbox_confirm() end-to-end against ORB's own eval_fn (via
+#      _make_orb_eval_fn) on synthetic data with an isolated tempfile
+#      ledger - not just re-testing optimization_engine.py's own unit
+#      tests, but confirming THIS file's wiring of them.
 #
 # Run with:  python -m pytest research/test_orb_indices_optimization_and_ml.py -v
 # or:        python research/test_orb_indices_optimization_and_ml.py
@@ -40,6 +50,7 @@ import datetime
 import importlib.util
 import os
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -418,6 +429,91 @@ class TestWideSearchWiring(unittest.TestCase):
         self.assertLess(search_result["n_evals"], full_cross_product)
 
 
+# ============================= lockbox wiring (WIDE_SEARCH path) =============================
+
+class TestLockboxWiring(unittest.TestCase):
+    """research/optimization_engine.py's split_lockbox()/lockbox_confirm() landed in a parallel
+    commit partway through this upgrade and were wired into the WIDE_SEARCH path per the task
+    spec - see the module docstring's "LOCKBOX" section in orb_indices_optimization_and_ml.py.
+    These tests confirm THIS file's wiring (config + _make_orb_eval_fn as lockbox_confirm's
+    backtest_fn), not optimization_engine.py's own unit-level correctness (see
+    test_optimization_engine.py's TestSplitLockbox/TestLockboxConfirm for that)."""
+
+    def test_split_lockbox_matches_this_files_actual_fetch_range_and_config(self):
+        """The exact boundaries documented in this file's own WIDE SEARCH / LOCKBOX config
+        comment - not assumed, checked directly against orb's real FETCH_START/FETCH_END/
+        LOCKBOX_MONTHS."""
+        search_start, search_end, lockbox_start, lockbox_end = orb.opt_engine.split_lockbox(
+            orb.FETCH_START, orb.FETCH_END, orb.LOCKBOX_MONTHS)
+        self.assertEqual(search_start, datetime.datetime(2016, 1, 1))
+        self.assertEqual(search_end, datetime.datetime(2024, 1, 1))
+        self.assertEqual(lockbox_start, datetime.datetime(2024, 1, 1))
+        self.assertEqual(lockbox_end, datetime.datetime(2025, 1, 1))
+        self.assertEqual(search_end, lockbox_start)   # adjacency guarantee
+
+    def test_wide_search_strategy_id_is_a_stable_string(self):
+        self.assertIsInstance(orb.WIDE_SEARCH_STRATEGY_ID, str)
+        self.assertGreater(len(orb.WIDE_SEARCH_STRATEGY_ID), 0)
+
+    def test_lockbox_confirm_runs_end_to_end_against_orb_eval_fn(self):
+        """Builds a small multi-year synthetic dataset spanning both a "search" window and a
+        "lockbox" window, then calls opt_engine.lockbox_confirm with _make_orb_eval_fn-based
+        backtest_fn - exactly the pattern main()'s WIDE_SEARCH block uses - against an isolated
+        tempfile ledger (never the project's real, shared lockbox_ledger.json)."""
+        data = _small_multi_year_data(2016, 2020)   # search side would be e.g. 2016-2019, lockbox 2019-2020
+        lockbox_start = datetime.date(2019, 1, 1)
+        lockbox_end = datetime.date(2020, 1, 1)
+        # range_minutes=15 (not 10) deliberately: with this fixture's breakout bar at 09:40,
+        # RANGE_MINUTES=10 makes 09:40 the ENTRY bar (a real, non-zero-width entry against a
+        # flat/zero-width opening range), which is exactly the shape RANGE_ATR_FILTER is designed
+        # to reject once real ATR history accumulates - genuinely 0 trades after the first day, not
+        # a fixture bug (see TestRunBacktestMechanics' docstring for the same behavior). RANGE_
+        # MINUTES=15 instead makes 09:40 part of the RANGE itself, giving every day's opening range
+        # real width and avoiding that filter - this test is about lockbox wiring, not about
+        # re-deriving that filter behavior.
+        final_params = {"range_minutes": 15, "reward_risk": 2.0}
+
+        def backtest_fn(window_start, window_end):
+            eval_fn = orb._make_orb_eval_fn(data, window_start=window_start, window_end=window_end)
+            return eval_fn(final_params)
+
+        tmpdir = tempfile.mkdtemp()
+        ledger_path = os.path.join(tmpdir, "lockbox_ledger.json")
+
+        result = orb.opt_engine.lockbox_confirm(
+            "test_orb_lockbox_strategy", final_params, backtest_fn, lockbox_start, lockbox_end,
+            ledger_path=ledger_path)
+        self.assertIn("passed", result)
+        self.assertIn("n_trades", result)
+        self.assertGreater(result["n_trades"], 0)   # the alternating TP/SL fixture always has real trades
+
+        # one-shot enforcement: a second call for the SAME strategy_id must refuse, not re-run.
+        with self.assertRaises(orb.opt_engine.LockboxAlreadyUsedError):
+            orb.opt_engine.lockbox_confirm(
+                "test_orb_lockbox_strategy", final_params, backtest_fn, lockbox_start, lockbox_end,
+                ledger_path=ledger_path)
+
+    def test_lockbox_backtest_fn_only_sees_its_own_window(self):
+        """The backtest_fn main() builds for lockbox_confirm must respect window_start/window_end
+        exactly like every other windowed call in this file - a lockbox that accidentally leaked
+        search-side data would defeat the entire point."""
+        data = _small_multi_year_data(2016, 2020)
+        final_params = {"range_minutes": 15, "reward_risk": 2.0}   # see the comment in the lockbox
+                                                                     # end-to-end test above for why 15
+
+        def backtest_fn(window_start, window_end):
+            eval_fn = orb._make_orb_eval_fn(data, window_start=window_start, window_end=window_end)
+            return eval_fn(final_params)
+
+        lockbox_only = backtest_fn(datetime.date(2019, 1, 1), datetime.date(2020, 1, 1))
+        full_range = backtest_fn(None, None)
+        self.assertGreater(len(lockbox_only), 0)
+        self.assertLess(len(lockbox_only), len(full_range))
+        for t in lockbox_only:
+            self.assertGreaterEqual(t["date"], datetime.date(2019, 1, 1))
+            self.assertLess(t["date"], datetime.date(2020, 1, 1))
+
+
 # ============================= Monte Carlo =============================
 
 class TestMonteCarlo(unittest.TestCase):
@@ -651,6 +747,25 @@ class TestSmokeEndToEnd(unittest.TestCase):
         self.assertEqual(len(fold_results), len(folds))
         wfe_stats = orb.compute_walk_forward_efficiency(fold_results, combined_oos_r)
         self.assertIn("wfe", wfe_stats)
+
+        # STEP W5 analog: lockbox confirmation of the search's winning combo, on an isolated
+        # tempfile ledger - mirrors main()'s WIDE_SEARCH block end to end, including the
+        # split_lockbox() call that determines the search/lockbox boundary.
+        search_start, search_end, lockbox_start, lockbox_end = orb.opt_engine.split_lockbox(
+            datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1), lockbox_months=12)
+        final_params = search_result["best"]["params"]
+
+        def backtest_fn(window_start, window_end):
+            eval_fn = orb._make_orb_eval_fn(data, window_start=window_start, window_end=window_end)
+            return eval_fn(final_params)
+
+        tmpdir = tempfile.mkdtemp()
+        ledger_path = os.path.join(tmpdir, "lockbox_ledger.json")
+        lockbox_result = orb.opt_engine.lockbox_confirm(
+            "smoke_test_wide_search_lockbox", final_params, backtest_fn,
+            lockbox_start.date(), lockbox_end.date(), ledger_path=ledger_path)
+        self.assertIn("passed", lockbox_result)
+        print(f"\n[smoke test] lockbox result: {lockbox_result}")
 
 
 if __name__ == "__main__":

@@ -201,17 +201,41 @@ WIDE_PARAM_GRID = {
     "rvol_mult": RVOL_MULT_GRID,
 }
 
-# HONEST CAVEAT (printed verbatim by main() whenever WIDE_SEARCH is used - see
-# print_wide_search_caveat() below): as of this upgrade, research/optimization_engine.py does not
-# yet have a lockbox/embargoed-holdout mechanism wired in anywhere in this project (checked via
-# `grep -n "lockbox\|split_lockbox" research/optimization_engine.py` immediately before writing
-# this - no match). If that lands later, the wide-search path here - being the higher-dimensional,
-# higher-overfitting-risk search - is exactly the case it should be wired into first. Until then,
-# any promising WIDE_SEARCH result should be treated with MORE skepticism than the narrow default
-# grid's result, not less, even though it also gets Monte Carlo, cluster analysis, and its own
-# rolling walk-forward below (STEP W4) - more searched dimensions over the same finite historical
-# data is inherently more overfitting surface, walk-forward or not, without a genuine held-out
-# check this project doesn't have wired in yet.
+# --- LOCKBOX (research/optimization_engine.py's split_lockbox()/lockbox_confirm()) ---
+# UPDATE: at the time this WIDE_SEARCH section was first written, this project's
+# research/optimization_engine.py had no lockbox/embargoed-holdout mechanism anywhere (confirmed by
+# `grep -n "lockbox\|split_lockbox" research/optimization_engine.py` returning nothing). It landed
+# in a parallel commit shortly after, and per the reasoning below, the wide-search path here -
+# being the higher-dimensional, higher-overfitting-risk search - is exactly the case it should be
+# wired into first, so it now is:
+#
+#   - LOCKBOX_MONTHS carves the final `LOCKBOX_MONTHS` off the end of [FETCH_START, FETCH_END) via
+#     opt_engine.split_lockbox() BEFORE the wide search ever runs. With FETCH_START/FETCH_END =
+#     2016-01-01/2025-01-01 and the default 12 months, this yields search_start=2016-01-01,
+#     search_end=lockbox_start=2024-01-01, lockbox_end=2025-01-01 - the wide search's STEP W1
+#     full-search-range pass and STEP W4 walk-forward folds below are restricted to
+#     [search_start, search_end) only (2016-2023, 8 years), never touching 2024.
+#   - After the wide search (+ its Monte Carlo/cluster/walk-forward analysis) settles on ONE final
+#     combo, opt_engine.lockbox_confirm() runs that combo - and ONLY that combo, no re-searching -
+#     against the untouched 2024 lockbox window exactly once, ever, for WIDE_SEARCH_STRATEGY_ID
+#     (enforced by a persistent on-disk ledger - see optimization_engine.py's LOCKBOX section for
+#     why this is a hard one-shot refusal, not a re-runnable check).
+#
+# SCOPE LIMITATION (still worth being honest about): the narrow DEFAULT path (STEP 1-4 above) is
+# deliberately left UNCHANGED and still uses the full FETCH_START-FETCH_END range, including what
+# becomes the wide search's lockbox window - required for the regression-safety guarantee this
+# upgrade's default path depends on (see this file's top-of-module docstring). That means the
+# narrow default's own STEP 1-4 output does print results that touch 2024 before the wide search's
+# lockbox check ever runs - a lockbox this module doesn't attempt to firewall the rest of the
+# script's own printed output against. This is an acknowledged limitation, not an oversight: the
+# task this shipped from scoped the lockbox specifically to the wide-search path, not a project-
+# wide embargo across every script section.
+LOCKBOX_MONTHS = 12
+WIDE_SEARCH_STRATEGY_ID = "orb_indices_wide_search_v1"   # stable ledger key for lockbox_confirm -
+                                                            # bump to _v2/_v3/... if WIDE_PARAM_GRID's
+                                                            # shape or methodology changes enough that
+                                                            # a prior lockbox attempt shouldn't gate a
+                                                            # materially different search
 
 # ============================================================================
 # NEWS FILTER - INVESTIGATED, NOT IMPLEMENTED
@@ -1114,21 +1138,23 @@ def _resolve_wide_search_method():
     return WIDE_SEARCH_METHOD
 
 
-def print_wide_search_caveat():
+def print_wide_search_caveat(search_start, search_end, lockbox_start, lockbox_end):
     print("\n" + "=" * 70)
     print("WIDE_SEARCH CAVEAT - READ BEFORE TRUSTING ANYTHING BELOW")
     print("=" * 70)
     print("This run additionally searched MIN_RANGE_ATR_MULT/MAX_RANGE_ATR_MULT/IMPULSE_RANGE_MULT/"
           "RVOL_MULT alongside RANGE_MINUTES/REWARD_RISK - a much wider space than this project's "
-          "narrow, already-verified 2-parameter default. This project's research/optimization_engine.py "
-          "does not yet have a lockbox/embargoed-holdout mechanism wired in anywhere (checked via "
-          "`grep -n \"lockbox\\|split_lockbox\" research/optimization_engine.py` immediately before this "
-          "run - no match). Any promising result from this wide search should be treated with EXTRA "
-          "skepticism, more so than the narrow default's result above, even though it also gets its own "
-          "Monte Carlo, cluster analysis, and rolling walk-forward below - more searched dimensions over "
-          "the same finite historical data is inherently more overfitting surface, walk-forward or not, "
-          "without a genuine held-out check this project does not have wired in yet. If a lockbox lands "
-          "in optimization_engine.py later, this is exactly the path it should be wired into first.")
+          "narrow, already-verified 2-parameter default. The search side below is restricted to "
+          f"[{search_start}, {search_end}) - the final {LOCKBOX_MONTHS} months "
+          f"([{lockbox_start}, {lockbox_end})) are a genuine, ledger-enforced ONE-SHOT lockbox "
+          "(research/optimization_engine.py's split_lockbox()/lockbox_confirm()), never touched by "
+          "any search/Monte Carlo/cluster/walk-forward step below - only the single final combo the "
+          "search settles on gets checked against it, exactly once, ever. Even so, treat any promising "
+          "result from the SEARCH side (everything before the lockbox check) with EXTRA skepticism, "
+          "more so than the narrow default's result above - more searched dimensions over the same "
+          "finite historical data is inherently more overfitting surface, walk-forward or not. The "
+          "lockbox result is the one number in this section that was never available to the search "
+          "itself - weight it accordingly.")
 
 
 # ============================= main =============================
@@ -1237,31 +1263,40 @@ def main():
         print("Results are mixed across the grid, Monte Carlo, cluster, and walk-forward checks - see "
               "the sections above for the specific numbers.")
 
-    # ================= PART 1b: OPTIONAL WIDE SEARCH =================
+    # ================= PART 1b: OPTIONAL WIDE SEARCH (search side + lockbox) =================
     if WIDE_SEARCH:
         wide_method = _resolve_wide_search_method()
-        print_wide_search_caveat()
+
+        search_start_dt, search_end_dt, lockbox_start_dt, lockbox_end_dt = opt_engine.split_lockbox(
+            FETCH_START, FETCH_END, LOCKBOX_MONTHS)
+        search_start, search_end = search_start_dt.date(), search_end_dt.date()
+        lockbox_start, lockbox_end = lockbox_start_dt.date(), lockbox_end_dt.date()
+
+        print_wide_search_caveat(search_start, search_end, lockbox_start, lockbox_end)
 
         print("\n" + "=" * 70)
         print(f"WIDE SEARCH: {wide_method} search over RANGE_MINUTES/REWARD_RISK + 4 filter thresholds "
-              f"(6,400-combo full cross product, NOT exhaustively searched)")
+              f"(6,400-combo full cross product, NOT exhaustively searched) - SEARCH SIDE ONLY "
+              f"[{search_start}, {search_end}), lockbox [{lockbox_start}, {lockbox_end}) excluded")
         print("=" * 70)
         wide_kwargs = {"n_trials": WIDE_SEARCH_N_TRIALS} if wide_method == "bayesian" else \
             {"population_size": WIDE_SEARCH_POPULATION, "generations": WIDE_SEARCH_GENERATIONS}
         wide_grid_results, wide_search_result = run_param_search(
-            data, param_grid=WIDE_PARAM_GRID, method=wide_method, desc="wide search", **wide_kwargs)
+            data, window_start=search_start, window_end=search_end, param_grid=WIDE_PARAM_GRID,
+            method=wide_method, desc="wide search", **wide_kwargs)
         print(f"\n{wide_method} search evaluated {wide_search_result['n_evals']} distinct combos "
               f"(vs 6,400 in the full cross product).")
         print_top_wide_results(wide_grid_results)
 
         wide_best = _find_cell(wide_grid_results, wide_search_result["best"]["params"])
-        print(f"\nBest wide-search combo: {_format_params(wide_best['params'])} -> {wide_best['total_r']:+.2f}R "
-              f"over {wide_best['n_trades']} trades ({wide_best['avg_r']:+.4f}R/trade)")
-        print(f"For comparison, the narrow default's best cell: {best_cell['total_r']:+.2f}R over "
+        final_wide_params = wide_best["params"]
+        print(f"\nBest wide-search combo (search side only): {_format_params(final_wide_params)} -> "
+              f"{wide_best['total_r']:+.2f}R over {wide_best['n_trades']} trades ({wide_best['avg_r']:+.4f}R/trade)")
+        print(f"For comparison, the narrow default's best cell (full range): {best_cell['total_r']:+.2f}R over "
               f"{best_cell['n_trades']} trades ({best_cell['avg_r']:+.4f}R/trade)")
 
         print("\n" + "-" * 70)
-        print(f"STEP W2: Monte Carlo per wide-search cell ({MC_ITERATIONS} iterations each)")
+        print(f"STEP W2: Monte Carlo per wide-search cell ({MC_ITERATIONS} iterations each, search side only)")
         print("-" * 70)
         wide_mc_results = run_monte_carlo_all_cells(wide_grid_results)
         print_monte_carlo_table(wide_mc_results)
@@ -1269,14 +1304,56 @@ def main():
         print_cluster_analysis(wide_grid_results, search_method=wide_method,
                                 param_names=tuple(WIDE_PARAM_GRID.keys()))
 
+        wide_folds = generate_walk_forward_folds(search_start.year, search_end.year)
         wide_fold_results, wide_combined_oos_r = run_walk_forward(
-            data, folds, param_grid=WIDE_PARAM_GRID, method=wide_method, **wide_kwargs)
+            data, wide_folds, param_grid=WIDE_PARAM_GRID, method=wide_method, **wide_kwargs)
         wide_wfe_stats = compute_walk_forward_efficiency(wide_fold_results, wide_combined_oos_r)
         print_walk_forward(wide_fold_results, wide_wfe_stats,
-                            title=f"wide-search rolling walk-forward ({wide_method}, 4 extra filter thresholds)")
+                            title=f"wide-search rolling walk-forward ({wide_method}, 4 extra filter thresholds, "
+                                  f"search side only [{search_start}, {search_end}))")
+
+        # ---------------- STEP W5: lockbox confirmation (ONE combo, ONE check, ever) ----------------
+        print("\n" + "=" * 70)
+        print(f"STEP W5: LOCKBOX CONFIRMATION - strategy_id={WIDE_SEARCH_STRATEGY_ID!r}, "
+              f"window [{lockbox_start}, {lockbox_end})")
+        print("=" * 70)
+
+        def _lockbox_backtest_fn(window_start, window_end):
+            eval_fn = _make_orb_eval_fn(data, window_start=window_start, window_end=window_end)
+            return eval_fn(final_wide_params)
+
+        try:
+            lockbox_result = opt_engine.lockbox_confirm(
+                WIDE_SEARCH_STRATEGY_ID, final_wide_params, _lockbox_backtest_fn,
+                lockbox_start, lockbox_end)
+            verdict = "PASSED" if lockbox_result["passed"] else "FAILED"
+            print(f"Lockbox {verdict}: {lockbox_result['n_trades']} trades, "
+                  f"{lockbox_result['total_r']:+.2f}R, {lockbox_result['avg_r']:+.4f}R/trade "
+                  f"(pass rule: positive avg R/trade AND non-negative consistency_ratio when there's "
+                  f"enough lockbox data to compute one - see optimization_engine.py's lockbox_confirm "
+                  f"docstring for the exact rule)")
+            print(f"consistency_ratio on the lockbox window: {lockbox_result['consistency']}")
+            if lockbox_result["passed"]:
+                print("\nThis is the closest this project currently gets to a genuine, never-re-touched "
+                      "confirmation of a wide-search combo - still only ONE data point on ONE holdout "
+                      "window, not proof of a durable edge, but a real one-shot check the narrow "
+                      "default's rolling walk-forward above does not provide (those OOS folds get "
+                      "re-touched on every search re-run; this lockbox window, by construction, cannot.")
+            else:
+                print("\nThe wide-search combo did NOT clear the lockbox. Combined with the fact that "
+                      "this combo was chosen from a much wider search than the narrow default, this is "
+                      "real evidence against trusting the wide-search result, not just an unlucky draw "
+                      "to explain away.")
+        except opt_engine.LockboxAlreadyUsedError as exc:
+            print(f"Lockbox SKIPPED: {exc}")
+            print("The search-side results above (grid/Bayesian/genetic search, Monte Carlo, cluster "
+                  "analysis, walk-forward) are still valid and printed in full - only the one-shot "
+                  "lockbox confirmation itself was skipped, exactly as designed, since it was already "
+                  "used for this strategy_id in a prior run.")
 
         print("\nREMINDER: see the WIDE_SEARCH CAVEAT printed above before drawing any conclusion from "
-              "this section - extra skepticism, not less, applies here.")
+              "this section - extra skepticism, not less, applies to the search-side numbers above the "
+              "lockbox result.")
 
     # ================= PART 2: ML scoring =================
     print("\n" + "=" * 70)
