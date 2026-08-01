@@ -57,6 +57,11 @@ SESSION_HOLD_HOURS = 8         # flatten this many hours after the session opens
 ENTRY_BUFFER_PCT = 0.02        # close must clear the range by this % of price (indices span 4,000-40,000+, so % not a flat point value)
 REWARD_RISK = 1.0              # classic measured-move target
 MIN_RANGE_PCT = 0.05           # SL distance floor as % of price
+
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
 REVERSE_SIGNALS = False
 
 ATR_LEN = 14
@@ -282,7 +287,8 @@ def backtest_index(label, instrument_const, tz_name, session_start):
             pnl = (last_close - entry) if side == "LONG" else (entry - last_close)
             outcome, exit_r = "FLAT", pnl / sl_distance
 
-        trades.append({"index": label, "side": side, "outcome": outcome, "r": exit_r})
+        trades.append({"index": label, "side": side, "outcome": outcome, "r": exit_r,
+                       "stop_pct": sl_distance / entry})
         i = j + 1
 
     return trades
@@ -331,6 +337,14 @@ def main():
     print("\nPer-index:")
     per_index = df.groupby("index")["r"].agg(trades="count", total_r="sum", avg_r="mean")
     print(per_index.sort_values("total_r", ascending=False).round(3))
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/len(df):+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled above - real results will be worse than this.")
 

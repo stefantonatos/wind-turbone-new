@@ -104,6 +104,11 @@ BB_LENGTH = 20             # SMA/stddev lookback for the bands
 BB_NUM_STD = 2.0           # band width, in stddevs
 STOP_BUFFER_PCT = 0.02     # % of price beyond the excursion bar's low/high - same scale as other scripts
 MIN_SL_PCT = 0.02          # floor on stop distance, as a % of entry - guards against near-zero stddev periods
+
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
 MAX_HOLD_BARS = 48         # 4 hours of 5-min bars
 
 
@@ -199,7 +204,8 @@ def backtest_instrument(label, df):
                 pnl = (closes[i] - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - closes[i])
                 outcome, exit_r = "FLAT", pnl / open_trade["sl_distance"]
             if outcome is not None:
-                trades.append({"side": side, "outcome": outcome, "r": exit_r, "date": times[i].date()})
+                trades.append({"side": side, "outcome": outcome, "r": exit_r, "date": times[i].date(),
+                               "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
                 open_trade = None
             continue   # one trade at a time - don't look for a new signal on a bar we just managed
 
@@ -321,6 +327,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entry is a simulated market order at the close of the "
           "bar that confirms re-entry into the band - real fills would be worse (that close is the exact "

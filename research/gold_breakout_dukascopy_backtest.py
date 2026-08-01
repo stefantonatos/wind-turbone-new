@@ -30,6 +30,11 @@ ATR_LEN = 14
 BREAKOUT_ATR_OFFSET = 0.5
 REWARD_ATR_MULT = 5.0
 RISK_ATR_MULT = 1.0
+
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
 MAX_HOLD_BARS = 5
 POSITION_PCT = 0.20
 STARTING_EQUITY = 10000.0
@@ -114,7 +119,7 @@ def backtest_ticker(label, instrument_const):
 
         trades.append({
             "ticker": label, "outcome": outcome, "r": r_multiple,
-            "pnl_dollars": pnl_dollars, "equity_after": equity,
+            "pnl_dollars": pnl_dollars, "equity_after": equity, "stop_pct": risk / entry,
         })
         i = j_final + 1
 
@@ -169,6 +174,14 @@ def main():
         ticker_trades = [t for t in all_trades if t["ticker"] == label]
         if ticker_trades:
             print(f"  {label}: ${STARTING_EQUITY:,.0f} -> ${ticker_trades[-1]['equity_after']:,.0f}")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/len(df):+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled above - real results will be worse than this.")
 

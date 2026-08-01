@@ -66,6 +66,11 @@ STOP_BUFFER_PCT = 0.02          # small buffer beyond the manipulation's wick, s
 FALLBACK_REWARD_RISK = 2.0      # used only if the opposite range edge is already passed or too close
 MIN_RANGE_PCT = 0.02            # floor on the accumulation range size, guards against a degenerate near-zero range
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def to_ny_time(index):
     if index.tz is None:
@@ -195,7 +200,8 @@ def backtest_instrument(label, df):
             pnl = (entry - last_close) if side == "SHORT" else (last_close - entry)
             outcome, exit_r = "FLAT", pnl / sl_distance
 
-        trades.append({"side": side, "outcome": outcome, "r": exit_r, "date": today})
+        trades.append({"side": side, "outcome": outcome, "r": exit_r, "date": today,
+                       "stop_pct": sl_distance / entry})
         i = j + 1
 
     return trades
@@ -288,6 +294,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entry is a simulated market order at the close of the "
           "first bar that breaks the accumulation range - real fills would be worse (the actual break is "

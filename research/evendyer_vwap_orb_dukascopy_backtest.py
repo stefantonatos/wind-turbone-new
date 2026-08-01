@@ -188,6 +188,11 @@ TARGET_SWING_LEN = 5    # bars each side, confirmed-pivot lookback used for the 
 BUFFER_AMOUNT = 0.0     # price units beyond the swing extreme - Pine default is 0, kept as-is (see header note 6)
 MAX_TRADES_PER_DAY = 1
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 VOLUME_USABLE_MIN_NONZERO_FRACTION = 0.5   # heuristic threshold - see determine_vwap_weights()
 
 
@@ -331,7 +336,8 @@ def backtest_instrument(label, df, verbose=True, record_trace=False):
                 last_close = closes[i - 1]
                 pnl = (last_close - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - last_close)
                 trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"],
-                                "date": times[i - 1].date()})
+                                "date": times[i - 1].date(),
+                                "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
                 open_trade = None
             current_day = today
             orb_high = orb_low = None
@@ -348,15 +354,18 @@ def backtest_instrument(label, df, verbose=True, record_trace=False):
             hi, lo = highs[i], lows[i]
             hit_stop = lo <= stop if side == "LONG" else hi >= stop
             hit_target = hi >= target if side == "LONG" else lo <= target
+            stop_pct = open_trade["sl_distance"] / open_trade["entry"]
             if hit_stop:
-                trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": today})
+                trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": today, "stop_pct": stop_pct})
                 open_trade = None
             elif hit_target:
-                trades.append({"side": side, "outcome": "TP", "r": open_trade["reward_risk"], "date": today})
+                trades.append({"side": side, "outcome": "TP", "r": open_trade["reward_risk"], "date": today,
+                               "stop_pct": stop_pct})
                 open_trade = None
             elif tod >= FORCE_CLOSE_TIME:
                 pnl = (closes[i] - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - closes[i])
-                trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"], "date": today})
+                trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"], "date": today,
+                               "stop_pct": stop_pct})
                 open_trade = None
 
         in_orb = ORB_SESSION[0] <= tod < ORB_SESSION[1]
@@ -474,7 +483,7 @@ def backtest_instrument(label, df, verbose=True, record_trace=False):
         last_close = closes[-1]
         pnl = (last_close - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - last_close)
         trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"],
-                        "date": times[-1].date()})
+                        "date": times[-1].date(), "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
 
     if record_trace:
         return trades, used_real_volume, diag, trace
@@ -569,6 +578,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled (the original Pine source DID model $2.50/contract "
           "commission + 1 tick slippage in its own strategy() declaration - not replicated here, see "

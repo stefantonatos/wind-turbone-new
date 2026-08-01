@@ -166,6 +166,11 @@ EXIT_PERIOD = 10       # trailing exit channel, in complete prior trading days
 ATR_PERIOD = 14        # Wilder ATR length
 ATR_STOP_MULT = 2.0    # initial stop = entry +/- ATR_STOP_MULT * ATR(14)
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def to_ny_time(index):
     if index.tz is None:
@@ -305,29 +310,30 @@ def backtest_instrument(label, df):
             hi, lo = highs[i], lows[i]
             ex_low, ex_high = sig["exit_low"], sig["exit_high"]
 
+            stop_pct = position["sl_distance"] / position["entry"]
             if side == "LONG":
                 hit_stop = lo <= stop
                 hit_trail = (ex_low is not None) and not pd.isna(ex_low) and lo <= ex_low
                 if hit_stop:
                     trades.append({"side": side, "outcome": "SL", "r": -1.0,
-                                   "date": position["entry_date"]})
+                                   "date": position["entry_date"], "stop_pct": stop_pct})
                     position = None
                 elif hit_trail:
                     r = (ex_low - position["entry"]) / position["sl_distance"]
                     trades.append({"side": side, "outcome": "TRAIL", "r": r,
-                                   "date": position["entry_date"]})
+                                   "date": position["entry_date"], "stop_pct": stop_pct})
                     position = None
             else:   # SHORT
                 hit_stop = hi >= stop
                 hit_trail = (ex_high is not None) and not pd.isna(ex_high) and hi >= ex_high
                 if hit_stop:
                     trades.append({"side": side, "outcome": "SL", "r": -1.0,
-                                   "date": position["entry_date"]})
+                                   "date": position["entry_date"], "stop_pct": stop_pct})
                     position = None
                 elif hit_trail:
                     r = (position["entry"] - ex_high) / position["sl_distance"]
                     trades.append({"side": side, "outcome": "TRAIL", "r": r,
-                                   "date": position["entry_date"]})
+                                   "date": position["entry_date"], "stop_pct": stop_pct})
                     position = None
             # one trade at a time: whether the position just closed or is still open, don't
             # also evaluate a fresh entry on this same bar (matches this project's preference
@@ -359,7 +365,7 @@ def backtest_instrument(label, df):
         last_close = closes[-1]
         pnl = (last_close - position["entry"]) if side == "LONG" else (position["entry"] - last_close)
         trades.append({"side": side, "outcome": "FLAT", "r": pnl / position["sl_distance"],
-                        "date": position["entry_date"]})
+                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"]})
 
     return trades
 
@@ -452,6 +458,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entries and trailing-channel exits are filled at exact "
           "simulated prices (bar close / exact channel level) - real fills, especially the ATR stop during a "

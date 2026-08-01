@@ -74,6 +74,11 @@ STOP_BUFFER_PCT = 0.02         # small buffer beyond the sweep's wick, same scal
 # --- grid search space (kept to one parameter, per this project's overfitting guard) ---
 REWARD_RISK_GRID = [1.5, 2.0, 3.0]
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def to_ny_time(index):
     if index.tz is None:
@@ -208,7 +213,8 @@ def find_silver_bullet_trade(highs, lows, closes, times, window_start_idx, windo
         pnl = (last_close - entry_price) if sweep_side == "LONG" else (entry_price - last_close)
         outcome, exit_r = "FLAT", pnl / sl_distance
 
-    return {"side": sweep_side, "outcome": outcome, "r": exit_r, "date": times[window_start_idx].date()}
+    return {"side": sweep_side, "outcome": outcome, "r": exit_r, "date": times[window_start_idx].date(),
+            "stop_pct": sl_distance / entry_price}
 
 
 def precompute_days(df):
@@ -346,6 +352,15 @@ def main():
         print(f"\nCAVEAT: only {n_trades_oos} out-of-sample trades - too few to distinguish real edge "
               f"from noise with confidence (rule of thumb elsewhere in this project has been 100-200+ "
               f"out-of-sample trades before trusting a result). Treat this as a first look, not a verdict.")
+
+    print(f"\nCOST SENSITIVITY (out-of-sample trades only, illustrative round-trip spread scenarios, "
+          f"NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_oos_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades_oos:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entry is a simulated resting limit order at the FVG "
           "midpoint - real fills would be worse (requoting, partial fills, the level not being reached "

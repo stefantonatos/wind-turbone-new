@@ -141,6 +141,11 @@ FORCE_CLOSE_TIME = pd.Timestamp("16:00").time()
 
 STOP_BUFFER_PCT = 0.02   # % of price beyond the sweep's wick extreme - see header note on the tick-to-% swap
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def to_ny_time(index):
     if index.tz is None:
@@ -216,7 +221,8 @@ def backtest_instrument(label, df):
                 last_close = closes[i - 1]
                 pnl = (last_close - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - last_close)
                 trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"],
-                                "date": times[i - 1].date(), "range": open_trade["range"]})
+                                "date": times[i - 1].date(), "range": open_trade["range"],
+                                "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
                 open_trade = None
             current_day = today
             for st in range_states.values():
@@ -232,17 +238,19 @@ def backtest_instrument(label, df):
             hi, lo = highs[i], lows[i]
             hit_stop = lo <= stop if side == "LONG" else hi >= stop
             hit_target = hi >= target if side == "LONG" else lo <= target
+            stop_pct = open_trade["sl_distance"] / open_trade["entry"]
             if hit_stop:
-                trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": today, "range": open_trade["range"]})
+                trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": today,
+                               "range": open_trade["range"], "stop_pct": stop_pct})
                 open_trade = None
             elif hit_target:
                 trades.append({"side": side, "outcome": "TP", "r": open_trade["reward_risk"], "date": today,
-                                "range": open_trade["range"]})
+                                "range": open_trade["range"], "stop_pct": stop_pct})
                 open_trade = None
             elif tod >= FORCE_CLOSE_TIME:
                 pnl = (closes[i] - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - closes[i])
                 trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"], "date": today,
-                                "range": open_trade["range"]})
+                                "range": open_trade["range"], "stop_pct": stop_pct})
                 open_trade = None
 
         # --- range building, sweep detection, and entry confirmation, per range ---
@@ -426,6 +434,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entry is a simulated market order at the close of the "
           "bar whose close breaks the 3-candle-reversal level - real fills would be worse (that close is "

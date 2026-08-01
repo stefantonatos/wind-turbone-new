@@ -187,6 +187,11 @@ DUKASCOPY_OFFER_SIDE = dukascopy_python.OFFER_SIDE_BID
 
 SWING_LEN = 20   # bars (trading days) required on EACH side to confirm a swing high/low - the one structural parameter
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def to_ny_time(index):
     if index.tz is None:
@@ -361,7 +366,8 @@ def backtest_instrument(label, df):
                     position["stop"] = max(position["stop"], eff_stop)   # trail only ever ratchets favorably
                 if lo <= position["stop"]:
                     r = (position["stop"] - position["entry"]) / position["sl_distance"]
-                    trades.append({"side": side, "outcome": "STOP", "r": r, "date": position["entry_date"]})
+                    trades.append({"side": side, "outcome": "STOP", "r": r, "date": position["entry_date"],
+                                   "stop_pct": position["sl_distance"] / position["entry"]})
                     position = None
             else:   # SHORT
                 eff_stop = sig["stop_short_effective"]
@@ -369,7 +375,8 @@ def backtest_instrument(label, df):
                     position["stop"] = min(position["stop"], eff_stop)
                 if hi >= position["stop"]:
                     r = (position["entry"] - position["stop"]) / position["sl_distance"]
-                    trades.append({"side": side, "outcome": "STOP", "r": r, "date": position["entry_date"]})
+                    trades.append({"side": side, "outcome": "STOP", "r": r, "date": position["entry_date"],
+                                   "stop_pct": position["sl_distance"] / position["entry"]})
                     position = None
             # one trade at a time: whether the position just closed or is still open, don't also
             # evaluate a fresh entry on this same bar (matches Donchian's identical convention)
@@ -399,7 +406,7 @@ def backtest_instrument(label, df):
         last_close = closes[-1]
         pnl = (last_close - position["entry"]) if side == "LONG" else (position["entry"] - last_close)
         trades.append({"side": side, "outcome": "FLAT", "r": pnl / position["sl_distance"],
-                        "date": position["entry_date"]})
+                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"]})
 
     return trades
 
@@ -501,6 +508,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entries and trailing-stop exits are simulated at exact "
           "prices (bar close / exact trail level) - real fills, especially the trailing stop during a fast "

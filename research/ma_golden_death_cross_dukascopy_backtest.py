@@ -158,6 +158,11 @@ SMA_SLOW = 200
 ATR_PERIOD = 14
 ATR_STOP_MULT = 3.0   # sl_distance = ATR_STOP_MULT * ATR(14) - both the R basis AND a real hard stop, see header
 
+# Illustrative round-trip cost scenarios, as a percentage of entry price - NOT measured real spread
+# data, just a few bracketing assumptions to see how much cost this edge can absorb before it
+# disappears, same convention introduced in support_resistance_zone_bounce_dukascopy_backtest.py.
+COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
+
 
 def to_ny_time(index):
     if index.tz is None:
@@ -321,7 +326,8 @@ def backtest_instrument(label, df):
             hi, lo = highs[i], lows[i]
             hit_stop = (lo <= stop) if side == "LONG" else (hi >= stop)
             if hit_stop:
-                trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": position["entry_date"]})
+                trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": position["entry_date"],
+                               "stop_pct": position["sl_distance"] / position["entry"]})
                 position = None
 
         # --- cross-triggered actions: evaluated ONLY on the action day's first 5-min bar - a
@@ -338,7 +344,8 @@ def backtest_instrument(label, df):
                 if opposite_fired:
                     pnl = (close - position["entry"]) if side == "LONG" else (position["entry"] - close)
                     trades.append({"side": side, "outcome": "CROSS", "r": pnl / position["sl_distance"],
-                                   "date": position["entry_date"]})
+                                   "date": position["entry_date"],
+                                   "stop_pct": position["sl_distance"] / position["entry"]})
                     position = None
 
             atr = sig["atr"]
@@ -364,7 +371,7 @@ def backtest_instrument(label, df):
         last_close = closes[-1]
         pnl = (last_close - position["entry"]) if side == "LONG" else (position["entry"] - last_close)
         trades.append({"side": side, "outcome": "FLAT", "r": pnl / position["sl_distance"],
-                        "date": position["entry_date"]})
+                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"]})
 
     return trades
 
@@ -463,6 +470,14 @@ def main():
           f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
           f"evidence, since data-snooping risk compounds across every strategy and parameter "
           f"combination tried project-wide, not just this one.")
+
+    print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data):")
+    for cost_pct in COST_PCT_SCENARIOS:
+        cost_adjusted_total = sum(t["r"] - (cost_pct / 100.0) / t["stop_pct"] for t in all_trades)
+        print(f"  {cost_pct:.2f}% round-trip cost: {cost_adjusted_total:+.2f}R total, "
+              f"{cost_adjusted_total/n_trades:+.4f}R/trade")
+    print(f"  If the total goes negative well before 0.05%, this edge is too thin to survive real "
+          f"execution costs - check your actual broker's spread on each instrument against these numbers.")
 
     print("\nNo commission/spread/slippage modeled. Entries/exits are simulated market orders at the "
           "relevant bar's close; real fills would be worse. Flat-then-wait was chosen over always-in-market "
