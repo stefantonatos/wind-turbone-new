@@ -311,29 +311,35 @@ def backtest_instrument(label, df):
             ex_low, ex_high = sig["exit_low"], sig["exit_high"]
 
             stop_pct = position["sl_distance"] / position["entry"]
+            common = {"entry_price": position["entry"], "stop_price": stop, "target_price": None,
+                      "entry_time": position["entry_time"], "exit_time": times[i]}
             if side == "LONG":
                 hit_stop = lo <= stop
                 hit_trail = (ex_low is not None) and not pd.isna(ex_low) and lo <= ex_low
                 if hit_stop:
                     trades.append({"side": side, "outcome": "SL", "r": -1.0,
-                                   "date": position["entry_date"], "stop_pct": stop_pct})
+                                   "date": position["entry_date"], "stop_pct": stop_pct,
+                                   "exit_price": stop, **common})
                     position = None
                 elif hit_trail:
                     r = (ex_low - position["entry"]) / position["sl_distance"]
                     trades.append({"side": side, "outcome": "TRAIL", "r": r,
-                                   "date": position["entry_date"], "stop_pct": stop_pct})
+                                   "date": position["entry_date"], "stop_pct": stop_pct,
+                                   "exit_price": ex_low, **common})
                     position = None
             else:   # SHORT
                 hit_stop = hi >= stop
                 hit_trail = (ex_high is not None) and not pd.isna(ex_high) and hi >= ex_high
                 if hit_stop:
                     trades.append({"side": side, "outcome": "SL", "r": -1.0,
-                                   "date": position["entry_date"], "stop_pct": stop_pct})
+                                   "date": position["entry_date"], "stop_pct": stop_pct,
+                                   "exit_price": stop, **common})
                     position = None
                 elif hit_trail:
                     r = (position["entry"] - ex_high) / position["sl_distance"]
                     trades.append({"side": side, "outcome": "TRAIL", "r": r,
-                                   "date": position["entry_date"], "stop_pct": stop_pct})
+                                   "date": position["entry_date"], "stop_pct": stop_pct,
+                                   "exit_price": ex_high, **common})
                     position = None
             # one trade at a time: whether the position just closed or is still open, don't
             # also evaluate a fresh entry on this same bar (matches this project's preference
@@ -351,21 +357,23 @@ def backtest_instrument(label, df):
             sl_distance = entry - stop
             if sl_distance > 0:
                 position = {"side": "LONG", "entry": entry, "stop": stop,
-                            "sl_distance": sl_distance, "entry_date": day}
+                            "sl_distance": sl_distance, "entry_date": day, "entry_time": times[i]}
         elif close < ch_low:
             entry = close
             stop = entry + ATR_STOP_MULT * atr
             sl_distance = stop - entry
             if sl_distance > 0:
                 position = {"side": "SHORT", "entry": entry, "stop": stop,
-                            "sl_distance": sl_distance, "entry_date": day}
+                            "sl_distance": sl_distance, "entry_date": day, "entry_time": times[i]}
 
     if position is not None:
         side = position["side"]
         last_close = closes[-1]
         pnl = (last_close - position["entry"]) if side == "LONG" else (position["entry"] - last_close)
         trades.append({"side": side, "outcome": "FLAT", "r": pnl / position["sl_distance"],
-                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"]})
+                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"],
+                        "entry_price": position["entry"], "stop_price": position["stop"], "target_price": None,
+                        "exit_price": last_close, "entry_time": position["entry_time"], "exit_time": times[-1]})
 
     return trades
 

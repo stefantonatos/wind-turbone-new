@@ -24,7 +24,7 @@ import run_history
 import stats as stats_mod
 import style
 from registry import STRATEGIES, STRATEGIES_BY_ID, _instrument_labels
-from style import ACCENT, CRITICAL, GOOD, INK_MUTED, CSS, PLOTLY_LAYOUT_DEFAULTS, eyebrow
+from style import ACCENT, CRITICAL, GOOD, WARNING, INK_MUTED, CSS, PLOTLY_LAYOUT_DEFAULTS, eyebrow
 
 st.set_page_config(page_title="Strategy Backtests", layout="wide")
 st.markdown(CSS, unsafe_allow_html=True)
@@ -92,7 +92,8 @@ def style_diverging_heatmap(df):
 # History, so the filter/stats/chart/table behavior is identical either way.
 # --------------------------------------------------------------------------------------
 
-def render_filterable_results(trades, facets, key_prefix):
+def render_filterable_results(trades, strategy, key_prefix):
+    facets = strategy.facets if strategy else []
     outcomes = sorted({t.get("outcome") for t in trades if t.get("outcome")})
     instruments = sorted({t.get("instrument") for t in trades if t.get("instrument")})
     sides = sorted({t.get("side") for t in trades if t.get("side")})
@@ -221,7 +222,89 @@ def render_filterable_results(trades, facets, key_prefix):
     trade_df = pd.DataFrame(display_trades)
     st.dataframe(style_signed_columns(trade_df, ["r"]), use_container_width=True, hide_index=True)
 
+    render_trade_chart_section(strategy, filtered, key_prefix)
     render_prop_firm_fit_section(filtered, key_prefix)
+
+
+def render_trade_chart_section(strategy, trades, key_prefix):
+    """Real candlestick chart around one chosen trade, with entry/stop/target as horizontal
+    lines and entry/exit as markers - a short, freshly-fetched window (not a slice of the
+    full backtest range), gated behind a button since it's a real Dukascopy fetch. Only
+    strategies whose trade dicts carry entry/stop/target/exit price+time show this section -
+    see registry.py's chart_fetcher field for exactly which ones do so far."""
+    if strategy is None or strategy.chart_fetcher is None:
+        return
+    chartable = [t for t in trades if t.get("entry_time") and t.get("exit_time")
+                 and t.get("entry_price") is not None]
+    if not chartable:
+        return
+
+    st.markdown(eyebrow("TRADE CHART"), unsafe_allow_html=True)
+
+    def _label(t):
+        et = pd.Timestamp(t["entry_time"])
+        return (f"{et.strftime('%Y-%m-%d %H:%M')} - {t.get('instrument', '?')} {t.get('side', '?')} "
+                f"({t.get('outcome', '?')}, {t.get('r', 0.0):+.2f}R)")
+
+    chosen_idx = st.selectbox("Trade", range(len(chartable)), format_func=lambda i: _label(chartable[i]),
+                               key=f"{key_prefix}_chart_trade")
+    trade = chartable[chosen_idx]
+    const_map = dict(strategy.instruments)
+    const = const_map.get(trade.get("instrument"))
+    if const is None:
+        st.caption("Can't chart this trade - its instrument wasn't found in the strategy's instrument list.")
+        return
+
+    entry_time = pd.Timestamp(trade["entry_time"])
+    exit_time = pd.Timestamp(trade["exit_time"])
+    duration = exit_time - entry_time
+    pad = max(duration * 0.25, pd.Timedelta(hours=6))
+    window_start, window_end = entry_time - pad, exit_time + pad
+    fetch_start = window_start.tz_convert("UTC").tz_localize(None) if window_start.tzinfo else window_start
+    fetch_end = window_end.tz_convert("UTC").tz_localize(None) if window_end.tzinfo else window_end
+
+    st.caption("A real, freshly-fetched Dukascopy candlestick window around this trade only (not the whole "
+               "backtest range) - gated behind the button below since it's a real fetch, same as the "
+               "Optimization tab and Prop Firm Fit sweep above.")
+    if not st.button("Load chart", key=f"{key_prefix}_chart_load"):
+        return
+
+    module = importlib.import_module(strategy.module_name)
+    with st.spinner(f"Fetching {trade.get('instrument')} bars around this trade..."):
+        try:
+            df = strategy.chart_fetcher(module, trade.get("instrument"), const, fetch_start, fetch_end)
+        except Exception as exc:
+            st.error(f"Couldn't fetch chart data: {exc}")
+            return
+    if df is None or df.empty:
+        st.warning("No bar data returned for this window.")
+        return
+
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+        increasing_line_color=GOOD, decreasing_line_color=CRITICAL, name=trade.get("instrument"))])
+    for price, price_label, color in (
+        (trade.get("entry_price"), "Entry", ACCENT),
+        (trade.get("stop_price"), "Stop", CRITICAL),
+        (trade.get("target_price"), "Target", GOOD),
+    ):
+        if price is not None:
+            fig.add_hline(y=price, line=dict(color=color, width=1, dash="dot"),
+                          annotation_text=price_label, annotation_position="right",
+                          annotation_font_color=color)
+    exit_color = GOOD if trade.get("outcome") == "TP" else (CRITICAL if trade.get("outcome") == "SL" else WARNING)
+    fig.add_trace(go.Scatter(x=[entry_time], y=[trade.get("entry_price")], mode="markers",
+                              marker=dict(symbol="triangle-right", size=13, color=ACCENT,
+                                          line=dict(width=1, color="#ffffff")),
+                              name="Entry", showlegend=True))
+    fig.add_trace(go.Scatter(x=[exit_time], y=[trade.get("exit_price")], mode="markers",
+                              marker=dict(symbol="x", size=12, color=exit_color,
+                                          line=dict(width=1, color="#ffffff")),
+                              name=f"Exit ({trade.get('outcome')})", showlegend=True))
+    fig.update_layout(height=440, xaxis_rangeslider_visible=False,
+                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                       **{k: v for k, v in PLOTLY_LAYOUT_DEFAULTS.items() if k != "legend"})
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_fig")
 
 
 def render_prop_firm_fit_section(trades, key_prefix):
@@ -465,7 +548,7 @@ def render_run_context(strategy_name, strategy_id, trades, key_prefix):
     strategy = STRATEGIES_BY_ID.get(strategy_id)
     tabs = st.tabs(["Results", "Optimization & Robustness"])
     with tabs[0]:
-        render_filterable_results(trades, strategy.facets if strategy else [], key_prefix)
+        render_filterable_results(trades, strategy, key_prefix)
     with tabs[1]:
         render_optimization_tab(strategy_id, strategy.optimization_module if strategy else None)
 
@@ -636,7 +719,7 @@ def history_page():
         return
     tabs = st.tabs(["Results", "Optimization & Robustness"])
     with tabs[0]:
-        render_filterable_results(trades, strategy.facets if strategy else [], key_prefix=f"hist_{run_id}")
+        render_filterable_results(trades, strategy, key_prefix=f"hist_{run_id}")
     with tabs[1]:
         render_optimization_tab(strategy.id if strategy else None, strategy.optimization_module if strategy else None)
 

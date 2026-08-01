@@ -57,6 +57,10 @@ class StrategyDef:
                                        # need a much wider default than the intraday ones to see any
                                        # signal at all (a 50/200-day SMA cross needs 200+ days of
                                        # history just to warm up, before a rare cross can even fire)
+    chart_fetcher: Optional[Callable] = None  # (module, label, const, start_dt, end_dt) -> OHLC df, for
+                                       # the trade candlestick chart. None means this strategy's trade
+                                       # dicts don't carry entry/stop/target/exit price+time yet - the
+                                       # chart section hides itself rather than showing a broken chart.
 
 
 def _instrument_labels(strategy_def):
@@ -103,6 +107,29 @@ def _run_with_own_cache(module, selected_labels, start_dt, end_dt, overrides, pr
 # fetch_instrument_data(instrument_const) -> df, backtest_instrument(label, df) -> trades
 # (trade keys: side, outcome, r, date). No own disk cache -> generic cache used.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# chart fetchers - a SHORT re-fetch (just the padded window around one trade,
+# not the whole backtest range) for the per-trade candlestick chart on the
+# results page. Mirrors the corresponding runner's fetch_instrument_data call
+# shape exactly, just with start_dt/end_dt set to the trade's own window
+# instead of the run's full range - a fresh, small, separately-cached lookup,
+# not a slice of the (potentially huge) full-history cache entry.
+# ---------------------------------------------------------------------------
+def _chart_fetch_po3_shape(module, label, const, start_dt, end_dt):
+    module.FETCH_START, module.FETCH_END = start_dt, end_dt
+    with cached_dukascopy_fetch():
+        return module.fetch_instrument_data(const)
+
+
+def _chart_fetch_own_cache_shape(module, label, const, start_dt, end_dt):
+    import os
+    module.FETCH_START, module.FETCH_END = start_dt, end_dt
+    module.CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache",
+                                      f"{module.__name__.rsplit('.', 1)[-1]}_dukascopy_cache")
+    with cached_dukascopy_fetch():
+        return module.fetch_instrument_data(label, const)
+
+
 def _run_po3(module, selected_labels, start_dt, end_dt, overrides, progress_cb):
     module.FETCH_START, module.FETCH_END = start_dt, end_dt
     _apply_overrides(module, overrides)
@@ -402,6 +429,7 @@ def _build_registry():
         notes="One trade/day/instrument. Trades against the first accumulation-range break each morning.",
         runner=_run_po3,
         optimization_module=_find_optimization_module("research.ict_po3_forex_dukascopy_backtest"),
+        chart_fetcher=_chart_fetch_po3_shape,
     ))
 
     rauf_mod = _load_module("research.day_trading_rauf_dukascopy_backtest")
@@ -418,6 +446,7 @@ def _build_registry():
         notes="Sweep + 3-candle-reversal confirmation on two daily opening ranges (London, NY).",
         runner=_run_rauf,
         optimization_module=_find_optimization_module("research.day_trading_rauf_dukascopy_backtest"),
+        chart_fetcher=_chart_fetch_own_cache_shape,
     ))
 
     donchian_mod = _load_module("research.donchian_turtle_breakout_dukascopy_backtest")
@@ -440,6 +469,7 @@ def _build_registry():
         runner=_run_donchian,
         optimization_module=_find_optimization_module("research.donchian_turtle_breakout_dukascopy_backtest"),
         default_history_days=3 * 365,
+        chart_fetcher=_chart_fetch_own_cache_shape,
     ))
 
     ma_cross_mod = _load_module("research.ma_golden_death_cross_dukascopy_backtest")
@@ -463,6 +493,7 @@ def _build_registry():
         runner=_run_ma_cross,
         optimization_module=_find_optimization_module("research.ma_golden_death_cross_dukascopy_backtest"),
         default_history_days=3 * 365,
+        chart_fetcher=_chart_fetch_own_cache_shape,
     ))
 
     bollinger_mod = _load_module("research.bollinger_band_mean_reversion_dukascopy_backtest")
@@ -484,6 +515,7 @@ def _build_registry():
               "at entry. Runs continuously, not tied to a session window.",
         runner=_run_bollinger,
         optimization_module=_find_optimization_module("research.bollinger_band_mean_reversion_dukascopy_backtest"),
+        chart_fetcher=_chart_fetch_own_cache_shape,
     ))
 
     rsi_mod = _load_module("research.rsi_mean_reversion_dukascopy_backtest")
@@ -508,6 +540,7 @@ def _build_registry():
               "target off a swing-low/high stop. Runs continuously, not tied to a session window.",
         runner=_run_rsi,
         optimization_module=_find_optimization_module("research.rsi_mean_reversion_dukascopy_backtest"),
+        chart_fetcher=_chart_fetch_own_cache_shape,
     ))
 
     asian_mod = _load_module("research.asian_range_breakout_dukascopy_backtest")

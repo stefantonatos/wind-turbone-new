@@ -199,9 +199,14 @@ def backtest_instrument(label, df):
             last_close = closes[j]
             pnl = (entry - last_close) if side == "SHORT" else (last_close - entry)
             outcome, exit_r = "FLAT", pnl / sl_distance
+            exit_price = last_close
+        else:
+            exit_price = stop if outcome == "SL" else target
 
         trades.append({"side": side, "outcome": outcome, "r": exit_r, "date": today,
-                       "stop_pct": sl_distance / entry})
+                       "stop_pct": sl_distance / entry,
+                       "entry_price": entry, "stop_price": stop, "target_price": target,
+                       "exit_price": exit_price, "entry_time": times[i], "exit_time": times[j]})
         i = j + 1
 
     return trades

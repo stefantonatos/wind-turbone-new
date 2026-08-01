@@ -327,7 +327,9 @@ def backtest_instrument(label, df):
             hit_stop = (lo <= stop) if side == "LONG" else (hi >= stop)
             if hit_stop:
                 trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": position["entry_date"],
-                               "stop_pct": position["sl_distance"] / position["entry"]})
+                               "stop_pct": position["sl_distance"] / position["entry"],
+                               "entry_price": position["entry"], "stop_price": stop, "target_price": None,
+                               "exit_price": stop, "entry_time": position["entry_time"], "exit_time": times[i]})
                 position = None
 
         # --- cross-triggered actions: evaluated ONLY on the action day's first 5-min bar - a
@@ -345,7 +347,10 @@ def backtest_instrument(label, df):
                     pnl = (close - position["entry"]) if side == "LONG" else (position["entry"] - close)
                     trades.append({"side": side, "outcome": "CROSS", "r": pnl / position["sl_distance"],
                                    "date": position["entry_date"],
-                                   "stop_pct": position["sl_distance"] / position["entry"]})
+                                   "stop_pct": position["sl_distance"] / position["entry"],
+                                   "entry_price": position["entry"], "stop_price": position["stop"],
+                                   "target_price": None, "exit_price": close,
+                                   "entry_time": position["entry_time"], "exit_time": times[i]})
                     position = None
 
             atr = sig["atr"]
@@ -357,21 +362,23 @@ def backtest_instrument(label, df):
                     sl_distance = entry - stop
                     if sl_distance > 0:
                         position = {"side": "LONG", "entry": entry, "stop": stop,
-                                    "sl_distance": sl_distance, "entry_date": day}
+                                    "sl_distance": sl_distance, "entry_date": day, "entry_time": times[i]}
                 elif sig["act_death"]:
                     entry = close
                     stop = entry + ATR_STOP_MULT * atr
                     sl_distance = stop - entry
                     if sl_distance > 0:
                         position = {"side": "SHORT", "entry": entry, "stop": stop,
-                                    "sl_distance": sl_distance, "entry_date": day}
+                                    "sl_distance": sl_distance, "entry_date": day, "entry_time": times[i]}
 
     if position is not None:
         side = position["side"]
         last_close = closes[-1]
         pnl = (last_close - position["entry"]) if side == "LONG" else (position["entry"] - last_close)
         trades.append({"side": side, "outcome": "FLAT", "r": pnl / position["sl_distance"],
-                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"]})
+                        "date": position["entry_date"], "stop_pct": position["sl_distance"] / position["entry"],
+                        "entry_price": position["entry"], "stop_price": position["stop"], "target_price": None,
+                        "exit_price": last_close, "entry_time": position["entry_time"], "exit_time": times[-1]})
 
     return trades
 

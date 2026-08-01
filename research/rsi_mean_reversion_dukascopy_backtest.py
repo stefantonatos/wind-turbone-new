@@ -221,8 +221,12 @@ def backtest_instrument(label, df):
                 pnl = (closes[i] - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - closes[i])
                 outcome, exit_r = "FLAT", pnl / open_trade["sl_distance"]
             if outcome is not None:
+                exit_price = {"SL": stop, "TP": target}.get(outcome, closes[i])
                 trades.append({"side": side, "outcome": outcome, "r": exit_r, "date": times[i].date(),
-                               "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
+                               "stop_pct": open_trade["sl_distance"] / open_trade["entry"],
+                               "entry_price": open_trade["entry"], "stop_price": stop, "target_price": target,
+                               "exit_price": exit_price, "entry_time": times[open_trade["entry_index"]],
+                               "exit_time": times[i]})
                 open_trade = None
             continue   # one trade at a time - don't look for a new signal on a bar we just managed
 

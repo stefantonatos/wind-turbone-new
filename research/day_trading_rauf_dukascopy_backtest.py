@@ -222,7 +222,10 @@ def backtest_instrument(label, df):
                 pnl = (last_close - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - last_close)
                 trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"],
                                 "date": times[i - 1].date(), "range": open_trade["range"],
-                                "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
+                                "stop_pct": open_trade["sl_distance"] / open_trade["entry"],
+                                "entry_price": open_trade["entry"], "stop_price": open_trade["stop"],
+                                "target_price": open_trade["target"], "exit_price": last_close,
+                                "entry_time": open_trade["entry_time"], "exit_time": times[i - 1]})
                 open_trade = None
             current_day = today
             for st in range_states.values():
@@ -239,18 +242,23 @@ def backtest_instrument(label, df):
             hit_stop = lo <= stop if side == "LONG" else hi >= stop
             hit_target = hi >= target if side == "LONG" else lo <= target
             stop_pct = open_trade["sl_distance"] / open_trade["entry"]
+            common = {"entry_price": open_trade["entry"], "stop_price": stop, "target_price": target,
+                      "entry_time": open_trade["entry_time"], "exit_time": t}
             if hit_stop:
                 trades.append({"side": side, "outcome": "SL", "r": -1.0, "date": today,
-                               "range": open_trade["range"], "stop_pct": stop_pct})
+                               "range": open_trade["range"], "stop_pct": stop_pct,
+                               "exit_price": stop, **common})
                 open_trade = None
             elif hit_target:
                 trades.append({"side": side, "outcome": "TP", "r": open_trade["reward_risk"], "date": today,
-                                "range": open_trade["range"], "stop_pct": stop_pct})
+                                "range": open_trade["range"], "stop_pct": stop_pct,
+                                "exit_price": target, **common})
                 open_trade = None
             elif tod >= FORCE_CLOSE_TIME:
                 pnl = (closes[i] - open_trade["entry"]) if side == "LONG" else (open_trade["entry"] - closes[i])
                 trades.append({"side": side, "outcome": "FLAT", "r": pnl / open_trade["sl_distance"], "date": today,
-                                "range": open_trade["range"], "stop_pct": stop_pct})
+                                "range": open_trade["range"], "stop_pct": stop_pct,
+                                "exit_price": closes[i], **common})
                 open_trade = None
 
         # --- range building, sweep detection, and entry confirmation, per range ---
@@ -317,7 +325,8 @@ def backtest_instrument(label, df):
                     if sl_distance > 0 and target > entry and open_trade is None:
                         reward_risk = (target - entry) / sl_distance
                         open_trade = {"side": "LONG", "entry": entry, "stop": stop, "target": target,
-                                      "sl_distance": sl_distance, "reward_risk": reward_risk, "range": name}
+                                      "sl_distance": sl_distance, "reward_risk": reward_risk, "range": name,
+                                      "entry_time": t}
                         rs["traded_today"] = True
             else:
                 if setup["three_level"] is None and bars_since >= 3:
@@ -333,7 +342,8 @@ def backtest_instrument(label, df):
                     if sl_distance > 0 and target < entry and open_trade is None:
                         reward_risk = (entry - target) / sl_distance
                         open_trade = {"side": "SHORT", "entry": entry, "stop": stop, "target": target,
-                                      "sl_distance": sl_distance, "reward_risk": reward_risk, "range": name}
+                                      "sl_distance": sl_distance, "reward_risk": reward_risk, "range": name,
+                                      "entry_time": t}
                         rs["traded_today"] = True
 
     return trades
