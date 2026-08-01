@@ -119,18 +119,38 @@ hr {{
   margin: 1.25rem 0;
 }}
 
-/* sidebar: darker panel, glowing right edge */
-section[data-testid="stSidebar"] {{
-  background: linear-gradient(180deg, #0d1420 0%, #0a0e17 100%);
-  border-right: 1px solid rgba(0, 212, 255, 0.15);
-  box-shadow: 6px 0 24px rgba(0, 194, 255, 0.04);
+/* top brand bar + page nav - replaces the old left sidebar entirely, HUD console strip
+   instead of a 2006-era left-rail layout */
+.brand {{
+  font-family: var(--font-mono);
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--ink-primary);
+  text-shadow: 0 0 18px rgba(0, 194, 255, 0.35);
+  padding-top: 0.4rem;
+  white-space: nowrap;
 }}
-section[data-testid="stSidebar"] .block-container {{
-  padding-top: 1.5rem;
+.brand-rule {{
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0.9rem 0 1.6rem 0;
+  box-shadow: 0 1px 14px rgba(0, 194, 255, 0.08);
 }}
-section[data-testid="stSidebar"] label {{
-  color: var(--ink-secondary) !important;
-  font-size: 0.85rem;
+div[data-testid="stSegmentedControl"] label {{
+  font-family: var(--font-mono) !important;
+  letter-spacing: 0.05em;
+}}
+
+/* config console - the bordered panel holding strategy/instrument/date controls that used
+   to live in the sidebar, now a horizontal strip at the top of the page instead */
+.console-label {{
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+  margin-bottom: 0.15rem;
 }}
 
 /* primary button - glowing HUD action button */

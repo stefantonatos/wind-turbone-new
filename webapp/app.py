@@ -475,55 +475,60 @@ def render_run_context(strategy_name, strategy_id, trades, key_prefix):
 # --------------------------------------------------------------------------------------
 
 def run_backtest_page():
-    st.sidebar.markdown("### Strategy")
     strategy_names = [s.name for s in STRATEGIES]
-    chosen_name = st.sidebar.selectbox("Strategy", strategy_names, label_visibility="collapsed")
-    strategy = next(s for s in STRATEGIES if s.name == chosen_name)
-    st.sidebar.caption(f"{strategy.granularity}. {strategy.notes}")
 
-    st.sidebar.markdown("### Instruments")
-    labels = _instrument_labels(strategy)
-    selected_instruments = st.sidebar.multiselect("Instruments", labels, default=labels,
+    # config console - a single horizontal HUD strip replacing the old left sidebar. All
+    # run controls live here, top of page, above the results - nothing tucked in a side rail.
+    with st.container(border=True):
+        st.markdown(eyebrow("BACKTEST CONFIG"), unsafe_allow_html=True)
+        c1, c2, c3 = st.columns([1.3, 1.6, 1.3])
+        with c1:
+            st.markdown('<div class="console-label">Strategy</div>', unsafe_allow_html=True)
+            chosen_name = st.selectbox("Strategy", strategy_names, label_visibility="collapsed")
+            strategy = next(s for s in STRATEGIES if s.name == chosen_name)
+            st.caption(f"{strategy.granularity}. {strategy.notes}")
+        with c2:
+            st.markdown('<div class="console-label">Instruments</div>', unsafe_allow_html=True)
+            labels = _instrument_labels(strategy)
+            selected_instruments = st.multiselect("Instruments", labels, default=labels,
                                                      label_visibility="collapsed", key=f"{strategy.id}_instruments")
-
-    st.sidebar.markdown("### Date range")
-    default_end = datetime.date.today() - datetime.timedelta(days=1)
-    default_start = default_end - datetime.timedelta(days=strategy.default_history_days)
-    date_range = st.sidebar.date_input("Date range", value=(default_start, default_end),
+        with c3:
+            st.markdown('<div class="console-label">Date range</div>', unsafe_allow_html=True)
+            default_end = datetime.date.today() - datetime.timedelta(days=1)
+            default_start = default_end - datetime.timedelta(days=strategy.default_history_days)
+            date_range = st.date_input("Date range", value=(default_start, default_end),
                                           max_value=default_end, label_visibility="collapsed",
                                           key=f"{strategy.id}_daterange")
-    default_window_label = f"~{strategy.default_history_days / 365:.0f}-year" if strategy.default_history_days >= 365 else "6-month"
-    st.sidebar.caption(f"Defaults to a short {default_window_label} window - first-time fetches of a wide "
-                       f"range can take many minutes even with caching. Widen this deliberately once you "
-                       f"know what you're doing.")
+            default_window_label = f"~{strategy.default_history_days / 365:.0f}-year" if strategy.default_history_days >= 365 else "6-month"
+            st.caption(f"Defaults to a short {default_window_label} window - widen deliberately, "
+                       f"first fetches of a wide range can take many minutes.")
 
-    # Manual parameter tweaking is a power-user feature, not the default flow - most people
-    # don't know what STOP_BUFFER_PCT should be and shouldn't have to. This runs with the
-    # strategy's own defaults unless deliberately opened and changed; the "find the best
-    # combo automatically" path is the Optimization & Robustness tab after a run, not this.
-    param_values = {}
-    with st.sidebar.expander("Advanced parameters (optional)", expanded=False):
-        st.caption("Leave these alone unless you know what they do. Prefer the Optimization & "
-                   "Robustness tab after running once - it searches many combinations "
-                   "automatically instead of you guessing values here.")
-        for p in strategy.params:
-            widget_key = f"{strategy.id}_{p.attr}"
-            if p.kind == "int":
-                param_values[p.attr] = st.number_input(p.label, value=int(p.default), min_value=int(p.min_value),
-                                                          max_value=int(p.max_value), step=int(p.step),
-                                                          key=widget_key, help=p.help or None)
-            else:
-                param_values[p.attr] = st.number_input(p.label, value=float(p.default), min_value=float(p.min_value),
-                                                          max_value=float(p.max_value), step=float(p.step),
-                                                          key=widget_key, help=p.help or None)
+        # Manual parameter tweaking is a power-user feature, not the default flow - most people
+        # don't know what STOP_BUFFER_PCT should be and shouldn't have to. This runs with the
+        # strategy's own defaults unless deliberately opened and changed; the "find the best
+        # combo automatically" path is the Optimization & Robustness tab after a run, not this.
+        param_values = {}
+        with st.expander("Advanced parameters (optional)", expanded=False):
+            st.caption("Leave these alone unless you know what they do. Prefer the Optimization & "
+                       "Robustness tab after running once - it searches many combinations "
+                       "automatically instead of you guessing values here.")
+            param_cols = st.columns(3) if strategy.params else []
+            for i, p in enumerate(strategy.params):
+                widget_key = f"{strategy.id}_{p.attr}"
+                target = param_cols[i % 3]
+                if p.kind == "int":
+                    param_values[p.attr] = target.number_input(p.label, value=int(p.default), min_value=int(p.min_value),
+                                                              max_value=int(p.max_value), step=int(p.step),
+                                                              key=widget_key, help=p.help or None)
+                else:
+                    param_values[p.attr] = target.number_input(p.label, value=float(p.default), min_value=float(p.min_value),
+                                                              max_value=float(p.max_value), step=float(p.step),
+                                                              key=widget_key, help=p.help or None)
 
-    st.sidebar.markdown("---")
-    run_clicked = st.sidebar.button("Run Backtest", type="primary", use_container_width=True)
-
-    st.title("Strategy Backtests")
-    st.caption("Every run fetches real historical data live from Dukascopy - nothing here is mocked or "
-               "precomputed. No commission, spread, or slippage is modeled, matching every underlying "
-               "research script's own caveat.")
+        run_clicked = st.button("Run Backtest", type="primary", use_container_width=True)
+        st.caption("Every run fetches real historical data live from Dukascopy - nothing here is mocked or "
+                   "precomputed. No commission, spread, or slippage is modeled, matching every underlying "
+                   "research script's own caveat.")
 
     if run_clicked:
         if not selected_instruments:
@@ -589,7 +594,7 @@ def run_backtest_page():
 
 
 def history_page():
-    st.title("History")
+    st.markdown(eyebrow("RUN HISTORY"), unsafe_allow_html=True)
     st.caption("Every completed backtest run from this tool, newest first.")
 
     runs = run_history.load_runs()
@@ -637,12 +642,19 @@ def history_page():
 
 
 # --------------------------------------------------------------------------------------
+# top bar - brand + page nav, replacing the old left sidebar. A HUD console strip across
+# the top instead of a 2006-era left rail; both pages share it.
+# --------------------------------------------------------------------------------------
 
-st.sidebar.markdown("# Strategy Backtests")
-page = st.sidebar.radio("Page", ["Run Backtest", "History"], label_visibility="collapsed")
-st.sidebar.markdown("---")
+header_l, header_r = st.columns([2, 1])
+with header_l:
+    st.markdown('<div class="brand">&#9889; STRATEGY BACKTESTS</div>', unsafe_allow_html=True)
+with header_r:
+    page = st.segmented_control("Page", ["Run Backtest", "History"], default="Run Backtest",
+                                 label_visibility="collapsed", key="page_nav")
+st.markdown('<hr class="brand-rule"/>', unsafe_allow_html=True)
 
-if page == "Run Backtest":
-    run_backtest_page()
-else:
+if page == "History":
     history_page()
+else:
+    run_backtest_page()
