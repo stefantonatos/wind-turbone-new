@@ -228,11 +228,100 @@ def _render_optimization_result(result, opt_module_name):
         wf_signed = [c for c in result.walk_forward.columns if "total_r" in c or "avg_r" in c]
         st.dataframe(style_signed_columns(result.walk_forward, wf_signed, fmt="{:+.4f}"),
                      use_container_width=True, hide_index=True)
+    if result.decay is not None:
+        st.markdown(eyebrow("SIGNAL-DECAY DIAGNOSTIC"), unsafe_allow_html=True)
+        d = result.decay
+        if d.get("confidence") == "insufficient_folds":
+            st.caption(f"Insufficient walk-forward folds ({d.get('n_folds_used', 0)}) to pool a "
+                       f"months-since-fit decay estimate yet.")
+        else:
+            dcols = st.columns(3)
+            dcols[0].metric("Slope (per month)", f"{d['slope']:+.5f}")
+            dcols[1].metric("Half-life (months)",
+                             f"{d['half_life_months']:.1f}" if d.get("half_life_months") is not None else "n/a")
+            dcols[2].metric("Folds pooled", d.get("n_folds_used", 0))
+            verdict = "decay evidence (negative slope)" if d["slope"] < 0 else "no decay evidence (flat/positive slope)"
+            st.caption(f"Pooled by months-since-fit across every walk-forward fold's own out-of-sample "
+                       f"trades - {verdict}. This is a diagnostic, not a pass/fail gate; it never changes "
+                       f"the walk-forward efficiency verdict above.")
     if result.extra_notes:
         st.caption(result.extra_notes)
     if result.reason == "partial":
         st.caption("Some of the four methodology outputs weren't found on the companion module yet - "
                    "showing what is available.")
+
+
+def render_lockbox_section(strategy_id):
+    mapping = optimization.lockbox_param_mapping(strategy_id)
+    if mapping is None:
+        return
+
+    st.markdown("---")
+    st.markdown(eyebrow("LOCKBOX CONFIRMATION - ONE-SHOT, EVER"), unsafe_allow_html=True)
+
+    prior = optimization.lockbox_ledger_status(strategy_id)
+    if prior is not None:
+        verdict = "PASSED" if prior.get("passed") else "DID NOT PASS"
+        st.warning(f"This strategy's lockbox has already been used in this webapp - {verdict} on "
+                   f"{prior.get('timestamp', '?')} (lockbox window {prior.get('lockbox_start', '?')} to "
+                   f"{prior.get('lockbox_end', '?')}). A lockbox can only ever be confirmed once per "
+                   f"strategy, so no button is shown here - see the recorded attempt below.")
+        detail_cols = st.columns(4)
+        detail_cols[0].metric("Result", verdict)
+        detail_cols[1].metric("Total R", f"{prior.get('total_r', 0):+.2f}")
+        detail_cols[2].metric("Avg R / trade", f"{prior.get('avg_r', 0):+.4f}")
+        detail_cols[3].metric("Trades", prior.get("n_trades", 0))
+        return
+
+    with st.container(border=True):
+        st.markdown("**This is a genuine one-shot, ledger-enforced final holdout check - not a "
+                    "re-runnable report.** It scores your chosen final parameters on a final held-out "
+                    "window that STEP 1-4 above never touched, exactly once, ever, for this strategy. "
+                    "A second attempt is refused outright (`LockboxAlreadyUsedError`), not just "
+                    "discouraged - do not click the button below unless you genuinely mean to spend "
+                    "this strategy's one and only lockbox confirmation right now.")
+
+        strategy = STRATEGIES_BY_ID.get(strategy_id)
+        final_params = {}
+        param_display = []
+        if strategy is not None:
+            for attr, lockbox_key in mapping.items():
+                widget_key = f"{strategy_id}_{attr}"
+                spec = next((p for p in strategy.params if p.attr == attr), None)
+                value = st.session_state.get(widget_key, spec.default if spec else None)
+                final_params[lockbox_key] = value
+                param_display.append(f"{attr}={value}")
+        st.caption("Final parameters that will be locked in (currently set in the sidebar): "
+                   + ", ".join(param_display))
+
+        confirmed = st.checkbox(
+            "I understand this can only be run ONCE per strategy, ever, and cannot be undone.",
+            key=f"lockbox_ack_{strategy_id}")
+        if confirmed:
+            if st.button("Run Lockbox Confirmation (ONE-SHOT)", key=f"lockbox_run_{strategy_id}",
+                          type="primary"):
+                with st.spinner("Running the one-shot lockbox confirmation against real Dukascopy data..."):
+                    outcome = optimization.run_lockbox(strategy_id, final_params)
+                if outcome.status == "already_used":
+                    st.error("Refused: this strategy's lockbox was already used (a race with another "
+                             "run, most likely). " + outcome.detail)
+                elif outcome.status == "error":
+                    st.error(f"Lockbox run failed: {outcome.detail}")
+                else:
+                    verdict = "PASSED" if outcome.status == "passed" else "DID NOT PASS"
+                    st.success(f"Lockbox confirmation complete - {verdict}") if outcome.status == "passed" \
+                        else st.warning(f"Lockbox confirmation complete - {verdict}")
+                    rcols = st.columns(4)
+                    rcols[0].metric("Result", verdict)
+                    rcols[1].metric("Total R", f"{outcome.total_r:+.2f}")
+                    rcols[2].metric("Avg R / trade", f"{outcome.avg_r:+.4f}")
+                    rcols[3].metric("Trades", outcome.n_trades)
+                    st.caption(f"Lockbox window: {outcome.lockbox_start} to {outcome.lockbox_end}. "
+                               f"Consistency: {outcome.consistency}. This attempt is now permanently "
+                               f"recorded - re-opening this page will show the same result, not a new button.")
+        else:
+            st.button("Run Lockbox Confirmation (ONE-SHOT)", key=f"lockbox_run_disabled_{strategy_id}",
+                      disabled=True)
 
 
 def render_optimization_tab(strategy_id, opt_module_name):
@@ -259,8 +348,10 @@ def render_optimization_tab(strategy_id, opt_module_name):
     result = st.session_state.get(cache_key)
     if result is None:
         st.info("Not run yet this session - click the button above when you're ready to wait for it.")
-        return
-    _render_optimization_result(result, opt_module_name or known_module)
+    else:
+        _render_optimization_result(result, opt_module_name or known_module)
+
+    render_lockbox_section(strategy_id)
 
 
 def render_run_context(strategy_name, strategy_id, trades, key_prefix):

@@ -40,18 +40,30 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
 
 ## Strategies in the registry
 
-ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout, MA
-Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion,
-Support/Resistance Zone Bounce, ICT Silver Bullet, and ORB (indices) - 9 total. Two
-of these (Donchian, MA cross) are multi-day SWING/POSITION systems on daily channels
-rather than intraday, so their sidebar date-range default is ~3 years instead of the
-6-month default every intraday strategy uses - a 20-day Donchian channel or a 50/200
-SMA cross needs real history to produce more than a couple of signals, and a 50/200
-cross is inherently rare (low single digits to a dozen per instrument over a 9-year
-history is normal, not a bug - see that script's own header). `trend_following_momentum_
-dukascopy_backtest.py` is deliberately excluded: it produces a monthly-rebalanced
-portfolio return series (NAV/Sharpe/drawdown), not the R-multiple trade list every
-other strategy and this whole results UI is built around.
+13 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
+Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
+Support/Resistance Zone Bounce, ICT Silver Bullet, and ORB (indices).
+
+Three of these (Donchian, MA cross, Dow Theory) are multi-day SWING/POSITION systems on
+daily channels/pivots rather than intraday, so their sidebar date-range default is ~3
+years instead of the 6-month default every intraday strategy uses - these need real
+history to produce more than a couple of signals, and a couple of them (MA cross, Dow
+Theory) are inherently rare/selective by design (a handful to a few dozen trades per
+instrument over 9 years is normal, not a bug - see each script's own header).
+
+Bollinger Band Mean-Reversion and Bollinger Squeeze Breakout are the mechanical
+OPPOSITE of each other (fade a band touch vs. trade a breakout after a volatility
+squeeze) - named and captioned distinctly on purpose, don't conflate them. Climax
+Volume Reversal is the one strategy on native 15-min bars (every other strategy here
+uses 5-min); it also decides at run time, empirically, whether its volume condition is
+usable at all (checked against the actual fetched data for every selected instrument,
+dropped for the whole run if any instrument's volume field looks degenerate) - the
+webapp reproduces that exact check, never bypasses it.
+
+`trend_following_momentum_dukascopy_backtest.py` is deliberately excluded: it produces
+a monthly-rebalanced portfolio return series (NAV/Sharpe/drawdown), not the R-multiple
+trade list every other strategy and this whole results UI is built around.
 
 ## Layout
 
@@ -66,9 +78,25 @@ other strategy and this whole results UI is built around.
   actual grid-search/Monte-Carlo/cluster/walk-forward functions for real - gated behind
   an explicit "Run full optimization & robustness pass" button in the UI, since these
   are genuinely heavy (the scripts' own headers warn 30 minutes to well over an hour).
-  Any other strategy falls back to a lightweight generic detector that shows a plain
-  "not available yet" state until a matching `research/<strategy>_optimization.py`
-  lands and exposes recognizable function names.
+  Also surfaces a signal-decay/half-life diagnostic (`research/optimization_engine.py`'s
+  `estimate_decay`, pooled across the walk-forward folds) alongside the walk-forward
+  table, and a separate **Lockbox Confirmation** section - a genuine one-shot, ever,
+  ledger-enforced final holdout check (`split_lockbox`/`lockbox_confirm`), gated behind
+  its own explicit "I understand this can only be run ONCE" checkbox before the button
+  even appears. Both companion optimization pipelines are now also windowed to exclude
+  the lockbox period from their own grid search and walk-forward folds, matching the
+  underlying scripts' own `main()` - otherwise running "Run full optimization pass"
+  here would have already leaked the lockbox window before the user ever got to confirm
+  it. The webapp's lockbox ledger lives at `webapp/run_history_data/webapp_lockbox_
+  ledger.json` - deliberately NOT `research/lockbox_ledger.json` (research/ is
+  read-only for this webapp, and a casual click here must never consume the real,
+  canonical, one-time-ever lockbox attempt meant for an actual research run - see
+  `optimization.py`'s own comment on `WEBAPP_LOCKBOX_LEDGER_PATH` for the full
+  reasoning; this mirrors the project's own test suite, which does the same thing with
+  a throwaway ledger path). Any strategy without a hand-wired pipeline falls back to a
+  lightweight generic detector that shows a plain "not available yet" state until a
+  matching `research/<strategy>_optimization.py` lands and exposes recognizable
+  function names.
 - `stats.py` - pure functions over an already-computed trade list (summary stats,
   per-instrument breakdown, equity curve) - no fetching or backtesting here.
 - `run_history.py` - append-only local run history (`run_history_data/runs.jsonl`

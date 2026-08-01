@@ -24,6 +24,8 @@
 # other changes needed anywhere in this file or in app.py.
 
 import importlib
+import json
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -42,6 +44,8 @@ class OptimizationResult:
     cluster_verdict: Optional[str] = None  # expected shape: short string verdict ("plateau" vs "spike")
     walk_forward: Optional[object] = None  # expected shape: pandas DataFrame, one row per fold + pass/fail
     extra_notes: Optional[str] = None      # combined walk-forward-efficiency summary line, when known
+    decay: Optional[dict] = None           # research/optimization_engine.py's estimate_decay() result, when known
+                                            # (keys: slope, half_life_months, phi, n_folds_used, confidence)
 
 
 # Conventional names this layer looks for on a companion module, per methodology step.
@@ -105,7 +109,24 @@ def _po3_pipeline(module):
     if not data:
         return OptimizationResult(available=False, reason="no data could be fetched for any instrument")
 
-    grid_results = module.run_grid_search(data)
+    # LOCKBOX-AWARE WINDOWING: the module's own main() (see its LOCKBOX_MONTHS/STRATEGY_ID
+    # constants and split_lockbox call) carves the final LOCKBOX_MONTHS off FETCH_END and
+    # bounds STEP 1's grid search + STEP 4's walk-forward folds to end at search_end, not
+    # FETCH_END - so the lockbox window is never touched by any search iteration, by
+    # construction. This pipeline reproduces that exact bound; skipping it would mean this
+    # tab's own "Run full optimization pass" silently uses up the lockbox window before the
+    # user ever gets to the separate, ledger-enforced Lockbox Confirmation section below,
+    # defeating the entire point of a never-touched-until-confirmed holdout.
+    opt_engine = module.opt_engine
+    try:
+        search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            module.FETCH_START, module.FETCH_END, lockbox_months=module.LOCKBOX_MONTHS)
+    except ValueError:
+        search_start, search_end = module.FETCH_START, module.FETCH_END
+        lockbox_start = lockbox_end = None
+    ss, se = search_start.date(), search_end.date()
+
+    grid_results = module.run_grid_search(data, window_start=ss, window_end=se)
     sb_list, frr_list, avg_r_matrix, _total_r_matrix = module.build_grid_matrix(grid_results)
     heatmap_df = pd.DataFrame(avg_r_matrix, index=[f"SB={v:g}" for v in sb_list],
                                 columns=[f"FRR={v:g}" for v in frr_list])
@@ -138,7 +159,7 @@ def _po3_pipeline(module):
     except Exception as exc:
         cluster_verdict += f" (cluster analysis raised {exc} - skipped.)"
 
-    folds = module.generate_walk_forward_folds(module.FETCH_START.year, module.FETCH_END.year)
+    folds = module.generate_walk_forward_folds(module.FETCH_START.year, search_end.year)
     fold_results, combined_oos_r = module.run_walk_forward(data, folds)
     wfe_stats = module.compute_walk_forward_efficiency(fold_results, combined_oos_r)
     wf_df = pd.DataFrame(fold_results)
@@ -148,14 +169,25 @@ def _po3_pipeline(module):
         wfe_text = "undefined (mean in-sample avg R/trade is ~0)"
     else:
         wfe_text = f"{wfe:.3f} -> {'PASS' if wfe >= module.WFE_PASS_THRESHOLD else 'FAIL'} the >=0.5 rule of thumb"
-    extra_notes = (f"Combined out-of-sample across {len(fold_results)} rolling folds: "
+    lockbox_note = (f"excluding the {module.LOCKBOX_MONTHS}-month lockbox window "
+                     f"{lockbox_start.date()} to {lockbox_end.date()}"
+                     if lockbox_start is not None else "no lockbox window carved (fetch range too short)")
+    extra_notes = (f"Combined out-of-sample across {len(fold_results)} rolling folds (bounded by "
+                   f"{ss} to {se}, {lockbox_note}): "
                    f"{wfe_stats['combined_oos_n_trades']} trades, {wfe_stats['combined_oos_total_r']:+.2f}R, "
                    f"{wfe_stats['combined_oos_avg_r']:+.4f}R/trade. Walk-Forward Efficiency = {wfe_text}. "
                    f"{module.WFE_PASS_THRESHOLD:.0%} is a standard rule-of-thumb threshold, not proof of "
                    f"robustness either way.")
 
+    # optimization_engine.estimate_decay: pools every fold's own un-merged OOS trades
+    # (run_walk_forward's "oos_trades" addition) by months-since-that-fold's-own-fit and fits
+    # a slope/half-life diagnostic - a DIAGNOSTIC, never a pass/fail gate, shown alongside the
+    # walk-forward table above.
+    decay = opt_engine.estimate_decay(fold_results)
+
     return OptimizationResult(available=True, reason="full", heatmap=heatmap_df, monte_carlo=mc_df,
-                                cluster_verdict=cluster_verdict, walk_forward=wf_df, extra_notes=extra_notes)
+                                cluster_verdict=cluster_verdict, walk_forward=wf_df, extra_notes=extra_notes,
+                                decay=decay)
 
 
 def _rauf_pipeline(module):
@@ -169,8 +201,21 @@ def _rauf_pipeline(module):
     if not all_arrays:
         return OptimizationResult(available=False, reason="no data could be fetched for any instrument")
 
+    # LOCKBOX-AWARE WINDOWING: same reasoning as _po3_pipeline above - passing (search_start,
+    # search_end) instead of (FETCH_START, FETCH_END) bounds BOTH run_full_pipeline's STEP 1
+    # search and STEP 4 walk-forward folds to end before the lockbox window, by construction
+    # (see run_full_pipeline's own docstring/comments on step1_window_start/end and
+    # run_walk_forward's fetch_start/fetch_end usage).
+    opt_engine = module.opt_engine
+    try:
+        search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            module.FETCH_START, module.FETCH_END, lockbox_months=module.LOCKBOX_MONTHS)
+    except ValueError:
+        search_start, search_end = module.FETCH_START, module.FETCH_END
+        lockbox_start = lockbox_end = None
+
     results = module.run_full_pipeline(all_arrays, module.STOP_BUFFER_PCT_GRID, module.CONFIRMATION_CANDLES_GRID,
-                                         module.FETCH_START, module.FETCH_END, mc_iterations=module.MC_ITERATIONS,
+                                         search_start, search_end, mc_iterations=module.MC_ITERATIONS,
                                          make_plots=False, show_progress=False, verbose=False)
     grid_results = results["grid_results"]
     heatmap_df = pd.DataFrame([
@@ -208,13 +253,20 @@ def _rauf_pipeline(module):
         wfe_text = "undefined (mean in-sample avg R/trade is ~0)"
     else:
         wfe_text = f"{wfe:.3f} -> {'PASS' if wf['wfe_pass'] else 'FAIL'} the >=0.5 rule of thumb"
-    extra_notes = (f"Combined out-of-sample: {wf['combined_n_trades']} trades, {wf['combined_total_r']:+.2f}R, "
-                   f"{wf['combined_avg_r']:+.4f}R/trade. Walk-Forward Efficiency = {wfe_text}. "
-                   f"{module.WFE_PASS_THRESHOLD:.0%} is a standard rule-of-thumb threshold, not proof of "
-                   f"robustness either way.")
+    lockbox_note = (f"excluding the {module.LOCKBOX_MONTHS}-month lockbox window "
+                     f"{lockbox_start.date()} to {lockbox_end.date()}"
+                     if lockbox_start is not None else "no lockbox window carved (fetch range too short)")
+    extra_notes = (f"Combined out-of-sample ({lockbox_note}): {wf['combined_n_trades']} trades, "
+                   f"{wf['combined_total_r']:+.2f}R, {wf['combined_avg_r']:+.4f}R/trade. "
+                   f"Walk-Forward Efficiency = {wfe_text}. {module.WFE_PASS_THRESHOLD:.0%} is a standard "
+                   f"rule-of-thumb threshold, not proof of robustness either way.")
+
+    # run_full_pipeline already computes this internally (results["decay_result"]) - no extra call needed.
+    decay = results.get("decay_result")
 
     return OptimizationResult(available=True, reason="full", heatmap=heatmap_df, monte_carlo=mc_df,
-                                cluster_verdict=cluster_verdict, walk_forward=wf_df, extra_notes=extra_notes)
+                                cluster_verdict=cluster_verdict, walk_forward=wf_df, extra_notes=extra_notes,
+                                decay=decay)
 
 
 # strategy id -> (companion module name, real pipeline function). Populated for the two
@@ -252,6 +304,195 @@ def run_known_pipeline(strategy_id):
         return pipeline_fn(module)
     except Exception as exc:
         return OptimizationResult(available=False, reason=f"pipeline run failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# LOCKBOX CONFIRMATION - a one-shot, ledger-enforced final holdout check
+# (research/optimization_engine.py's split_lockbox/lockbox_confirm/
+# LockboxAlreadyUsedError - see that module's own "LOCKBOX / EMBARGOED FINAL
+# HOLDOUT" section header for the full reasoning on why this is structurally
+# stricter than the walk-forward OOS folds above, and why it's enforced via a
+# persistent ledger rather than a docstring convention).
+#
+# LEDGER PATH - DELIBERATELY NOT research/lockbox_ledger.json: that's the
+# default path optimization_engine.lockbox_confirm() writes to, and it is
+# where the REAL, canonical, ONE-TIME-EVER lockbox attempt for each strategy
+# is meant to be recorded (e.g. from an actual run of
+# ict_po3_forex_dukascopy_optimization.py's own main() in a notebook).
+# research/ is strictly read-only for this webapp, and - far more importantly
+# - a casual click of this webapp's own "Run Lockbox Confirmation" button
+# (including during this project's own testing) must never consume that real,
+# irreversible, once-ever attempt. lockbox_confirm() exposes `ledger_path`
+# as an overridable keyword argument specifically for cases like this - the
+# project's OWN test suite does the exact same thing (see
+# test_day_trading_rauf_dukascopy_optimization.py's
+# test_make_lockbox_backtest_fn_and_lockbox_confirm_one_shot, which passes a
+# throwaway tempfile ledger_path rather than touching the real one). This
+# webapp's lockbox ledger is its own, separate, persistent record of THIS
+# WEBAPP's own lockbox usage - the one-shot guarantee is completely real and
+# enforced the same way (a strategy_id used once here can never be used here
+# again), it is simply scoped to this tool's own runs rather than shared with
+# notebook-run research scripts.
+WEBAPP_LOCKBOX_LEDGER_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "run_history_data", "webapp_lockbox_ledger.json")
+
+
+@dataclass
+class LockboxOutcome:
+    status: str   # "not_run" | "already_used" | "passed" | "failed" | "error"
+    detail: str = ""
+    total_r: Optional[float] = None
+    avg_r: Optional[float] = None
+    n_trades: Optional[int] = None
+    consistency: Optional[dict] = None
+    lockbox_start: Optional[str] = None
+    lockbox_end: Optional[str] = None
+    final_params: Optional[dict] = None
+
+
+def _module_strategy_id(strategy_id):
+    """Translates this webapp's own registry strategy_id ("po3", "rauf") to the underlying
+    optimization module's own STRATEGY_ID constant ("ict_po3_forex_dukascopy",
+    "day_trading_rauf_dukascopy") - the actual key every ledger record is written under (see
+    _po3_lockbox_run/_rauf_lockbox_run, which pass module.STRATEGY_ID, not the webapp's short
+    id, to lockbox_confirm). Returns None if strategy_id has no lockbox wiring or its module
+    can't be imported."""
+    entry = LOCKBOX_STRATEGIES.get(strategy_id)
+    if entry is None:
+        return None
+    module_name = entry[0]
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        return None
+    return getattr(module, "STRATEGY_ID", None)
+
+
+def lockbox_ledger_status(strategy_id):
+    """Read-only check against THIS WEBAPP's own ledger (see WEBAPP_LOCKBOX_LEDGER_PATH) -
+    never calls lockbox_confirm, never touches research/lockbox_ledger.json. Returns the prior
+    attempt record (a dict) if strategy_id has already used its lockbox here, else None. Used
+    to render the UI's "already used" state proactively, without needing to attempt (and have
+    refused) a real call first."""
+    module_strategy_id = _module_strategy_id(strategy_id)
+    if module_strategy_id is None:
+        return None
+    if not os.path.exists(WEBAPP_LOCKBOX_LEDGER_PATH):
+        return None
+    try:
+        with open(WEBAPP_LOCKBOX_LEDGER_PATH) as f:
+            content = f.read().strip()
+        records = json.loads(content) if content else []
+    except (OSError, json.JSONDecodeError):
+        return None
+    for r in records:
+        if r.get("strategy_id") == module_strategy_id:
+            return r
+    return None
+
+
+def _po3_lockbox_run(module, final_params):
+    opt_engine = module.opt_engine
+    data = {}
+    with cached_dukascopy_fetch():
+        for label, const in module.INSTRUMENTS:
+            df = module.fetch_instrument_data(label, const)
+            if df is None or df.empty:
+                continue
+            data[label] = module.precompute_indicators(df)
+    if not data:
+        return LockboxOutcome(status="error", detail="no data could be fetched for any instrument")
+
+    try:
+        _s, _e, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            module.FETCH_START, module.FETCH_END, lockbox_months=module.LOCKBOX_MONTHS)
+    except ValueError as exc:
+        return LockboxOutcome(status="error", detail=str(exc))
+
+    backtest_fn = module.make_lockbox_backtest_fn(
+        data, final_params["stop_buffer_pct"], final_params["fallback_reward_risk"])
+    try:
+        result = opt_engine.lockbox_confirm(module.STRATEGY_ID, final_params, backtest_fn,
+                                              lockbox_start, lockbox_end, ledger_path=WEBAPP_LOCKBOX_LEDGER_PATH)
+    except opt_engine.LockboxAlreadyUsedError as exc:
+        return LockboxOutcome(status="already_used", detail=str(exc))
+
+    return LockboxOutcome(status="passed" if result["passed"] else "failed",
+                            total_r=result["total_r"], avg_r=result["avg_r"], n_trades=result["n_trades"],
+                            consistency=result["consistency"], lockbox_start=str(lockbox_start),
+                            lockbox_end=str(lockbox_end), final_params=final_params)
+
+
+def _rauf_lockbox_run(module, final_params):
+    opt_engine = module.opt_engine
+    all_arrays = {}
+    with cached_dukascopy_fetch():
+        for label, const_name in module.INSTRUMENTS:
+            df = module.fetch_instrument_data(label, const_name)
+            if df is None or df.empty:
+                continue
+            all_arrays[label] = module.precompute_arrays(df)
+    if not all_arrays:
+        return LockboxOutcome(status="error", detail="no data could be fetched for any instrument")
+
+    try:
+        _s, _e, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            module.FETCH_START, module.FETCH_END, lockbox_months=module.LOCKBOX_MONTHS)
+    except ValueError as exc:
+        return LockboxOutcome(status="error", detail=str(exc))
+
+    backtest_fn = module.make_lockbox_backtest_fn(
+        all_arrays, final_params["stop_buffer_pct"], final_params["confirmation_candles"])
+    try:
+        result = opt_engine.lockbox_confirm(module.STRATEGY_ID, final_params, backtest_fn,
+                                              lockbox_start, lockbox_end, ledger_path=WEBAPP_LOCKBOX_LEDGER_PATH)
+    except opt_engine.LockboxAlreadyUsedError as exc:
+        return LockboxOutcome(status="already_used", detail=str(exc))
+
+    return LockboxOutcome(status="passed" if result["passed"] else "failed",
+                            total_r=result["total_r"], avg_r=result["avg_r"], n_trades=result["n_trades"],
+                            consistency=result["consistency"], lockbox_start=str(lockbox_start),
+                            lockbox_end=str(lockbox_end), final_params=final_params)
+
+
+# strategy id -> (companion module name, lockbox runner, final_params key mapping). The key
+# mapping translates this webapp's sidebar ParamSpec attr names (UPPERCASE, matching each
+# module's own constants) to the lowercase keys optimization_engine.lockbox_confirm/
+# make_lockbox_backtest_fn actually expect (confirmed from both companion scripts' own STEP 5
+# sections - see e.g. ict_po3_forex_dukascopy_optimization.py's
+# `{"stop_buffer_pct": ..., "fallback_reward_risk": ...}`).
+LOCKBOX_STRATEGIES = {
+    "po3": ("research.ict_po3_forex_dukascopy_optimization", _po3_lockbox_run,
+            {"STOP_BUFFER_PCT": "stop_buffer_pct", "FALLBACK_REWARD_RISK": "fallback_reward_risk"}),
+    "rauf": ("research.day_trading_rauf_dukascopy_optimization", _rauf_lockbox_run,
+             {"STOP_BUFFER_PCT": "stop_buffer_pct", "CONFIRMATION_CANDLES": "confirmation_candles"}),
+}
+
+
+def lockbox_param_mapping(strategy_id):
+    entry = LOCKBOX_STRATEGIES.get(strategy_id)
+    return entry[2] if entry else None
+
+
+def run_lockbox(strategy_id, final_params):
+    """Runs the real, one-shot lockbox confirmation for `strategy_id` with `final_params`
+    (already translated to the lowercase keys lockbox_confirm expects - see
+    lockbox_param_mapping). Never raises - LockboxAlreadyUsedError and any other failure both
+    come back as a LockboxOutcome with a clear status/detail for the UI to render honestly.
+    Caller (app.py) is responsible for gating this behind explicit, unmistakable confirmation -
+    this function does the real, irreversible-once-passed work."""
+    entry = LOCKBOX_STRATEGIES.get(strategy_id)
+    if entry is None:
+        return LockboxOutcome(status="error", detail="no lockbox wiring for this strategy")
+    module_name, runner, _mapping = entry
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:
+        return LockboxOutcome(status="error", detail=f"import_failed: {exc}")
+    try:
+        return runner(module, final_params)
+    except Exception as exc:
+        return LockboxOutcome(status="error", detail=f"unexpected error: {exc}")
 
 
 def load_optimization_result(optimization_module_name):

@@ -182,6 +182,103 @@ _run_rsi = _run_with_own_cache
 
 
 # ---------------------------------------------------------------------------
+# asian_range_breakout_dukascopy_backtest.py (Asian Range Breakout)
+# Trades WITH a close-confirmed breakout of the prior evening's Asian session
+# range during the London-open window - the mechanical opposite philosophy
+# from PO3 (which fades that kind of break). Exposes: INSTRUMENTS
+# [(label, const)], FETCH_START, FETCH_END, CACHE_DIR (own disk cache),
+# STOP_BUFFER_PCT, TARGET_RANGE_MULT, FALLBACK_REWARD_RISK, MIN_RANGE_PCT,
+# fetch_instrument_data(label, instrument_const) -> df, backtest_instrument(label,
+# df) -> trades (keys: side, outcome, r, date). Same shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_asian_range_breakout = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# dow_theory_swing_structure_dukascopy_backtest.py (Dow Theory Swing Structure)
+# SWING/POSITION trend-following system on confirmed daily HH/HL (uptrend) or
+# LH/LL (downtrend) swing pivots, with a trailing stop that ratchets to each new
+# confirmed pivot (reuses Donchian/Turtle's trailing mechanic) - a selective
+# filter by design, expect a modest handful to a few dozen trades per instrument
+# over 9 years, not hundreds. Exposes: INSTRUMENTS [(label, const)], FETCH_START,
+# FETCH_END, CACHE_DIR (own disk cache), SWING_LEN, fetch_instrument_data(label,
+# instrument_const) -> df, backtest_instrument(label, df) -> trades (keys: side,
+# outcome, r, date). Same shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_dow_theory = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# bollinger_squeeze_breakout_dukascopy_backtest.py (Bollinger Squeeze Breakout)
+# NOT THE SAME STRATEGY AS bollinger_mean_reversion below - this is the
+# mechanical OPPOSITE: waits for the bands to visibly contract (a volatility
+# "squeeze", a relative/rolling-percentile condition) then trades WITH the
+# breakout once price closes outside a band, instead of fading a band touch.
+# Exposes: INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, CACHE_DIR (own
+# disk cache), BB_LENGTH, BB_NUM_STD, SQUEEZE_LOOKBACK, SQUEEZE_PERCENTILE,
+# SQUEEZE_RECENCY_BARS, MIN_SL_PCT, REWARD_RISK, MAX_HOLD_BARS,
+# fetch_instrument_data(label, instrument_const) -> df, backtest_instrument(label,
+# df) -> trades (keys: side, outcome, r, date). Same shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_bollinger_squeeze = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# climax_volume_reversal_dukascopy_backtest.py (Climax Volume Reversal)
+# Native 15-MIN bars (DUKASCOPY_INTERVAL = INTERVAL_MIN_15, not 5-min like every
+# other strategy here - the module's own fetch_instrument_data already fetches
+# at its own configured interval, so no special handling needed for that part).
+# DOES NOT follow the shared _run_with_own_cache shape: backtest_instrument
+# takes a THIRD argument, `use_volume_filter` (bool), which main() decides
+# EMPIRICALLY at run time via volume_field_is_usable() - applied only if the
+# volume field looks usable (non-zero fraction, enough distinct values) on
+# EVERY instrument being tested this run, dropped for the whole run otherwise
+# (never a silent per-instrument split). This runner reproduces that exact
+# empirical decision (across only the SELECTED instruments, not the module's
+# full default list) rather than hardcoding or bypassing it - see the module's
+# own header note 4 and main() for the source of this logic.
+# Exposes: INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, CACHE_DIR (own
+# disk cache), ATR_LENGTH, CLIMAX_RANGE_ATR_MULT, RUN_LOOKBACK_BARS,
+# CLIMAX_VOLUME_MULT, PENDING_ORDER_EXPIRY_BARS, REWARD_RISK, MAX_HOLD_HOURS,
+# MIN_SL_PCT, fetch_instrument_data(label, instrument_const) -> df,
+# volume_field_is_usable(volumes) -> bool, backtest_instrument(label, df,
+# use_volume_filter) -> trades (keys: side, outcome, r, date).
+# ---------------------------------------------------------------------------
+def _run_climax_volume_reversal(module, selected_labels, start_dt, end_dt, overrides, progress_cb):
+    import os
+    module.FETCH_START, module.FETCH_END = start_dt, end_dt
+    _apply_overrides(module, overrides)
+    module.CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache",
+                                      "climax_volume_reversal_dukascopy_cache")
+    chosen = [row for row in module.INSTRUMENTS if row[0] in selected_labels]
+    dfs = {}
+    with cached_dukascopy_fetch():
+        for done, (label, const) in enumerate(chosen):
+            progress_cb(done, len(chosen), f"{label} (fetching)")
+            df = module.fetch_instrument_data(label, const)
+            if df is not None and not df.empty:
+                dfs[label] = df
+
+        # empirical volume-usability decision, reproduced exactly from main(): usable only if
+        # EVERY fetched instrument's own volume field looks real, dropped for the whole run
+        # otherwise - never bypassed, never hardcoded either way.
+        per_instrument_usable = {}
+        for label, df in dfs.items():
+            volumes = df["volume"].tolist() if "volume" in df.columns else []
+            per_instrument_usable[label] = module.volume_field_is_usable(volumes)
+        use_volume_filter = bool(dfs) and all(per_instrument_usable.values())
+
+        all_trades = []
+        for done, (label, df) in enumerate(dfs.items()):
+            progress_cb(done, len(dfs), f"{label} (backtesting)")
+            for t in module.backtest_instrument(label, df, use_volume_filter):
+                t["instrument"] = label
+                all_trades.append(t)
+        progress_cb(len(dfs), len(dfs), "done")
+    return all_trades
+
+
+# ---------------------------------------------------------------------------
 # support_resistance_zone_bounce_dukascopy_backtest.py (S/R zone bounce)
 # Exposes: INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, DAILY bars,
 # ATR_LEN, ZONE_PIVOT_LOOKBACK, ZONE_WIDTH_ATR_MULT, ZONE_BREAK_BUFFER_ATR_MULT,
@@ -411,6 +508,102 @@ def _build_registry():
               "target off a swing-low/high stop. Runs continuously, not tied to a session window.",
         runner=_run_rsi,
         optimization_module=_find_optimization_module("research.rsi_mean_reversion_dukascopy_backtest"),
+    ))
+
+    asian_mod = _load_module("research.asian_range_breakout_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="asian_range_breakout",
+        name="Asian Range Breakout",
+        module_name="research.asian_range_breakout_dukascopy_backtest",
+        granularity="5-min bars",
+        instruments=asian_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("STOP_BUFFER_PCT", "Stop buffer (% of price)", "float", asian_mod.STOP_BUFFER_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("TARGET_RANGE_MULT", "Measured-move target (x Asian range)", "float", asian_mod.TARGET_RANGE_MULT, 0.5, 5.0, 0.25),
+            ParamSpec("FALLBACK_REWARD_RISK", "Fallback reward:risk", "float", asian_mod.FALLBACK_REWARD_RISK, 0.5, 10.0, 0.5),
+            ParamSpec("MIN_RANGE_PCT", "Min Asian range (% of price)", "float", asian_mod.MIN_RANGE_PCT, 0.0, 1.0, 0.01),
+        ],
+        facets=[],
+        notes="Trades WITH a close-confirmed break of the prior evening's Asian session range during "
+              "the London open - the mechanical opposite of ICT Power of Three above (which fades that "
+              "same kind of break).",
+        runner=_run_asian_range_breakout,
+        optimization_module=_find_optimization_module("research.asian_range_breakout_dukascopy_backtest"),
+    ))
+
+    dow_theory_mod = _load_module("research.dow_theory_swing_structure_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="dow_theory_swing_structure",
+        name="Dow Theory Swing Structure",
+        module_name="research.dow_theory_swing_structure_dukascopy_backtest",
+        granularity="5-min bars driving daily swing pivots (swing/position - trades can stay open weeks-months)",
+        instruments=dow_theory_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("SWING_LEN", "Swing pivot confirmation (days each side)", "int", dow_theory_mod.SWING_LEN, 5, 60, 1),
+        ],
+        facets=[],
+        notes="Trend-following on confirmed daily higher-highs/higher-lows (or lower-highs/lower-lows) "
+              "swing structure, with a trailing stop that ratchets to each new confirmed pivot - the "
+              "same trailing mechanic as Donchian/Turtle above. A selective filter by design: expect a "
+              "modest handful to a few dozen trades per instrument over 9 years, not hundreds. Defaults "
+              "to a 3-year window like the other swing/daily-bar strategies above.",
+        runner=_run_dow_theory,
+        optimization_module=_find_optimization_module("research.dow_theory_swing_structure_dukascopy_backtest"),
+        default_history_days=3 * 365,
+    ))
+
+    bollinger_squeeze_mod = _load_module("research.bollinger_squeeze_breakout_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="bollinger_squeeze_breakout",
+        name="Bollinger Squeeze Breakout",
+        module_name="research.bollinger_squeeze_breakout_dukascopy_backtest",
+        granularity="5-min bars",
+        instruments=bollinger_squeeze_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("BB_LENGTH", "Band length (bars)", "int", bollinger_squeeze_mod.BB_LENGTH, 5, 100, 5),
+            ParamSpec("BB_NUM_STD", "Band width (x stddev)", "float", bollinger_squeeze_mod.BB_NUM_STD, 0.5, 4.0, 0.25),
+            ParamSpec("SQUEEZE_LOOKBACK", "Squeeze lookback (bars)", "int", bollinger_squeeze_mod.SQUEEZE_LOOKBACK, 20, 400, 20),
+            ParamSpec("SQUEEZE_PERCENTILE", "Squeeze percentile threshold", "float", bollinger_squeeze_mod.SQUEEZE_PERCENTILE, 1.0, 50.0, 1.0),
+            ParamSpec("SQUEEZE_RECENCY_BARS", "Squeeze recency window (bars)", "int", bollinger_squeeze_mod.SQUEEZE_RECENCY_BARS, 1, 30, 1),
+            ParamSpec("MIN_SL_PCT", "Min stop distance (% of price)", "float", bollinger_squeeze_mod.MIN_SL_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("REWARD_RISK", "Reward:risk", "float", bollinger_squeeze_mod.REWARD_RISK, 0.5, 6.0, 0.5),
+            ParamSpec("MAX_HOLD_BARS", "Max hold (5-min bars)", "int", bollinger_squeeze_mod.MAX_HOLD_BARS, 6, 288, 6),
+        ],
+        facets=[],
+        notes="NOT the same strategy as Bollinger Band Mean-Reversion above - this is the mechanical "
+              "OPPOSITE: waits for the bands to visibly contract (a volatility squeeze) then trades WITH "
+              "the breakout once price closes outside a band, instead of fading a band touch. Compare "
+              "the two side by side deliberately, don't conflate them.",
+        runner=_run_bollinger_squeeze,
+        optimization_module=_find_optimization_module("research.bollinger_squeeze_breakout_dukascopy_backtest"),
+    ))
+
+    climax_mod = _load_module("research.climax_volume_reversal_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="climax_volume_reversal",
+        name="Climax Volume Reversal",
+        module_name="research.climax_volume_reversal_dukascopy_backtest",
+        granularity="15-min bars (native fetch, not resampled from 5-min like every other strategy here)",
+        instruments=climax_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("ATR_LENGTH", "ATR length (15-min bars)", "int", climax_mod.ATR_LENGTH, 2, 60, 1),
+            ParamSpec("CLIMAX_RANGE_ATR_MULT", "Climax range floor (x ATR)", "float", climax_mod.CLIMAX_RANGE_ATR_MULT, 1.0, 8.0, 0.5),
+            ParamSpec("RUN_LOOKBACK_BARS", "Prior-run lookback (bars)", "int", climax_mod.RUN_LOOKBACK_BARS, 2, 40, 1),
+            ParamSpec("CLIMAX_VOLUME_MULT", "Climax volume floor (x trailing avg)", "float", climax_mod.CLIMAX_VOLUME_MULT, 1.0, 8.0, 0.5,
+                       help="Only applied if the volume field looks usable on every selected instrument this run - see the strategy note."),
+            ParamSpec("PENDING_ORDER_EXPIRY_BARS", "Pending stop-entry expiry (bars)", "int", climax_mod.PENDING_ORDER_EXPIRY_BARS, 1, 30, 1),
+            ParamSpec("REWARD_RISK", "Reward:risk", "float", climax_mod.REWARD_RISK, 0.5, 6.0, 0.5),
+            ParamSpec("MIN_SL_PCT", "Min stop distance (% of price)", "float", climax_mod.MIN_SL_PCT, 0.0, 1.0, 0.01),
+        ],
+        facets=[],
+        notes="A volume-and-range exhaustion candle at the end of a directional run, confirmed by the "
+              "very next bar closing the opposite way, entered on a stop order (not a market order). "
+              "Native 15-min bars. Whether the volume condition is even applied is decided empirically "
+              "each run (checked against the actual fetched data for every selected instrument, dropped "
+              "for the whole run if any instrument's volume field looks degenerate) - watch for that "
+              "diagnostic if results seem to ignore CLIMAX_VOLUME_MULT.",
+        runner=_run_climax_volume_reversal,
+        optimization_module=_find_optimization_module("research.climax_volume_reversal_dukascopy_backtest"),
     ))
 
     sr_mod = _load_module("research.support_resistance_zone_bounce_dukascopy_backtest")
