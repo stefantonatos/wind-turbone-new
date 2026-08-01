@@ -121,10 +121,12 @@
 # for why it's an optional dependency handled with a graceful skip, same pattern as sklearn/matplotlib)
 
 import datetime
+import json
 import logging
 import os
 import pickle
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -214,6 +216,18 @@ WF_IS_YEARS = 3
 WF_OOS_YEARS = 1
 WF_STEP_YEARS = 1
 WFE_PASS_THRESHOLD = 0.5
+
+# --- lockbox (research/optimization_engine.py: split_lockbox/lockbox_confirm) ---
+# The final LOCKBOX_MONTHS of FETCH_START..FETCH_END are carved off BEFORE any search runs and are
+# excluded, BY CONSTRUCTION, from STEP 1's full-range search AND every STEP 4 walk-forward fold
+# (both now bounded by `search_end`, not `FETCH_END` - see main()) - structurally stricter than the
+# walk-forward OOS folds above, which DO get re-touched on every search re-run. See
+# optimization_engine.py's own LOCKBOX / EMBARGOED FINAL HOLDOUT section header for the full
+# reasoning, and why this is enforced via a persistent ledger (research/lockbox_ledger.json), not
+# just this comment.
+LOCKBOX_MONTHS = 12
+STRATEGY_ID = "day_trading_rauf_dukascopy"   # stable identifier for the lockbox ledger - one
+                                              # lockbox attempt EVER for this strategy, not per-run
 
 HEATMAP_PNG_PATH = "day_trading_rauf_param_heatmap.png"
 
@@ -799,7 +813,13 @@ def run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_star
     (exhaustive grid search, raw-total-R fold-winner selection) this function used before this
     refactor; this function's call signature and default numeric behavior are unchanged. See
     TestSearchEngineRetrofit.test_walk_forward_default_still_matches_old_behavior for the direct
-    regression check."""
+    regression check.
+
+    Each fold_rows entry ALSO carries "oos_trades" - that fold's own OOS trades, un-merged with any
+    other fold's - needed by optimization_engine.estimate_decay's month-since-fit pooling (see this
+    script's STEP 4 output section below), which combined_oos_trades alone cannot support since it
+    already threw away fold identity. Purely additive: combined_oos_trades' own contents are
+    unchanged."""
     folds = list(walk_forward_folds(fetch_start, fetch_end))
     fold_rows = []
     combined_oos_trades = []
@@ -829,6 +849,7 @@ def run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_star
             "best_stop_buffer_pct": best["stop_buffer_pct"], "best_confirmation_candles": best["confirmation_candles"],
             "is_total_r": best["total_r"], "is_n_trades": best["n_trades"], "is_avg_r": best["avg_r"],
             "oos_total_r": oos_total_r, "oos_n_trades": oos_n, "oos_avg_r": oos_avg_r,
+            "oos_trades": oos_trades,
         })
         combined_oos_trades.extend(oos_trades)
         is_avg_rs_selected.append(best["avg_r"])
@@ -888,9 +909,20 @@ def run_full_pipeline(all_arrays, stop_buffer_grid, confirmation_grid, fetch_sta
                   "win rate and is still net-negative because losers outsize winners. See "
                   "optimization_engine.py's win_rate() docstring. total_r/avg_r for the same selected combo "
                   "are also printed below so this can be cross-checked, not taken on faith.")
+    # STEP 1's window is now explicitly bounded by fetch_start/fetch_end (this function's own
+    # params) - when main() calls this with (search_start, search_end) rather than
+    # (FETCH_START, FETCH_END), the lockbox window is excluded from STEP 1's search BY
+    # CONSTRUCTION, not just by convention (see optimization_engine.py's LOCKBOX section header
+    # and main()'s split_lockbox call below). This also makes run_full_pipeline's own docstring
+    # ("Runs all 4 steps against whatever data/grid/date-range it's given") literally true for
+    # STEP 1 too, not just STEP 4's walk-forward folds (which already honored fetch_start/
+    # fetch_end via walk_forward_folds).
+    step1_window_start = fetch_start.date() if hasattr(fetch_start, "date") else fetch_start
+    step1_window_end = fetch_end.date() if hasattr(fetch_end, "date") else fetch_end
     grid_results, step1_search_result = run_param_search(
-        all_arrays, stop_buffer_grid, confirmation_grid, method=method, objective=objective,
-        show_progress=show_progress, desc="STEP 1 search")
+        all_arrays, stop_buffer_grid, confirmation_grid,
+        window_start=step1_window_start, window_end=step1_window_end,
+        method=method, objective=objective, show_progress=show_progress, desc="STEP 1 search")
     results["grid_results"] = grid_results
     results["step1_search_result"] = step1_search_result
     if verbose and resolved_method != "grid":
@@ -1019,7 +1051,39 @@ def run_full_pipeline(all_arrays, stop_buffer_grid, confirmation_grid, fetch_sta
               f"formal proof of robustness either way - a pass doesn't guarantee a real edge and a fail near "
               f"the line doesn't guarantee its absence).")
 
+    decay_result = opt_engine.estimate_decay(wf_result["fold_rows"])
+    results["decay_result"] = decay_result
+    if verbose:
+        print_decay_diagnostic(decay_result, n_folds=len(wf_result["fold_rows"]))
+
     return results
+
+
+def print_decay_diagnostic(decay_result, n_folds, metric="avg_r", min_folds=4):
+    """Prints optimization_engine.estimate_decay's result (pooled by months-since-fit across every
+    STEP 4 walk-forward fold's own un-merged OOS trades - see run_walk_forward's "oos_trades"
+    addition above) alongside the WFE result already printed by run_full_pipeline's STEP 4 section.
+    This is a DIAGNOSTIC, not a pass/fail gate - it never changes the WFE PASS/FAIL verdict, only
+    adds a second, differently-shaped signal about whether whatever edge (if any) the walk-forward
+    found tends to fade the further out from each fold's own fit date it's used."""
+    print(f"\n  Signal-decay diagnostic (pooled by months-since-fit across all {n_folds} walk-forward "
+          f"folds, metric={metric!r}):")
+    if decay_result["confidence"] == "insufficient_folds":
+        print(f"    INSUFFICIENT: only {decay_result['n_folds_used']} fold(s) contributed pooled OOS "
+              f"data (need >= min_folds={min_folds}) - this diagnostic is not meaningful yet with this "
+              "few independent walk-forward folds. Both Day Trading Rauf and ICT PO3's own 6-fold "
+              "rolling walk-forward comfortably clear this bar.")
+        return
+    print(f"    Pooled across {decay_result['n_folds_used']} folds. Linear trend: slope = "
+          f"{decay_result['slope']:+.5f} per month "
+          f"({'DECAY evidence (negative slope)' if decay_result['slope'] < 0 else 'no decay evidence (flat/positive slope)'}).")
+    if decay_result["phi"] is not None:
+        print(f"    Exponential decay fit: phi = {decay_result['phi']:.4f}, half-life = "
+              f"{decay_result['half_life_months']:.2f} months.")
+    else:
+        print("    Exponential decay fit: not reportable this run (pooled metric wasn't strictly "
+              "positive throughout, or fitted phi wasn't in the genuine-decay range (0, 1)) - the "
+              "linear slope above is still a valid decay/no-decay signal on its own.")
 
 
 def print_final_verdict(results):
@@ -1078,6 +1142,28 @@ def print_final_verdict(results):
                   "every run, which this print deliberately does not claim to be.")
 
 
+def make_lockbox_backtest_fn(all_arrays, stop_buffer_pct, confirmation_candles):
+    """Builds an optimization_engine.lockbox_confirm-compatible backtest_fn(lockbox_start,
+    lockbox_end) -> list_of_trade_dicts, running backtest_instrument across every instrument in
+    `all_arrays` with FIXED, already-selected params (STEP 1's final winner, not a search)
+    restricted to [lockbox_start, lockbox_end) - the one and only time those exact bars are ever
+    touched by this script. `lockbox_start`/`lockbox_end` are converted to datetime.date here
+    (backtest_instrument compares against per-bar .date() values) so a caller can pass
+    split_lockbox's raw datetime/date output straight through without converting first."""
+    def backtest_fn(lockbox_start, lockbox_end):
+        ls = lockbox_start.date() if hasattr(lockbox_start, "date") else lockbox_start
+        le = lockbox_end.date() if hasattr(lockbox_end, "date") else lockbox_end
+        trades = []
+        for label, arrays in all_arrays.items():
+            cell_trades = backtest_instrument(arrays, stop_buffer_pct, confirmation_candles,
+                                               window_start=ls, window_end=le)
+            for t in cell_trades:
+                t["instrument"] = label
+            trades.extend(cell_trades)
+        return trades
+    return backtest_fn
+
+
 def main():
     if dukascopy_python is None:
         print("dukascopy_python is not installed in this environment - install it "
@@ -1086,11 +1172,24 @@ def main():
         return
 
     years = (FETCH_END - FETCH_START).days / 365
+    # split_lockbox carves LOCKBOX_MONTHS off the END of the fetch range BEFORE anything below
+    # searches over any of it - search_start/search_end (== lockbox_start) replace FETCH_START/
+    # FETCH_END as run_full_pipeline's own bounds, so BOTH STEP 1's search window and every STEP 4
+    # walk-forward fold exclude the lockbox window BY CONSTRUCTION, not by convention. See
+    # optimization_engine.py's LOCKBOX section header and STEP 5 (lockbox_confirm) below.
+    search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+        FETCH_START, FETCH_END, lockbox_months=LOCKBOX_MONTHS)
     print(f"Downloading {len(INSTRUMENTS)} instruments from Dukascopy over ~{years:.0f} years "
           f"({FETCH_START.date()} to {FETCH_END.date()}) - cached to disk after the first run. "
           f"This full optimization pass (16-cell grid + Monte Carlo + cluster analysis + a 6-fold "
           f"rolling walk-forward that re-runs the 16-cell grid per fold) is considerably heavier than "
           f"the base backtest - expect this to take a long time; see the header's RUNTIME WARNING.\n")
+    print(f"LOCKBOX: the final {LOCKBOX_MONTHS} months ({lockbox_start.date()} to {lockbox_end.date()}) are "
+          f"held out from EVERYTHING below (STEP 1's search window and every STEP 4 fold now stop at "
+          f"{search_end.date()}, not {FETCH_END.date()}) - reserved for a single, ledger-enforced STEP 5 "
+          "confirmation at the very end. See research/optimization_engine.py's LOCKBOX section header for "
+          "why this is a structurally different (stricter) guarantee than the walk-forward OOS folds above "
+          "it.\n")
 
     all_arrays = {}
     for label, instrument_const_name in tqdm(INSTRUMENTS, desc="Instruments", unit="instrument"):
@@ -1110,9 +1209,34 @@ def main():
         return
 
     results = run_full_pipeline(all_arrays, STOP_BUFFER_PCT_GRID, CONFIRMATION_CANDLES_GRID,
-                                 FETCH_START, FETCH_END, mc_iterations=MC_ITERATIONS,
+                                 search_start, search_end, mc_iterations=MC_ITERATIONS,
                                  make_plots=True, show_progress=True, verbose=True)
     print_final_verdict(results)
+
+    # ---------------- STEP 5: lockbox confirmation (one-shot, ledger-enforced) ----------------
+    print("\n" + "=" * 70)
+    print("STEP 5: LOCKBOX CONFIRMATION (one-shot, ledger-enforced final holdout)")
+    print("=" * 70)
+    step1_search_result = results["step1_search_result"]
+    best_cell = _find_cell(results["grid_results"], step1_search_result["best"]["params"])
+    print(f"Confirming STEP 1's winning combo (STOP_BUFFER_PCT={best_cell['stop_buffer_pct']:.3g}, "
+          f"CONFIRMATION_CANDLES={best_cell['confirmation_candles']}) on the lockbox window "
+          f"{lockbox_start.date()} to {lockbox_end.date()} - this window was NEVER touched by STEP 1-4 "
+          "above (search_end excluded it by construction, see main()'s top). This can only ever be run "
+          f"ONCE for strategy_id={STRATEGY_ID!r} - see research/lockbox_ledger.json and "
+          "optimization_engine.py's LOCKBOX section header.")
+    lockbox_backtest_fn = make_lockbox_backtest_fn(
+        all_arrays, best_cell["stop_buffer_pct"], best_cell["confirmation_candles"])
+    try:
+        lockbox_result = opt_engine.lockbox_confirm(
+            STRATEGY_ID,
+            {"stop_buffer_pct": best_cell["stop_buffer_pct"], "confirmation_candles": best_cell["confirmation_candles"]},
+            lockbox_backtest_fn, lockbox_start, lockbox_end)
+        print(f"Lockbox result: {lockbox_result['n_trades']} trades, {lockbox_result['total_r']:+.2f}R total, "
+              f"{lockbox_result['avg_r']:+.4f}R/trade, consistency={lockbox_result['consistency']} "
+              f"-> {'PASSED' if lockbox_result['passed'] else 'DID NOT PASS'}")
+    except opt_engine.LockboxAlreadyUsedError as exc:
+        print(f"Lockbox SKIPPED - already used for this strategy_id: {exc}")
 
 
 # ============================= synthetic end-to-end smoke test =============================
@@ -1656,6 +1780,122 @@ class TestCorrectedZScoreAndBonferroni(unittest.TestCase):
         results = run_full_pipeline(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
                                      mc_iterations=50, make_plots=False, show_progress=False, verbose=False)
         print_final_verdict(results)   # must not raise
+
+
+# ============================= NEW: consistency_ratio / estimate_decay / lockbox wiring =============================
+
+class TestOosTradesTagging(unittest.TestCase):
+    """run_walk_forward's fold_rows entries must now carry "oos_trades" (full trade dicts,
+    un-merged across folds) IN ADDITION TO the existing keys - needed by
+    optimization_engine.estimate_decay's months-since-fit pooling. Purely additive:
+    combined_oos_trades' own contents stay unchanged."""
+
+    def test_fold_rows_carry_oos_trades_consistent_with_combined_oos_trades(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+        wf_result = run_walk_forward(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end, show_progress=False)
+
+        for row in wf_result["fold_rows"]:
+            self.assertIn("oos_trades", row)
+            self.assertEqual(len(row["oos_trades"]), row["oos_n_trades"])
+
+        rebuilt = [t for row in wf_result["fold_rows"] for t in row["oos_trades"]]
+        self.assertEqual(rebuilt, wf_result["combined_oos_trades"])
+
+
+class TestDecayDiagnosticWiring(unittest.TestCase):
+    def test_run_full_pipeline_carries_decay_result_and_prints_without_crashing(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+        results = run_full_pipeline(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
+                                     mc_iterations=50, make_plots=False, show_progress=False, verbose=True)
+        self.assertIn("decay_result", results)
+        self.assertIn(results["decay_result"]["confidence"], ("ok", "insufficient_folds"))
+        # only 2 folds in this small window - below the default min_folds=4 gate
+        self.assertEqual(results["decay_result"]["confidence"], "insufficient_folds")
+        print_decay_diagnostic(results["decay_result"], n_folds=len(results["wf_result"]["fold_rows"]))
+
+
+class TestLockboxWiring(unittest.TestCase):
+    """CRITICAL structural requirement: STEP 1's search window and every STEP 4 walk-forward fold
+    must be bounded by search_end (== split_lockbox's lockbox_start), not FETCH_END, so the lockbox
+    window is excluded BY CONSTRUCTION - never touched by any search iteration."""
+
+    def test_split_lockbox_boundary_math(self):
+        fetch_start = datetime.datetime(2016, 1, 1)
+        fetch_end = datetime.datetime(2025, 1, 1)
+        search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            fetch_start, fetch_end, lockbox_months=12)
+        self.assertEqual(search_start, fetch_start)
+        self.assertEqual(search_end, lockbox_start)
+        self.assertEqual(lockbox_start, datetime.datetime(2024, 1, 1))
+        self.assertEqual(lockbox_end, fetch_end)
+
+    def test_no_generated_fold_ever_crosses_into_the_lockbox_window(self):
+        fetch_start = datetime.datetime(2016, 1, 1)
+        fetch_end = datetime.datetime(2025, 1, 1)
+        _, search_end, lockbox_start, _ = opt_engine.split_lockbox(fetch_start, fetch_end, lockbox_months=12)
+
+        folds = list(walk_forward_folds(fetch_start, search_end))
+        self.assertGreater(len(folds), 0)
+        for is_start, is_end, oos_start, oos_end in folds:
+            self.assertLessEqual(oos_end, lockbox_start.date())
+            self.assertLessEqual(is_end, lockbox_start.date())
+
+        # sanity check: using fetch_end directly WOULD have produced a fold crossing into what is
+        # now the lockbox window - proving this isn't a vacuously-true check.
+        old_style_folds = list(walk_forward_folds(fetch_start, fetch_end))
+        self.assertTrue(any(oos_end > lockbox_start.date() for _, _, _, oos_end in old_style_folds))
+
+    def test_run_full_pipeline_step1_window_excludes_lockbox_data(self):
+        """A direct check that STEP 1's grid search, as wired through main()'s
+        (search_start, search_end) call, never sees trades dated on/after the lockbox boundary -
+        constructs a small dataset spanning INTO what would be the lockbox window and confirms
+        run_full_pipeline's STEP 1 trades never cross it when given search_start/search_end."""
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+        search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            fetch_start, fetch_end, lockbox_months=12)   # search ends 2020-01-01, lockbox 2020-2021
+
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        results = run_full_pipeline(all_arrays, sb_grid, cc_grid, search_start, search_end,
+                                     mc_iterations=50, make_plots=False, show_progress=False, verbose=False)
+        for cell in results["grid_results"]:
+            for t in cell["trades"]:
+                self.assertLess(t["date"], lockbox_start.date())
+
+    def test_make_lockbox_backtest_fn_and_lockbox_confirm_one_shot(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+        _, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            fetch_start, fetch_end, lockbox_months=12)
+
+        backtest_fn = make_lockbox_backtest_fn(all_arrays, stop_buffer_pct=0.02, confirmation_candles=3)
+
+        tmpdir = tempfile.mkdtemp()
+        ledger_path = os.path.join(tmpdir, "lockbox_ledger.json")
+        strategy_id = "test_rauf_strategy"
+
+        result = opt_engine.lockbox_confirm(strategy_id, {"stop_buffer_pct": 0.02, "confirmation_candles": 3},
+                                             backtest_fn, lockbox_start, lockbox_end, ledger_path=ledger_path)
+        self.assertIn("passed", result)
+        self.assertIn("n_trades", result)
+
+        self.assertTrue(os.path.exists(ledger_path))
+        with open(ledger_path) as f:
+            records = json.load(f)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["strategy_id"], strategy_id)
+
+        with self.assertRaises(opt_engine.LockboxAlreadyUsedError):
+            opt_engine.lockbox_confirm(strategy_id, {"stop_buffer_pct": 0.02, "confirmation_candles": 3},
+                                        backtest_fn, lockbox_start, lockbox_end, ledger_path=ledger_path)
+
+        with open(ledger_path) as f:
+            records_after = json.load(f)
+        self.assertEqual(len(records_after), 1)   # the refused second call never appended anything
 
 
 if __name__ == "__main__":

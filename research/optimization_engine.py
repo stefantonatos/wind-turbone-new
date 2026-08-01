@@ -41,12 +41,50 @@
 # list_of_trade_dicts` callback supplied by the CALLER - this module only ever
 # calls that callback and scores what comes back. The companion scripts import
 # FROM this module; this module imports nothing from them.
+#
+# THREE ADDITIONS ON TOP OF THE ABOVE (dedicated follow-up pass, grounded in the real quant
+# literature rather than taking a trading-education video's claims at face value):
+#
+#   a. consistency_ratio() - a period-consistency objective/diagnostic INSPIRED BY (not a
+#      reimplementation of) the mean/std-of-a-return-stream structure behind Grinold & Kahn's
+#      Information Coefficient / ICIR. Real ICIR is a cross-sectional FACTOR-SCORING metric (it
+#      measures how consistently a factor's cross-sectional score correlates with forward returns
+#      across many assets, period over period) - this project has one strategy's discrete trade
+#      list per run, not a cross-section of scored assets, so there is no faithful ICIR to compute
+#      here. consistency_ratio() is honestly named for what it actually is: mean(R_p)/std(R_p)
+#      across fixed calendar periods (monthly or weekly), INCLUDING zero-trade periods. See its
+#      own docstring for the full distinction - read that before assuming this project does
+#      cross-sectional factor scoring, because it does not.
+#
+#   b. estimate_decay() - a signal-decay / half-life diagnostic built directly on this project's
+#      EXISTING rolling walk-forward fold structure (both companion scripts' STEP 4), pooling every
+#      fold's out-of-sample trades by months-since-that-fold's-own-fit rather than treating each
+#      fold's calendar months as independent data points. See its docstring for the exponential-
+#      decay fit and the guardrails on when a half-life is actually reportable.
+#
+#   c. split_lockbox() / lockbox_confirm() - a genuinely one-shot, ledger-enforced final holdout,
+#      structurally DIFFERENT FROM (and stricter than) the existing walk-forward OOS folds above.
+#      The walk-forward folds are re-touched every time a grid/Bayesian/genetic search re-runs
+#      (STEP 1's full-range search and every STEP 4 fold's in-sample search all see data up to
+#      fetch_end) - useful for what they're for, but they do NOT satisfy "never touched by any
+#      search iteration". The lockbox is carved off BEFORE any search runs and is enforced, via a
+#      persistent append-only ledger (not just a comment/convention), to be scored AT MOST ONCE per
+#      strategy_id. See split_lockbox()/lockbox_confirm()'s docstrings for why this needs to be
+#      ledger-enforced rather than trusted to programmer discipline, and why it deliberately does
+#      NOT apply a Bonferroni correction the way the existing zscore()/bonferroni_adjusted_z_
+#      threshold() section above does (a one-shot-by-construction test has no multiple-comparisons
+#      problem to correct for).
 
 # !pip install --upgrade optuna -q   # uncomment in Colab - only needed for bayesian_search;
 # grid_search and genetic_search need nothing beyond numpy (already a dependency of both
 # companion scripts). Missing optuna never crashes anything here - see bayesian_search below.
 
+import calendar
+import datetime
 import itertools
+import json
+import math
+import os
 import random
 import statistics
 
@@ -235,12 +273,168 @@ def win_rate(trades, years=None):
     return float(np.mean(r > 0.0))
 
 
+# ----------------------------------------------------------------------------
+# consistency_ratio - a PERIOD-CONSISTENCY objective, INSPIRED BY (not a reimplementation of)
+# Grinold & Kahn's Information Coefficient / ICIR.
+#
+# *** READ THIS BEFORE ASSUMING THIS PROJECT DOES CROSS-SECTIONAL FACTOR SCORING - IT DOES NOT ***
+# The real Information Coefficient (IC) is the cross-sectional rank correlation, in a given period,
+# between a factor's SCORES across many assets and those same assets' forward returns; ICIR is
+# mean(IC)/std(IC) across periods. That is a statement about how consistently a factor ranks many
+# assets relative to each other, period over period. This project has exactly ONE strategy's
+# chronological list of discrete closed trades per run - there is no cross-section of scored assets
+# anywhere in this codebase, so there is no faithful IC/ICIR to compute here, full stop. Calling
+# this function "ICIR" would misrepresent what it does.
+#
+# What consistency_ratio() ACTUALLY is: mean(R_p) / std(R_p, ddof=1), where R_p is the SUM of a
+# strategy's realized trade R-multiples falling in calendar period p (monthly by default, or
+# weekly), across EVERY period spanning the trades' own date range - INCLUDING periods with zero
+# trades (R_p = 0 for those, not skipped). That last part matters: a strategy that trades in every
+# period and nets modestly each time should score HIGHER than one with the identical total R
+# concentrated into a few active periods and many silent ones - silence is not neutral here, it
+# lowers the period count denominator's effective evidence and (via the zero R_p values it
+# contributes) can raise or lower the ratio depending on whether those zeros are more or less
+# extreme than the active periods' own spread. This is the one piece of ICIR's STRUCTURE (a
+# mean/std ratio of a return stream across periods) this function borrows - not its cross-sectional
+# meaning.
+def _to_date(d):
+    """Normalizes a trade's "date" field (datetime.date OR datetime.datetime, both appear across
+    this project's various backtest scripts) down to a plain datetime.date for period bucketing."""
+    if isinstance(d, datetime.datetime):
+        return d.date()
+    return d
+
+
+def _period_key(d, period):
+    """Monthly key: (year, month). Weekly key: the ISO (iso_year, iso_week) of `d`'s Monday - ISO
+    week keys are used (not a naive day//7 bucket) specifically so a trade near a year boundary is
+    grouped with the correct week even when ISO week 1 of a year starts in the tail end of the
+    previous calendar year (or vice versa) - datetime.date.isocalendar() already implements this
+    correctly, so it's used directly rather than hand-rolled."""
+    if period == "M":
+        return (d.year, d.month)
+    if period == "W":
+        iso = d.isocalendar()
+        return (iso[0], iso[1])
+    raise ValueError(f"consistency_ratio: unknown period {period!r} - choose 'M' (monthly) or 'W' (weekly)")
+
+
+def _all_period_keys(min_d, max_d, period):
+    """Every period key from `min_d`'s period through `max_d`'s period, INCLUSIVE, in order - the
+    full span a set of trades could have occurred across, independent of which periods actually
+    have a trade in them. This is what makes zero-trade periods show up in consistency_ratio's R_p
+    list at all: this function enumerates the calendar, not the trades."""
+    if period == "M":
+        keys = []
+        y, m = min_d.year, min_d.month
+        ey, em = max_d.year, max_d.month
+        while (y, m) <= (ey, em):
+            keys.append((y, m))
+            m += 1
+            if m == 13:
+                m = 1
+                y += 1
+        return keys
+    if period == "W":
+        # Step Monday-to-Monday by exactly 7 days (never hand-rolled ISO week arithmetic, which is
+        # easy to get subtly wrong around 52/53-week year boundaries) and read each Monday's own
+        # ISO (year, week) via isocalendar() - monotonic and gap-free by construction since every
+        # step is exactly one week.
+        keys = []
+        cur = min_d - datetime.timedelta(days=min_d.weekday())
+        end = max_d - datetime.timedelta(days=max_d.weekday())
+        while cur <= end:
+            iso = cur.isocalendar()
+            keys.append((iso[0], iso[1]))
+            cur += datetime.timedelta(days=7)
+        return keys
+    raise ValueError(f"consistency_ratio: unknown period {period!r} - choose 'M' (monthly) or 'W' (weekly)")
+
+
+def bucket_trades_by_period(trades, period="M"):
+    """Sums each trade's "r" into its calendar period bucket (see _period_key) - does NOT fill in
+    zero-trade periods (that is consistency_ratio's job, via _all_period_keys, since only
+    consistency_ratio knows it needs the full calendar span, not just the occupied buckets).
+    Exposed as its own function (not inlined into consistency_ratio) so the period-bucketing logic
+    itself is directly unit-testable against hand-crafted trade lists with known R_p values."""
+    buckets = {}
+    for t in trades:
+        key = _period_key(_to_date(t["date"]), period)
+        buckets[key] = buckets.get(key, 0.0) + float(t["r"])
+    return buckets
+
+
+def consistency_ratio(trades, years=None, period="M"):
+    """mean(R_p) / std(R_p, ddof=1) across every calendar period (monthly by default; period="W"
+    for weekly) spanning `trades`' own date range, R_p = sum of that period's trade R-multiples,
+    INCLUDING zero-trade periods (R_p = 0, not skipped - see the registry-level docstring above for
+    why this matters). `years` is accepted and ignored, purely so this function can be plugged into
+    OBJECTIVES and called through search strategies' identical (trades, years) -> ... signature
+    alongside total_r/avg_r/sharpe/calmar/win_rate.
+
+    UNLIKE every other function in OBJECTIVES, this returns a DICT, not a bare float - the reason a
+    score is missing or low-confidence matters to a caller deciding whether to trust it:
+        {"value": float | nan, "n_periods": int, "n_trades": int,
+         "confidence": "ok" | "low_confidence" | "insufficient"}
+
+    Guard rails:
+      - 0 trades -> value=nan, n_periods=0, confidence="insufficient" (nothing to bucket at all).
+      - std(R_p) == 0 (or fewer than 2 periods, where a sample std is undefined) -> value=nan,
+        NEVER a silent inf or 0 - a constant (or single-period) R_p stream has no meaningful
+        consistency ratio, not a "perfectly consistent" one.
+      - n_periods < 12 -> confidence="insufficient" AND value is forced to nan regardless of what
+        the raw ratio would have been - the whole point of "insufficient" is "don't even report a
+        number as comparable", not "report a number with a footnote".
+      - 12 <= n_periods < 24 -> confidence="low_confidence" (a real number, but on a short span -
+        use with caution).
+      - n_periods >= 24 -> confidence="ok".
+
+    See grid_search/bayesian_search/genetic_search's "best" selection (via this module's internal
+    _normalize_score helper) for how a dict-valued score - including a nan value - is handled
+    without ever letting a nan/insufficient cell win a max() comparison by accident."""
+    n_trades = len(trades)
+    if n_trades == 0:
+        return {"value": float("nan"), "n_periods": 0, "n_trades": 0, "confidence": "insufficient"}
+
+    dates = [_to_date(t["date"]) for t in trades]
+    min_d, max_d = min(dates), max(dates)
+    all_keys = _all_period_keys(min_d, max_d, period)
+    r_by_period = bucket_trades_by_period(trades, period=period)
+    r_values = [r_by_period.get(k, 0.0) for k in all_keys]
+    n_periods = len(r_values)
+
+    if n_periods >= 2:
+        std_r = statistics.stdev(r_values)   # ddof=1, the same convention used by sharpe()/zscore() above
+        mean_r = statistics.mean(r_values)
+    else:
+        std_r = float("nan")
+        mean_r = float(r_values[0]) if r_values else float("nan")
+
+    if math.isnan(std_r) or std_r == 0.0:
+        value = float("nan")
+    else:
+        value = mean_r / std_r
+
+    if n_periods < 12:
+        confidence = "insufficient"
+        value = float("nan")   # don't report a number as comparable - see docstring above
+    elif n_periods < 24:
+        confidence = "low_confidence"
+    else:
+        confidence = "ok"
+
+    return {"value": value, "n_periods": n_periods, "n_trades": n_trades, "confidence": confidence}
+
+
 OBJECTIVES = {
     "total_r": total_r,     # DEFAULT - matches both companion scripts' existing, already-verified behavior
     "avg_r": avg_r,
     "sharpe": sharpe,
     "calmar": calmar,
     "win_rate": win_rate,   # see the loud trap warning in win_rate()'s own docstring above
+    "consistency_ratio": consistency_ratio,   # returns a DICT, not a float - see its own docstring
+                                               # and _normalize_score below for how search strategies
+                                               # handle that without special-casing it themselves
 }
 
 DEFAULT_OBJECTIVE = "total_r"
@@ -255,6 +449,43 @@ def get_objective(name):
         return OBJECTIVES[name]
     except KeyError:
         raise KeyError(f"Unknown objective {name!r} - choose one of {sorted(OBJECTIVES)}") from None
+
+
+def _normalize_score(raw_score):
+    """Every OBJECTIVES function except consistency_ratio returns a plain float; consistency_ratio
+    returns a dict ({"value", "n_periods", "n_trades", "confidence"}, see its own docstring). All
+    three search strategies (grid_search/bayesian_search/genetic_search) need a single float to
+    rank cells by max(..., key=...) regardless of which shape the configured objective_fn produced
+    - this is the ONE place that difference gets reconciled, so grid_search/bayesian_search/
+    genetic_search's own bodies never have to special-case "is this objective's score a dict".
+
+    Returns (sort_value, detail): `sort_value` is always a plain float, safe to store in a result
+    entry's "score" key and hand straight to max(key=...) - a dict's "value" is extracted for this
+    purpose, and nan (explicitly, e.g. consistency_ratio's "insufficient"/std==0 cases) is mapped to
+    -inf so a numerically-undefined or too-little-evidence cell can NEVER accidentally win a
+    max() comparison against a real, defined score merely because NaN comparisons are unreliable in
+    Python/numpy (nan is neither > nor < anything, including other nans) - it must always lose.
+    `detail` is the original dict when raw_score was one (None otherwise) - callers that want the
+    full picture (n_periods, confidence, ...) for REPORTING, not ranking, get it back via the
+    result entry's "score_detail" key (see grid_search/bayesian_search/genetic_search below), so no
+    information from a dict-valued objective is thrown away, only reordered for comparison
+    purposes."""
+    if isinstance(raw_score, dict):
+        value = raw_score.get("value")
+        detail = raw_score
+    else:
+        value = raw_score
+        detail = None
+
+    if value is None:
+        return float("-inf"), detail
+    try:
+        is_nan = math.isnan(value)
+    except TypeError:
+        return float("-inf"), detail
+    if is_nan:
+        return float("-inf"), detail
+    return float(value), detail
 
 
 # ============================================================================
@@ -370,12 +601,20 @@ def bonferroni_adjusted_z_threshold(n_trials, family_wise_alpha=0.05):
 #
 # Return value (all three): a dict with
 #   "method":   "grid" | "bayesian" | "genetic"
-#   "all":      list of {"params": dict, "trades": [...], "score": float} -
+#   "all":      list of {"params": dict, "trades": [...], "score": float, "score_detail": dict?} -
 #               every DISTINCT combo actually evaluated (grid_search: every
 #               combo in param_grid, in exhaustive order; bayesian_search:
 #               every trial Optuna ran; genetic_search: every distinct
 #               chromosome evaluated across the whole run, deduplicated - see
-#               genetic_search's own docstring)
+#               genetic_search's own docstring). "score" is ALWAYS a plain
+#               float (via _normalize_score above), even when objective_fn is
+#               consistency_ratio (dict-returning) - nan/insufficient-data
+#               cells are normalized to -inf so they can never accidentally
+#               win a "best" comparison. "score_detail" is present (the
+#               objective's original dict) only when objective_fn returned
+#               one; omitted entirely for plain-float objectives (total_r,
+#               avg_r, sharpe, calmar, win_rate) so their entries' shape is
+#               completely unchanged from before this key existed.
 #   "best":     the single entry of "all" with the highest score (None if
 #               "all" is empty)
 #   "n_evals":  len(results["all"]) - how many DISTINCT eval_fn calls this
@@ -411,8 +650,12 @@ def grid_search(param_grid, eval_fn, objective_fn, years=None, show_progress=Fal
     for combo in iterator:
         params = dict(zip(names, combo))
         trades = eval_fn(params)
-        score = objective_fn(trades, years)
-        all_results.append({"params": params, "trades": trades, "score": score})
+        raw_score = objective_fn(trades, years)
+        score, score_detail = _normalize_score(raw_score)
+        entry = {"params": params, "trades": trades, "score": score}
+        if score_detail is not None:
+            entry["score_detail"] = score_detail
+        all_results.append(entry)
 
     best = max(all_results, key=lambda r: r["score"]) if all_results else None
     return {"method": "grid", "all": all_results, "best": best, "n_evals": len(all_results)}
@@ -458,9 +701,15 @@ def bayesian_search(param_grid, eval_fn, objective_fn, years=None, n_trials=20, 
         if key in seen:
             return all_results[seen[key]]["score"]
         trades = eval_fn(params)
-        score = objective_fn(trades, years)
+        raw_score = objective_fn(trades, years)
+        score, score_detail = _normalize_score(raw_score)   # Optuna needs a plain float back - a
+                                                              # dict-valued objective (consistency_ratio)
+                                                              # would otherwise break study.optimize()
+        entry = {"params": params, "trades": trades, "score": score}
+        if score_detail is not None:
+            entry["score_detail"] = score_detail
         seen[key] = len(all_results)
-        all_results.append({"params": params, "trades": trades, "score": score})
+        all_results.append(entry)
         return score
 
     sampler = optuna.samplers.TPESampler(seed=seed)
@@ -527,9 +776,13 @@ def genetic_search(param_grid, eval_fn, objective_fn, years=None, population_siz
             return all_results[cache[key]]["score"]
         params = chromosome_to_params(chrom)
         trades = eval_fn(params)
-        score = objective_fn(trades, years)
+        raw_score = objective_fn(trades, years)
+        score, score_detail = _normalize_score(raw_score)
+        entry = {"params": params, "trades": trades, "score": score}
+        if score_detail is not None:
+            entry["score_detail"] = score_detail
         cache[key] = len(all_results)
-        all_results.append({"params": params, "trades": trades, "score": score})
+        all_results.append(entry)
         return score
 
     def random_chromosome():
@@ -619,3 +872,368 @@ def print_search_comparison(results_by_method, param_names=None):
             continue
         best = result["best"]
         print(f"  {label:<12}{result['n_evals']:>10}   {best['score']:>+12.4f}   {best['params']}")
+
+
+# ============================================================================
+# SIGNAL-DECAY / HALF-LIFE DIAGNOSTIC
+# ============================================================================
+#
+# Built directly on top of the EXISTING rolling walk-forward fold structure both companion scripts
+# already have (ict_po3_forex_dukascopy_optimization.py's run_walk_forward/generate_walk_forward_
+# folds, day_trading_rauf_dukascopy_optimization.py's run_walk_forward/walk_forward_folds) - NOT a
+# generic textbook decay formula bolted on separately from real fold data.
+#
+# Both companion scripts currently chain every fold's out-of-sample trades into one flat list
+# (combined_oos_r / combined_oos_trades), which is exactly right for computing Walk-Forward
+# Efficiency but throws away WHERE in each fold's own OOS window a trade fell - i.e. it loses fold
+# identity entirely. This diagnostic needs that back: for each fold, how many calendar months past
+# that fold's own oos_start did a given OOS trade happen (its "months_since_fit"), pooled ACROSS
+# folds so month 1 across all 6 PO3/Rauf folds becomes one bucket, month 2 across all 6 folds
+# becomes another, etc. - turning e.g. 6 folds x 12 OOS months into up to 72 pooled data points
+# instead of 6 separate 12-point series. A negative trend in the chosen metric as months_since_fit
+# increases is evidence the fitted parameters' edge (if any) decays the further out-of-sample they
+# get used - exactly the kind of thing "re-fit every year" walk-forward practice already assumes is
+# true without directly measuring it.
+
+def _months_since_fit(trade_date, oos_start):
+    """1-indexed calendar-month offset of `trade_date` from `oos_start` (both date-like) - a trade
+    falling within oos_start's own calendar month is month 1 (not month 0), matching the natural
+    "how many months into this fold's OOS window" reading and this project's month 1..12 for a
+    1-year (WALK_FORWARD_OOS_YEARS=1 / WF_OOS_YEARS=1) OOS window in both companion scripts."""
+    trade_date = _to_date(trade_date)
+    oos_start = _to_date(oos_start)
+    return (trade_date.year - oos_start.year) * 12 + (trade_date.month - oos_start.month) + 1
+
+
+def pool_oos_trades_by_month(fold_data):
+    """Pools every fold's OOS trades by months-since-THAT-FOLD's-own-oos_start (see
+    _months_since_fit), collapsing fold identity in favor of relative position within each fold's
+    OOS window - e.g. 6 folds each with a 12-month OOS window pool into at most 12 buckets (month
+    1..12), each bucket drawing trades from as many as 6 different folds, rather than 6 separate
+    12-point series.
+
+    `fold_data`: a list of per-fold dicts, each needing at least "oos_start" (date-like) and
+    "oos_trades" (list of trade dicts with a "date" key) - exactly the shape both companion
+    scripts' fold_results/fold_rows entries have once their STEP 4 sections tag each fold with its
+    own un-merged OOS trades (see this module's header and both companion scripts' walk-forward
+    sections) - folds with no "oos_trades" key or an empty one are simply skipped, not an error (a
+    fold that produced zero OOS trades has nothing to pool from it, but doesn't invalidate the
+    others).
+
+    Returns (pooled, n_folds_used): `pooled` is {month_index: [trade, ...]}; `n_folds_used` is the
+    count of DISTINCT folds that contributed at least one trade to any bucket - this is what
+    estimate_decay's `min_folds` gate below checks against, not a total trade count or bucket
+    count."""
+    pooled = {}
+    n_folds_used = 0
+    for fold in fold_data:
+        trades = fold.get("oos_trades") or []
+        if not trades:
+            continue
+        oos_start = fold["oos_start"]
+        n_folds_used += 1
+        for t in trades:
+            month_idx = _months_since_fit(t["date"], oos_start)
+            pooled.setdefault(month_idx, []).append(t)
+    return pooled, n_folds_used
+
+
+def estimate_decay(fold_data, metric="avg_r", min_folds=4):
+    """Pools `fold_data`'s OOS trades by months-since-fit (see pool_oos_trades_by_month), computes
+    `metric` (an OBJECTIVES key, default "avg_r"; "consistency_ratio" is also accepted - its own
+    "value" is used, per-bucket, skipping any bucket where consistency_ratio itself reports
+    confidence="insufficient") per pooled bucket, and:
+
+      1. Fits an ordinary least-squares line (metric vs. months_since_fit) via np.polyfit - "slope"
+         below. This ALWAYS gets reported (whenever there are >= 3 usable pooled buckets): a
+         negative slope is decay evidence, a flat-or-positive slope is not, regardless of whether
+         the metric ever goes negative (avg_r realistically can, for a losing strategy/fold).
+
+      2. SEPARATELY attempts a genuine exponential-decay fit metric_t = metric_0 * phi**t (i.e.
+         log(metric_t) = log(metric_0) + t*log(phi), fit by ordinary least squares in log-space) -
+         "phi" and "half_life_months" = ln(0.5)/ln(phi) below. This is ONLY attempted when every
+         pooled bucket's metric value is strictly positive (log is undefined/meaningless
+         otherwise) AND the fitted phi lands in the OPEN interval (0, 1) - phi <= 0 or phi >= 1
+         means "not genuine decay" (no decay, growth, or a nonsensical fit), so half_life_months
+         stays None rather than reporting a number that doesn't mean what "half-life" is supposed
+         to mean. A negative/flat "slope" (point 1) with no reportable "phi"/"half_life_months"
+         (point 2) is a perfectly normal, self-consistent outcome - not every real decay pattern
+         is a clean positive-throughout exponential curve, and this function does not pretend one
+         is when it isn't.
+
+    `min_folds` (default 4): pool_oos_trades_by_month's `n_folds_used` must be at least this many
+    distinct folds for ANYTHING here to be reported - both companion scripts' 6-fold rolling walk-
+    forward (WALK_FORWARD_OOS_YEARS=1 / WF_OOS_YEARS=1, so months_since_fit runs 1..12) comfortably
+    clears this; a strategy script with fewer than 4 walk-forward folds does NOT have enough
+    independent folds for a pooled-by-month decay estimate to mean anything yet, and this function
+    says so explicitly via confidence="insufficient_folds" rather than fitting a line through too
+    little independent evidence and reporting it as if it were meaningful.
+
+    Returns: {"slope": float, "half_life_months": float | None, "phi": float | None,
+              "n_folds_used": int, "confidence": "ok" | "insufficient_folds"}"""
+    pooled, n_folds_used = pool_oos_trades_by_month(fold_data)
+
+    def _insufficient():
+        return {"slope": float("nan"), "half_life_months": None, "phi": None,
+                "n_folds_used": n_folds_used, "confidence": "insufficient_folds"}
+
+    if n_folds_used < min_folds:
+        return _insufficient()
+
+    metric_fn = None
+    use_consistency = (metric == "consistency_ratio")
+    if not use_consistency:
+        metric_fn = OBJECTIVES.get(metric)
+        if metric_fn is None:
+            raise KeyError(f"estimate_decay: unknown metric {metric!r} - choose one of "
+                            f"{sorted(OBJECTIVES)} (or 'consistency_ratio')")
+
+    months = sorted(pooled.keys())
+    xs, ys = [], []
+    for m in months:
+        bucket_trades = pooled[m]
+        if use_consistency:
+            cr = consistency_ratio(bucket_trades)
+            if cr["confidence"] == "insufficient" or math.isnan(cr["value"]):
+                continue
+            value = cr["value"]
+        else:
+            value = metric_fn(bucket_trades, None)
+        if value is None:
+            continue
+        try:
+            if math.isnan(value):
+                continue
+        except TypeError:
+            continue
+        xs.append(float(m))
+        ys.append(float(value))
+
+    if len(xs) < 3 or len(set(xs)) < 2:
+        # too few usable pooled buckets (or all the same month, degenerate for a line fit) to fit
+        # anything meaningful, even though enough distinct FOLDS contributed - e.g. every fold's
+        # OOS trades happened to land in the very first calendar month of its own window.
+        return _insufficient()
+
+    xs_arr = np.asarray(xs, dtype=float)
+    ys_arr = np.asarray(ys, dtype=float)
+    slope, _intercept = np.polyfit(xs_arr, ys_arr, 1)
+
+    phi = None
+    half_life = None
+    if np.all(ys_arr > 0.0):
+        log_slope, log_intercept = np.polyfit(xs_arr, np.log(ys_arr), 1)
+        candidate_phi = float(np.exp(log_slope))
+        if 0.0 < candidate_phi < 1.0:
+            phi = candidate_phi
+            half_life = float(np.log(0.5) / np.log(phi))
+
+    return {
+        "slope": float(slope),
+        "half_life_months": half_life,
+        "phi": phi,
+        "n_folds_used": n_folds_used,
+        "confidence": "ok",
+    }
+
+
+# ============================================================================
+# LOCKBOX / EMBARGOED FINAL HOLDOUT
+# ============================================================================
+#
+# WHY THIS IS STRUCTURALLY DIFFERENT FROM (STRICTER THAN) THE WALK-FORWARD OOS FOLDS ABOVE:
+# every one of the existing walk-forward folds' out-of-sample windows gets RE-TOUCHED on every
+# single re-run of a grid/Bayesian/genetic search - both companion scripts' STEP 1 (full-range
+# search) already sees data all the way to fetch_end, and every STEP 4 fold's in-sample search sees
+# data up to that fold's own is_end, which (across all folds) eventually covers the same range the
+# OOS folds draw from too. Re-running the whole pipeline with a tweaked grid, a different
+# SEARCH_METHOD, or a different OBJECTIVE touches that same data again. That is completely fine for
+# what walk-forward folds are FOR (an honest apples-to-apples check of whether an in-sample winner
+# transfers forward) - but it means the OOS folds do NOT satisfy a genuine "never touched by any
+# search iteration, ever" property, because they get re-touched every time the search itself reruns.
+#
+# The lockbox is different by construction: split_lockbox() carves the FINAL `lockbox_months` off
+# the fetched range, BEFORE any search (grid, Bayesian, genetic, or any walk-forward fold) ever
+# runs, and every walk-forward-fold-generating call site in both companion scripts is updated to
+# take `search_end` (== the lockbox's own start) as its upper bound instead of `fetch_end` - so the
+# lockbox window is excluded from every fold BY CONSTRUCTION, not by a comment saying "don't touch
+# this". lockbox_confirm() then enforces, via a persistent append-only ledger on disk (not just a
+# docstring convention a future run could forget), that a given strategy_id's lockbox window is
+# scored AT MOST ONCE, ever. That one-shot property is the entire point of a lockbox: a holdout
+# that gets checked twice (even by the same "final" set of parameters, "just to be sure") stops
+# being a true holdout the second time, because now the parameters have effectively been chosen
+# with knowledge of how they perform there - the classic multiple-comparisons trap this project's
+# own bonferroni_adjusted_z_threshold() exists to guard against elsewhere, reintroduced through the
+# back door if the lockbox itself were re-run. A ledger enforces this mechanically because
+# programmer discipline/memory ("I'll only run this once, I promise") is exactly the kind of thing
+# that quietly fails across re-runs, different notebook sessions, or a different person picking up
+# the same script later - the ledger doesn't need to be trusted to remember, it just checks a file.
+#
+# NOT ANOTHER PLACE TO APPLY BONFERRONI: bonferroni_adjusted_z_threshold() above exists because
+# MANY grid cells get tested against the same data in one run. The lockbox is the opposite
+# situation by construction - it runs exactly once per strategy_id, ever, enforced by the ledger -
+# so there is no multiple-comparisons problem here to correct for. lockbox_confirm()'s pass/fail
+# rule is deliberately simple and pre-registered (positive OOS avg R/trade, plus a non-negative
+# consistency_ratio value when there's enough data for that to mean anything) rather than yet
+# another significance test.
+
+class LockboxAlreadyUsedError(Exception):
+    """Raised by lockbox_confirm() when `strategy_id` already has ANY prior recorded attempt in the
+    ledger - see this section's header above for why this refuses outright rather than silently
+    re-confirming. Catching this and "just running it again anyway" defeats the entire purpose of
+    having a lockbox in the first place."""
+
+
+DEFAULT_LOCKBOX_LEDGER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lockbox_ledger.json")
+
+
+def _shift_months(dt, months):
+    """Shifts a date/datetime `dt` by a whole number of calendar `months` (positive = forward,
+    negative = back), clamping the day-of-month to the target month's own last valid day when the
+    original day doesn't exist there (e.g. Jan 31 - 1 month -> Dec 31, but Mar 31 - 1 month ->
+    Feb 28 or 29, since February never has a 31st) - the same defensive rollover
+    calendar.monthrange()-based approach as this project's other month-arithmetic helpers (see
+    both companion scripts' _month_chunks). Works for both datetime.date and datetime.datetime
+    (only .year/.month/.day and .replace(...) are used, both of which either type supports)."""
+    total_months = dt.year * 12 + (dt.month - 1) + months
+    year, month0 = divmod(total_months, 12)
+    month = month0 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def split_lockbox(fetch_start, fetch_end, lockbox_months=12):
+    """Carves the final `lockbox_months` off the end of [fetch_start, fetch_end) as a never-
+    touched-until-the-very-end final holdout, returning (search_start, search_end, lockbox_start,
+    lockbox_end) with search_end == lockbox_start EXACTLY (the two windows are adjacent and non-
+    overlapping by construction: [search_start, search_end) + [lockbox_start, lockbox_end) ==
+    [fetch_start, fetch_end), split at one point).
+
+    `fetch_start`/`fetch_end` may be datetime.date OR datetime.datetime (whichever a caller's own
+    FETCH_START/FETCH_END already are) - the return values are the same type as `fetch_end` (via
+    _shift_months's .replace(...)-based arithmetic), so a caller doesn't need to convert types to
+    keep using its existing FETCH_START/FETCH_END-shaped code.
+
+    search_start is always exactly fetch_start - the lockbox only ever comes off the END of the
+    range, never the beginning (this project's walk-forward folds are already rolling FORWARD in
+    time, so the most recent data is both the most realistic OOS test AND the correct place to
+    carve a final holdout from - carving from the start would leave the lockbox as the OLDEST data,
+    which is backwards for a "how does this perform on data that came after everything the search
+    ever saw" check).
+
+    Raises ValueError if `lockbox_months` would consume the entire range (or more) - a lockbox
+    that eats the whole fetch window leaves nothing for the search itself to use, which is not a
+    valid split, not a valid (if degenerate) lockbox."""
+    if lockbox_months <= 0:
+        raise ValueError(f"split_lockbox: lockbox_months must be positive, got {lockbox_months!r}")
+    lockbox_start = _shift_months(fetch_end, -lockbox_months)
+    if lockbox_start <= fetch_start:
+        raise ValueError(
+            f"split_lockbox: lockbox_months={lockbox_months} consumes the entire "
+            f"[{fetch_start}, {fetch_end}) range (or more) - shrink lockbox_months or widen the "
+            "fetch range so the search side has something left to search over.")
+    return fetch_start, lockbox_start, lockbox_start, fetch_end
+
+
+def _read_ledger(ledger_path):
+    """Loads the lockbox ledger (a JSON list of attempt records) from disk - an empty list if the
+    file doesn't exist yet (first-ever lockbox attempt anywhere) or is present but empty."""
+    if not os.path.exists(ledger_path):
+        return []
+    with open(ledger_path, "r") as f:
+        content = f.read().strip()
+    if not content:
+        return []
+    return json.loads(content)
+
+
+def _write_ledger(ledger_path, records):
+    """Overwrites the ledger file with the full `records` list (append-only from the CALLER's
+    perspective - lockbox_confirm always reads the existing records first and appends to them,
+    never truncates or edits a prior record - but the actual disk write is a plain overwrite of
+    the whole file, which is simpler and less failure-prone than a true append-only file format for
+    a ledger this small). default=str handles date/datetime values in a record without requiring
+    every caller to pre-serialize them."""
+    parent = os.path.dirname(os.path.abspath(ledger_path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(ledger_path, "w") as f:
+        json.dump(records, f, indent=2, default=str)
+
+
+def lockbox_confirm(strategy_id, final_params, backtest_fn, lockbox_start, lockbox_end,
+                     ledger_path=DEFAULT_LOCKBOX_LEDGER_PATH):
+    """Runs `backtest_fn(lockbox_start, lockbox_end)` (expected to return a list of trade dicts,
+    the same shape every eval_fn in this module already produces) on the lockbox window EXACTLY
+    ONCE for a given `strategy_id`, ever - see this section's header above for why that one-shot
+    property is the entire point of a lockbox and why it's enforced via a persistent ledger rather
+    than trusted to convention.
+
+    Before running anything, checks `ledger_path` (a JSON list of {"strategy_id", "params",
+    "timestamp", "passed", ...} records, append-only from the caller's perspective - see
+    _read_ledger/_write_ledger) for ANY prior record with this exact `strategy_id`. If one exists,
+    raises LockboxAlreadyUsedError immediately - `backtest_fn` is never even called - rather than
+    silently re-confirming. This is a hard refusal, not a warning: catching the exception and
+    calling lockbox_confirm again anyway defeats the entire purpose (see header).
+
+    After a successful run (pass OR fail), appends a new record to the ledger regardless of outcome
+    - a FAILED lockbox attempt is just as much a "this strategy_id's lockbox is now used up" event
+    as a passed one; the ledger tracks ATTEMPTS, not just passes.
+
+    Pass/fail rule (deliberately simple and pre-registered - see header for why this is NOT another
+    place to apply a Bonferroni-style correction): PASS requires BOTH
+      1. positive OOS avg R/trade on the lockbox window, AND
+      2. EITHER there weren't enough lockbox trades for consistency_ratio to report anything
+         comparable (confidence == "insufficient" - in that case this criterion is simply not
+         applied, rather than letting an under-powered consistency check veto an otherwise-positive
+         result it has no real evidence against), OR consistency_ratio's value is >= 0 when it DOES
+         have enough data to report one.
+
+    Returns {"passed": bool, "total_r": float, "avg_r": float, "n_trades": int,
+             "consistency": dict} - the same summary shape recorded in the ledger's `params`-
+    adjacent fields (see the ledger record itself, on disk, for the full attempt history)."""
+    records = _read_ledger(ledger_path)
+    prior = [r for r in records if r.get("strategy_id") == strategy_id]
+    if prior:
+        raise LockboxAlreadyUsedError(
+            f"lockbox_confirm: strategy_id={strategy_id!r} already has {len(prior)} recorded "
+            f"lockbox attempt(s) in {ledger_path!r} (first attempt at "
+            f"{prior[0].get('timestamp', '?')}, passed={prior[0].get('passed', '?')}) - refusing "
+            "to run the lockbox a second time for this strategy_id. A lockbox that gets checked "
+            "more than once stops being a genuine holdout the second time - see this module's "
+            "LOCKBOX / EMBARGOED FINAL HOLDOUT section header for why this is a hard refusal, not "
+            "a warning.")
+
+    trades = backtest_fn(lockbox_start, lockbox_end)
+    n_trades = len(trades)
+    total_r_value = float(sum(t["r"] for t in trades)) if trades else 0.0
+    avg_r_value = (total_r_value / n_trades) if n_trades else 0.0
+    consistency = consistency_ratio(trades)
+
+    positive_avg = avg_r_value > 0.0
+    if consistency["confidence"] == "insufficient":
+        consistency_ok = True   # not enough lockbox trades to judge consistency either way - don't
+                                 # let an under-powered check veto a result it has no real evidence
+                                 # against (see docstring above)
+    else:
+        consistency_value = consistency["value"]
+        consistency_ok = (not math.isnan(consistency_value)) and consistency_value >= 0.0
+    passed = bool(positive_avg and consistency_ok)
+
+    record = {
+        "strategy_id": strategy_id,
+        "params": final_params,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "passed": passed,
+        "total_r": total_r_value,
+        "avg_r": avg_r_value,
+        "n_trades": n_trades,
+        "consistency": consistency,
+        "lockbox_start": str(lockbox_start),
+        "lockbox_end": str(lockbox_end),
+    }
+    records.append(record)
+    _write_ledger(ledger_path, records)
+
+    return {"passed": passed, "total_r": total_r_value, "avg_r": avg_r_value, "n_trades": n_trades,
+            "consistency": consistency}

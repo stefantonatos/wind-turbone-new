@@ -25,8 +25,10 @@
 
 import datetime
 import importlib.util
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -503,6 +505,119 @@ class TestCorrectedZScoreAndBonferroni(unittest.TestCase):
         n_combos = len(opt.STOP_BUFFER_PCT_GRID) * len(opt.FALLBACK_REWARD_RISK_GRID)
         z_bar = opt.opt_engine.bonferroni_adjusted_z_threshold(n_combos)
         self.assertGreater(z_bar, 1.959963985)   # strictly above the naive single-test 1.96 bar
+
+
+# ============================= NEW: consistency_ratio / estimate_decay / lockbox wiring =============================
+
+class TestOosTradesTagging(unittest.TestCase):
+    """run_walk_forward's fold_results entries must now carry "oos_trades" (full trade dicts,
+    un-merged across folds) IN ADDITION TO the existing keys - needed by
+    optimization_engine.estimate_decay's months-since-fit pooling. This must be purely additive:
+    combined_oos_r's own contents (used by compute_walk_forward_efficiency) stay unchanged."""
+
+    def test_fold_results_carry_oos_trades_consistent_with_combined_oos_r(self):
+        data = _small_multi_year_data(2016, 2021)
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+        folds = opt.generate_walk_forward_folds(2016, 2021)
+        fold_results, combined_oos_r = opt.run_walk_forward(data, folds, grid=small_grid)
+
+        for f in fold_results:
+            self.assertIn("oos_trades", f)
+            self.assertEqual(len(f["oos_trades"]), f["oos_n_trades"])
+            for t in f["oos_trades"]:
+                self.assertIn("date", t)
+                self.assertIn("r", t)
+
+        # combined_oos_r must still equal every fold's oos_trades' "r" values, chained in fold order -
+        # proof this addition didn't change combined_oos_r's own pre-existing contents.
+        rebuilt = [t["r"] for f in fold_results for t in f["oos_trades"]]
+        self.assertEqual(rebuilt, combined_oos_r)
+
+
+class TestDecayDiagnosticWiring(unittest.TestCase):
+    def test_print_decay_diagnostic_runs_without_crashing(self):
+        data = _small_multi_year_data(2016, 2021)
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+        folds = opt.generate_walk_forward_folds(2016, 2021)
+        fold_results, _ = opt.run_walk_forward(data, folds, grid=small_grid)
+        opt.print_decay_diagnostic(fold_results)   # must not raise, regardless of confidence outcome
+
+    def test_estimate_decay_reports_insufficient_folds_with_only_two_folds(self):
+        data = _small_multi_year_data(2016, 2021)
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+        folds = opt.generate_walk_forward_folds(2016, 2021)   # only 2 folds < default min_folds=4
+        fold_results, _ = opt.run_walk_forward(data, folds, grid=small_grid)
+        decay = opt.opt_engine.estimate_decay(fold_results)
+        self.assertEqual(decay["confidence"], "insufficient_folds")
+        self.assertIsNone(decay["half_life_months"])
+
+
+class TestLockboxWiring(unittest.TestCase):
+    """CRITICAL structural requirement: STEP 1's search window and every STEP 4 walk-forward fold
+    must be bounded by search_end (== split_lockbox's lockbox_start), not FETCH_END, so the lockbox
+    window is excluded BY CONSTRUCTION - never touched by any search iteration."""
+
+    def test_split_lockbox_boundary_math(self):
+        fetch_start = datetime.datetime(2016, 1, 1)
+        fetch_end = datetime.datetime(2025, 1, 1)
+        search_start, search_end, lockbox_start, lockbox_end = opt.opt_engine.split_lockbox(
+            fetch_start, fetch_end, lockbox_months=12)
+        self.assertEqual(search_start, fetch_start)
+        self.assertEqual(search_end, lockbox_start)
+        self.assertEqual(lockbox_start, datetime.datetime(2024, 1, 1))
+        self.assertEqual(lockbox_end, fetch_end)
+
+    def test_no_generated_fold_ever_crosses_into_the_lockbox_window(self):
+        fetch_start = datetime.datetime(2016, 1, 1)
+        fetch_end = datetime.datetime(2025, 1, 1)
+        _, search_end, lockbox_start, _ = opt.opt_engine.split_lockbox(
+            fetch_start, fetch_end, lockbox_months=12)
+
+        folds = opt.generate_walk_forward_folds(fetch_start.year, search_end.year)
+        self.assertGreater(len(folds), 0)
+        for fold in folds:
+            self.assertLessEqual(fold["oos_end"], lockbox_start.date())
+            self.assertLessEqual(fold["is_end"], lockbox_start.date())
+
+        # sanity check on the OLD (pre-lockbox) call: using FETCH_END.year directly WOULD have
+        # produced a fold crossing into what is now the lockbox window - proving this isn't just a
+        # vacuously-true check on an already-safe function.
+        old_style_folds = opt.generate_walk_forward_folds(fetch_start.year, fetch_end.year)
+        self.assertTrue(any(f["oos_end"] > lockbox_start.date() for f in old_style_folds))
+
+    def test_make_lockbox_backtest_fn_and_lockbox_confirm_one_shot(self):
+        data = _small_multi_year_data(2016, 2021)
+        fetch_start = datetime.datetime(2016, 1, 1)
+        fetch_end = datetime.datetime(2021, 1, 1)
+        _, search_end, lockbox_start, lockbox_end = opt.opt_engine.split_lockbox(
+            fetch_start, fetch_end, lockbox_months=12)
+
+        backtest_fn = opt.make_lockbox_backtest_fn(data, stop_buffer_pct=0.02, fallback_reward_risk=2.0)
+
+        tmpdir = tempfile.mkdtemp()
+        ledger_path = os.path.join(tmpdir, "lockbox_ledger.json")
+        strategy_id = "test_po3_strategy"
+
+        result = opt.opt_engine.lockbox_confirm(strategy_id, {"stop_buffer_pct": 0.02, "fallback_reward_risk": 2.0},
+                                                 backtest_fn, lockbox_start, lockbox_end, ledger_path=ledger_path)
+        self.assertIn("passed", result)
+        self.assertIn("n_trades", result)
+
+        self.assertTrue(os.path.exists(ledger_path))
+        with open(ledger_path) as f:
+            records = json.load(f)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["strategy_id"], strategy_id)
+
+        # SECOND call for the SAME strategy_id must be refused, not silently re-run.
+        with self.assertRaises(opt.opt_engine.LockboxAlreadyUsedError):
+            opt.opt_engine.lockbox_confirm(strategy_id, {"stop_buffer_pct": 0.02, "fallback_reward_risk": 2.0},
+                                            backtest_fn, lockbox_start, lockbox_end, ledger_path=ledger_path)
+
+        # ledger persisted across the two SEPARATE calls (re-read from disk, not an in-memory cache).
+        with open(ledger_path) as f:
+            records_after = json.load(f)
+        self.assertEqual(len(records_after), 1)   # the refused second call never appended anything
 
 
 if __name__ == "__main__":
