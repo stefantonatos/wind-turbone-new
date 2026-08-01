@@ -310,7 +310,8 @@ class TestRandomWalkNullResult(unittest.TestCase):
         n = len(all_r)
         self.assertGreater(n, 20, "test setup produced too few trades to say anything meaningful")
         avg_r = sum(all_r) / n
-        z = avg_r / (1 / (n ** 0.5))
+        std_r = np.std(all_r, ddof=1)
+        z = avg_r / (std_r / (n ** 0.5)) if std_r > 0 else 0.0
         # generous bounds - this is a coarse "no smoking gun" check, not a rigorous statistical
         # proof of zero edge (small-sample trend-following results on random walks are noisy by
         # nature); a genuine implementation bug (e.g. a lookahead leak) would be expected to

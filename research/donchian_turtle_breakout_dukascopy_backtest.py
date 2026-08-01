@@ -419,7 +419,12 @@ def main():
     for label, rs in sorted(per_instrument.items(), key=lambda kv: -sum(kv[1])):
         print(f"  {label:10s}: {len(rs):4d} trades, {sum(rs):+8.2f}R")
 
-    z = (total_r / n_trades) / (1 / (n_trades ** 0.5)) if n_trades else 0
+    all_r = [t["r"] for t in all_trades]
+    if n_trades >= 2:
+        std_r = np.std(all_r, ddof=1)
+        z = (total_r / n_trades) / (std_r / (n_trades ** 0.5)) if std_r > 0 else 0.0
+    else:
+        z = 0.0
     print(f"\nApprox z-score: {z:.2f} (rule of thumb: |z| > 1.96 for ~95% confidence this isn't chance)")
     if n_trades < 100:
         print(f"CAVEAT: only {n_trades} trades - too few to trust regardless of the z-score.")
@@ -434,9 +439,19 @@ def main():
             continue
         r = sum(t["r"] for t in half)
         n = len(half)
-        z_half = (r / n) / (1 / (n ** 0.5)) if n else 0
+        half_r = [t["r"] for t in half]
+        if n >= 2:
+            std_half = np.std(half_r, ddof=1)
+            z_half = (r / n) / (std_half / (n ** 0.5)) if std_half > 0 else 0.0
+        else:
+            z_half = 0.0
         print(f"  {label} ({half[0]['date']} to {half[-1]['date']}): {n} trades, {r:+.2f}R, "
               f"{r/n:+.4f}R/trade, z={z_half:.2f}")
+
+    print(f"\nNOTE ON MULTIPLE COMPARISONS: this project has shipped many strategies, several with "
+          f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
+          f"evidence, since data-snooping risk compounds across every strategy and parameter "
+          f"combination tried project-wide, not just this one.")
 
     print("\nNo commission/spread/slippage modeled. Entries and trailing-channel exits are filled at exact "
           "simulated prices (bar close / exact channel level) - real fills, especially the ATR stop during a "

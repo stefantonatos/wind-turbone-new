@@ -315,7 +315,8 @@ class TestRandomWalkNullResult(unittest.TestCase):
         n = len(all_r)
         self.assertGreater(n, 20, "test setup produced too few trades to say anything meaningful")
         avg_r = sum(all_r) / n
-        z = avg_r / (1 / (n ** 0.5))
+        std_r = np.std(all_r, ddof=1)
+        z = avg_r / (std_r / (n ** 0.5)) if std_r > 0 else 0.0
         self.assertLess(abs(avg_r), 0.6, f"suspiciously large average R/trade on pure noise: {avg_r:.3f}")
         self.assertLess(abs(z), 3.0, f"suspiciously large z-score on pure noise: {z:.2f}")
 

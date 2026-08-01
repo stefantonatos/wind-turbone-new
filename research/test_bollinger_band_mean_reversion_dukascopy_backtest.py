@@ -347,7 +347,8 @@ class TestGranularityConvergence(unittest.TestCase):
                 all_r.extend(t["r"] for t in trades)
             n = len(all_r)
             avg_r = sum(all_r) / n
-            z = avg_r / (1 / (n ** 0.5))
+            std_r = np.std(all_r, ddof=1)
+            z = avg_r / (std_r / (n ** 0.5)) if std_r > 0 else 0.0
             results[n_substeps] = {"n_trades": n, "avg_r": avg_r, "z": z}
 
         z1 = abs(results[1]["z"])
@@ -397,7 +398,9 @@ class TestEndToEndSmokeRun(unittest.TestCase):
         # reporting-style aggregation (mirrors main()'s computations) must not crash
         total_r = sum(t["r"] for t in all_trades)
         n_trades = len(all_trades)
-        z = (total_r / n_trades) / (1 / (n_trades ** 0.5))
+        all_r = [t["r"] for t in all_trades]
+        std_r = np.std(all_r, ddof=1) if n_trades >= 2 else 0.0
+        z = (total_r / n_trades) / (std_r / (n_trades ** 0.5)) if std_r > 0 else 0.0
         self.assertTrue(np.isfinite(z))
 
         trades_sorted = sorted(all_trades, key=lambda t: t["date"])

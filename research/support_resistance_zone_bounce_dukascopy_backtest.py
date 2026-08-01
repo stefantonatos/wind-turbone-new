@@ -298,7 +298,12 @@ def main():
         r = sum(t["r"] for t in trades)
         print(f"  {label:10s}: {len(trades):4d} trades, {r:+8.2f}R")
 
-    z = (total_r / n_trades) / (1 / (n_trades ** 0.5)) if n_trades else 0
+    all_r = [t["r"] for t in all_trades]
+    if n_trades >= 2:
+        std_r = np.std(all_r, ddof=1)
+        z = (total_r / n_trades) / (std_r / (n_trades ** 0.5)) if std_r > 0 else 0.0
+    else:
+        z = 0.0
     print(f"\nApprox z-score: {z:.2f} (rule of thumb: |z| > 1.96 for ~95% confidence this isn't chance - "
           f"but R-multiples here are heavily skewed by variable-target-distance wins, so treat this as "
           f"suggestive, not exact - a normal-distribution z-score is an approximation on skewed data.)")
@@ -324,11 +329,21 @@ def main():
             continue
         r = sum(t["r"] for t in half)
         n = len(half)
-        z_half = (r / n) / (1 / (n ** 0.5)) if n else 0
+        half_r = [t["r"] for t in half]
+        if n >= 2:
+            std_half = np.std(half_r, ddof=1)
+            z_half = (r / n) / (std_half / (n ** 0.5)) if std_half > 0 else 0.0
+        else:
+            z_half = 0.0
         print(f"  {label} ({half[0]['date']} to {half[-1]['date']}): {n} trades, {r:+.2f}R, "
               f"{r/n:+.4f}R/trade, z={z_half:.2f}")
     print(f"  If one half is strongly positive and the other flat or negative, that's the same warning "
           f"sign flagged elsewhere in this project - don't trust the combined number over both halves.")
+
+    print(f"\nNOTE ON MULTIPLE COMPARISONS: this project has shipped many strategies, several with "
+          f"their own parameter grid searches - a single script's z-score in isolation isn't strong "
+          f"evidence, since data-snooping risk compounds across every strategy and parameter "
+          f"combination tried project-wide, not just this one.")
 
     print(f"\nCOST SENSITIVITY (illustrative round-trip spread scenarios, NOT measured real spread data - "
           f"see COST_PCT_SCENARIOS comment):")
