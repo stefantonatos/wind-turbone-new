@@ -166,6 +166,12 @@ def render_filterable_results(trades, facets, key_prefix):
     st.markdown(eyebrow("EQUITY CURVE (CUMULATIVE R)"), unsafe_allow_html=True)
     xs, ys, chronological = stats_mod.equity_curve(filtered)
     fig = go.Figure()
+    # neon-glow line: wide, low-opacity copies of the same trace stacked behind the crisp
+    # main line - a standard "HUD glow" trick, not a real visual effect Plotly has natively
+    for glow_width, glow_opacity in ((14, 0.06), (8, 0.10), (4, 0.16)):
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
+                                  line=dict(width=glow_width, color=ACCENT),
+                                  opacity=glow_opacity, hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(width=2, color=ACCENT), name="Cumulative R"))
     fig.update_layout(
         height=320,

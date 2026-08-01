@@ -1,31 +1,31 @@
-# Visual layer on top of Streamlit's defaults. Palette/tokens below are the validated set
-# (dataviz skill's color-blindness/contrast check) rather than eyeballed: hairline borders
-# instead of drop shadows, no gradients, no emoji, a capped left-aligned content column, a
-# system-sans font stack throughout (including stat numbers - no serif anywhere), and a
-# small set of chart color constants used explicitly on every Plotly figure instead of the
-# library's default rainbow palette.
+# Visual layer on top of Streamlit's defaults - dark trading-terminal / HUD panel look
+# (TradingView-dark base + glowing cyan accents, "Jarvis" energy), not the earlier minimal
+# light theme. Same exported names as before (color constants, CSS, PLOTLY_LAYOUT_DEFAULTS,
+# eyebrow()) so app.py/optimization.py don't need import changes - only the values and the
+# CSS content changed.
 
-INK_PRIMARY = "#0b0b0b"
-INK_SECONDARY = "#52514e"
-INK_MUTED = "#898781"
-SURFACE = "#fcfcfb"
-PAGE = "#f9f9f7"
-BORDER = "rgba(11,11,11,0.10)"
-ACCENT = "#2a78d6"
-GOOD = "#0ca30c"
-CRITICAL = "#d03b3b"
-WARNING = "#fab219"
-GRIDLINE = "#e1e0d9"
-FONT_UI = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Inter, sans-serif'
+INK_PRIMARY = "#e6edf3"
+INK_SECONDARY = "#9aa7b8"
+INK_MUTED = "#5c6b7f"
+SURFACE = "#141a26"
+PAGE = "#0a0e17"
+BORDER = "rgba(0, 212, 255, 0.18)"
+ACCENT = "#00c2ff"
+GOOD = "#00e6a0"
+CRITICAL = "#ff4d6a"
+WARNING = "#ffb800"
+GRIDLINE = "rgba(255, 255, 255, 0.06)"
+FONT_UI = '"Inter", -apple-system, "Segoe UI", sans-serif'
+FONT_MONO = '"JetBrains Mono", "SF Mono", "Cascadia Code", ui-monospace, monospace'
 
-# Multi-series categorical palette - validated all-pairs colorblind-safe up to 3 concurrent
-# lines. A 4th series should be a small multiple, not a 4th color in this same list.
-CATEGORICAL = ["#2a78d6", "#eb6834", "#1baf7a"]
+# Multi-series categorical palette - cyan/amber/violet, dark-background-legible, capped at 3
+# concurrent lines (a 4th series should be a small multiple, not a 4th color in this list).
+CATEGORICAL = ["#00c2ff", "#ffb800", "#a06bff"]
 
-# Diverging (e.g. a returns/correlation heatmap) and sequential (magnitude-only heatmaps)
-# scales, both anchored on the same accent blue so they read as one system.
-DIVERGING_NEG, DIVERGING_MID, DIVERGING_POS = "#e34948", "#f0efec", "#2a78d6"
-SEQUENTIAL_BLUE = ["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#2a78d6", "#1c5cab", "#0d366b"]
+# Diverging (returns/correlation heatmaps) and sequential (magnitude-only heatmaps), both
+# anchored on the same accent cyan so they read as one system against the dark base.
+DIVERGING_NEG, DIVERGING_MID, DIVERGING_POS = "#ff4d6a", "#1c2333", "#00c2ff"
+SEQUENTIAL_BLUE = ["#0a2a3d", "#0d3a54", "#10507a", "#1470a3", "#1795d4", "#3ab4f0", "#7dd3ff"]
 
 CSS = f"""
 <style>
@@ -41,6 +41,7 @@ CSS = f"""
   --critical: {CRITICAL};
   --gridline: {GRIDLINE};
   --font-ui: {FONT_UI};
+  --font-mono: {FONT_MONO};
 }}
 
 html, body, [class*="css"], .stMarkdown, .stText {{
@@ -48,17 +49,18 @@ html, body, [class*="css"], .stMarkdown, .stText {{
 }}
 
 .stApp {{
-  background-color: var(--page);
+  background: radial-gradient(ellipse at top, #0d1420 0%, var(--page) 55%);
+  color: var(--ink-primary);
 }}
 
-/* capped, left-aligned content column - never centered-everything */
+/* wide panel/terminal layout, not a narrow blog column - HUD dashboards run wide */
 .block-container {{
-  padding-top: 3rem;
+  padding-top: 2.25rem;
   padding-left: 2rem;
   padding-right: 2rem;
   padding-bottom: 3rem;
-  max-width: 1160px;
-  margin-left: 0;
+  max-width: 1560px;
+  margin-left: auto;
   margin-right: auto;
 }}
 
@@ -69,7 +71,11 @@ h1, h2, h3 {{
   font-family: var(--font-ui);
 }}
 
-h1 {{ font-size: 1.6rem; margin-bottom: 0.25rem; }}
+h1 {{
+  font-size: 1.6rem;
+  margin-bottom: 0.25rem;
+  text-shadow: 0 0 18px rgba(0, 194, 255, 0.35);
+}}
 h2 {{ font-size: 1.15rem; margin-top: 1.75rem; }}
 h3 {{ font-size: 1.0rem; color: var(--ink-secondary); font-weight: 500; text-transform: none; }}
 
@@ -77,15 +83,34 @@ p, li, label, .stMarkdown p {{
   color: var(--ink-primary);
 }}
 
-/* small-caps muted letter-spaced eyebrow label above a section/group of controls or stats */
+/* HUD-style eyebrow label - glowing cyan, wide tracking, monospace, small corner ticks either
+   side (a lightweight nod to sci-fi panel framing without relying on external icon assets) */
 .eyebrow {{
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
   font-size: 0.72rem;
   font-weight: 600;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: var(--ink-muted);
-  margin: 1.1rem 0 0.4rem 0;
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(0, 194, 255, 0.45);
+  margin: 1.4rem 0 0.6rem 0;
+}}
+.eyebrow::before {{
+  content: "";
+  width: 0.85rem;
+  height: 1px;
+  background: var(--accent);
+  box-shadow: 0 0 6px rgba(0, 194, 255, 0.7);
+  display: inline-block;
+}}
+.eyebrow::after {{
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(0, 194, 255, 0.35), transparent);
 }}
 
 hr {{
@@ -94,41 +119,56 @@ hr {{
   margin: 1.25rem 0;
 }}
 
-/* sidebar: quiet, structured, no heavy background */
+/* sidebar: darker panel, glowing right edge */
 section[data-testid="stSidebar"] {{
-  background-color: var(--surface);
-  border-right: 1px solid var(--border);
+  background: linear-gradient(180deg, #0d1420 0%, #0a0e17 100%);
+  border-right: 1px solid rgba(0, 212, 255, 0.15);
+  box-shadow: 6px 0 24px rgba(0, 194, 255, 0.04);
 }}
 section[data-testid="stSidebar"] .block-container {{
   padding-top: 1.5rem;
 }}
+section[data-testid="stSidebar"] label {{
+  color: var(--ink-secondary) !important;
+  font-size: 0.85rem;
+}}
 
-/* primary button - flat, hairline border, accent reserved for the primary action only */
+/* primary button - glowing HUD action button */
 .stButton > button, .stDownloadButton > button {{
-  background-color: var(--accent);
-  color: #ffffff;
-  border: 1px solid var(--accent);
-  border-radius: 8px;
+  background: linear-gradient(180deg, rgba(0, 194, 255, 0.18), rgba(0, 194, 255, 0.08));
+  color: var(--accent);
+  border: 1px solid rgba(0, 194, 255, 0.55);
+  border-radius: 4px;
   padding: 0.55rem 1.1rem;
-  font-weight: 500;
-  box-shadow: none !important;
-  transition: opacity 0.15s ease;
+  font-weight: 600;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 0.82rem;
+  box-shadow: 0 0 0 rgba(0, 194, 255, 0);
+  transition: box-shadow 0.2s ease, background 0.2s ease;
 }}
 .stButton > button:hover, .stDownloadButton > button:hover {{
-  background-color: var(--accent);
-  opacity: 0.85;
+  background: linear-gradient(180deg, rgba(0, 194, 255, 0.3), rgba(0, 194, 255, 0.12));
+  box-shadow: 0 0 18px rgba(0, 194, 255, 0.35);
+  color: #ffffff;
 }}
 .stButton > button:focus:not(:active) {{
   border-color: var(--accent);
 }}
+.stButton > button[kind="primary"] {{
+  background: linear-gradient(180deg, rgba(0, 194, 255, 0.4), rgba(0, 194, 255, 0.18));
+  color: #ffffff;
+  box-shadow: 0 0 14px rgba(0, 194, 255, 0.3);
+}}
 
-/* card-like containers (metric strip, bordered blocks): hairline border, 12px radius,
-   NEVER a drop shadow - the single most common "generic dashboard" tell */
+/* card-like containers (metric strip, bordered blocks): dark panel, glowing hairline border,
+   soft outer glow + inset highlight - the HUD-panel look, deliberately not flat/shadowless */
 div[data-testid="stVerticalBlockBorderWrapper"] {{
   border: 1px solid var(--border) !important;
-  border-radius: 12px !important;
-  box-shadow: none !important;
-  background-color: var(--surface);
+  border-radius: 6px !important;
+  background: linear-gradient(180deg, #141a26 0%, #10151f 100%) !important;
+  box-shadow: 0 0 24px rgba(0, 194, 255, 0.05), inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
 }}
 div[data-testid="stMetric"] {{
   background: transparent;
@@ -136,15 +176,21 @@ div[data-testid="stMetric"] {{
 }}
 div[data-testid="stMetricLabel"] {{
   color: var(--ink-muted);
-  font-weight: 400;
+  font-weight: 500;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }}
 div[data-testid="stMetricValue"] {{
   color: var(--ink-primary);
   font-weight: 600;
-  font-variant-numeric: proportional-nums;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 10px rgba(230, 237, 243, 0.15);
 }}
 
-/* tabs - understated underline style, not filled pill buttons */
+/* tabs - glowing underline on the active tab instead of a plain line */
 .stTabs [data-baseweb="tab-list"] {{
   gap: 1.75rem;
   border-bottom: 1px solid var(--border);
@@ -153,58 +199,80 @@ div[data-testid="stMetricValue"] {{
   height: 2.4rem;
   color: var(--ink-muted);
   font-weight: 500;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
   background: transparent;
 }}
 .stTabs [aria-selected="true"] {{
-  color: var(--ink-primary) !important;
+  color: var(--accent) !important;
   border-bottom: 2px solid var(--accent) !important;
+  text-shadow: 0 0 8px rgba(0, 194, 255, 0.45);
 }}
 
-/* dataframes/tables: hairline border, no shadow, no zebra rainbow. Table cells use
-   tabular (monospaced-width) digits for column alignment - the one place proportional
-   figures are wrong, unlike the stat-tile numbers above. */
+/* dataframes/tables: dark panel, glowing hairline border, monospace tabular digits */
 [data-testid="stDataFrame"] {{
   border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: none !important;
+  border-radius: 6px;
+  box-shadow: 0 0 18px rgba(0, 194, 255, 0.04);
 }}
 [data-testid="stDataFrame"] * {{
   font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono) !important;
+}}
+
+/* inputs - dark fields with a glowing focus ring */
+.stTextInput input, .stNumberInput input, .stDateInput input, .stSelectbox div[data-baseweb="select"] > div {{
+  background-color: #0d1420 !important;
+  border-color: var(--border) !important;
+  color: var(--ink-primary) !important;
+  font-family: var(--font-mono);
 }}
 
 /* remove Streamlit's default footer/hamburger clutter for a local personal tool */
 #MainMenu {{ visibility: hidden; }}
 footer {{ visibility: hidden; }}
 
-/* caption text, muted and small - used for caveats instead of alert boxes everywhere */
+/* caption text, muted mono, used for caveats instead of alert boxes everywhere */
 .stCaption, [data-testid="stCaptionContainer"] {{
   color: var(--ink-muted) !important;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
 }}
 
-/* alert boxes (st.info/st.error/etc): hairline border, no shadow, no gradient */
+/* alert boxes (st.info/st.error/etc): dark panel, glowing hairline border */
 div[data-testid="stAlert"] {{
-  box-shadow: none !important;
+  box-shadow: 0 0 16px rgba(0, 194, 255, 0.05);
   border: 1px solid var(--border);
+  background: #10151f;
 }}
+
+/* thin, dark, glowing scrollbar - a small but real HUD-terminal tell */
+::-webkit-scrollbar {{ width: 10px; height: 10px; }}
+::-webkit-scrollbar-track {{ background: var(--page); }}
+::-webkit-scrollbar-thumb {{
+  background: rgba(0, 194, 255, 0.25);
+  border-radius: 5px;
+}}
+::-webkit-scrollbar-thumb:hover {{ background: rgba(0, 194, 255, 0.45); }}
 </style>
 """
 
 
 def eyebrow(text):
-    """A small-caps muted letter-spaced label marking a section/group, e.g. 'RESULTS
-    SUMMARY' above a metrics row - used instead of a raw, unlabeled st.metric() strip.
+    """A glowing cyan, wide-tracked, monospace HUD-style label marking a section/group, e.g.
+    'RESULTS SUMMARY' above a metrics row - used instead of a raw, unlabeled st.metric() strip.
     Returns HTML for st.markdown(..., unsafe_allow_html=True)."""
     return f'<span class="eyebrow">{text}</span>'
 
 
 PLOTLY_LAYOUT_DEFAULTS = dict(
-    template="plotly_white",
-    font=dict(family=FONT_UI, color=INK_PRIMARY),
-    paper_bgcolor=SURFACE,
-    plot_bgcolor=SURFACE,
+    template="plotly_dark",
+    font=dict(family=FONT_MONO, color=INK_PRIMARY),
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(0,0,0,0)",
     colorway=CATEGORICAL,
     margin=dict(l=10, r=10, t=30, b=10),
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-    xaxis=dict(gridcolor=GRIDLINE, zerolinecolor=GRIDLINE),
-    yaxis=dict(gridcolor=GRIDLINE, zerolinecolor=GRIDLINE),
+    xaxis=dict(gridcolor=GRIDLINE, zerolinecolor=GRIDLINE, linecolor=GRIDLINE),
+    yaxis=dict(gridcolor=GRIDLINE, zerolinecolor=GRIDLINE, linecolor=GRIDLINE),
 )
