@@ -635,6 +635,158 @@ def print_risk_sweep_table(sweep_results, header="RISK-PER-TRADE SWEEP"):
 
 
 # =============================================================================
+# MULTI-PHASE CHALLENGE SIMULATION (real prop firms - see prop_firm_presets.py)
+# =============================================================================
+#
+# Real prop firms almost universally run 2 (sometimes 1) sequential evaluation
+# PHASES, each with its own profit target/daily-loss/drawdown/min-days rules -
+# a trader must clear every phase to get funded. The single-phase
+# simulate_challenge_path() above only models one target, which understates how
+# hard a real 2-step challenge actually is (clearing a 10% target is not the
+# same as clearing 10% THEN 5% with a fresh drawdown floor). This section chains
+# simulate_challenge_path() calls, one per phase, against ONE continuous
+# bootstrap-resampled trade sequence - not independent re-draws per phase - so a
+# multi-phase attempt consumes the trader's simulated trades in one continuous
+# string, exactly like a real trader would move from Phase 1 into Phase 2
+# without their trade-taking behavior resetting.
+
+def simulate_multi_phase_challenge_path(r_values_path, initial_balance, risk_pct_per_trade,
+                                         phases, trades_per_day):
+    """Chains simulate_challenge_path() once per phase in `phases` (a list of dicts with
+    profit_target_pct/max_daily_loss_pct/max_overall_loss_pct/min_trading_days/drawdown_mode -
+    see prop_firm_presets.py). Each phase starts FRESH from `initial_balance` (matching how
+    real prop firms reset the account for the next phase rather than carrying forward the
+    prior phase's ending equity/profit), but consumes the NEXT unused portion of
+    r_values_path - the trade sequence itself is never restarted between phases.
+
+    Stops at the first phase that doesn't PASS. Returns:
+      {"outcome": "PASS"|"FAIL"|"INCONCLUSIVE", "phase_failed": int|None (0-indexed, None if
+       outcome is PASS), "trades_taken": int, "days_taken": int, "max_consecutive_losses": int}
+    trades_taken/days_taken are SUMMED across every phase actually attempted (a FAIL in phase 2
+    still counts phase 1's trades/days, since the trader really did take them)."""
+    cursor = 0
+    total_trades = 0
+    total_days = 0
+    overall_max_consec_losses = 0
+
+    for phase_idx, phase in enumerate(phases):
+        remaining_path = r_values_path[cursor:]
+        if len(remaining_path) == 0:
+            return {"outcome": "INCONCLUSIVE", "phase_failed": phase_idx, "trades_taken": total_trades,
+                    "days_taken": total_days, "max_consecutive_losses": overall_max_consec_losses}
+
+        result = simulate_challenge_path(
+            remaining_path, initial_balance, risk_pct_per_trade,
+            phase["profit_target_pct"], phase["max_daily_loss_pct"], phase["max_overall_loss_pct"],
+            phase["min_trading_days"], phase["drawdown_mode"], trades_per_day)
+
+        cursor += result["trades_taken"]
+        total_trades += result["trades_taken"]
+        total_days += result["days_taken"]
+        overall_max_consec_losses = max(overall_max_consec_losses, result["max_consecutive_losses"])
+
+        if result["outcome"] != "PASS":
+            return {"outcome": result["outcome"], "phase_failed": phase_idx, "trades_taken": total_trades,
+                    "days_taken": total_days, "max_consecutive_losses": overall_max_consec_losses}
+
+    return {"outcome": "PASS", "phase_failed": None, "trades_taken": total_trades,
+            "days_taken": total_days, "max_consecutive_losses": overall_max_consec_losses}
+
+
+def multi_phase_risk_sweep(trades, preset, risk_levels_pct=None, n_iter=RISK_SWEEP_N_ITER,
+                            max_trades_per_path=None, seed=2026):
+    """The multi-phase equivalent of risk_sweep() above, for ONE real prop-firm preset (see
+    prop_firm_presets.py) across a range of risk-per-trade levels. `preset` is a dict as
+    returned by prop_firm_presets.get_preset() - uses its own initial_balance and phases list.
+
+    max_trades_per_path defaults to 2x RISK_SWEEP_MAX_TRADES_PER_PATH if not given - a
+    multi-phase attempt needs enough runway to get through every phase, not just one.
+
+    Returns a list of dicts, one per risk level: pass_prob (cleared EVERY phase),
+    fail_prob, inconclusive_prob, avg_trades_to_pass/avg_days_to_pass (among full passes),
+    and fail_by_phase - a dict of {phase_index: count} showing which phase most commonly
+    ends a failed attempt (a genuinely useful diagnostic a single-phase sweep can't show:
+    e.g. "most failures happen in Phase 2's tighter drawdown floor, not Phase 1")."""
+    if risk_levels_pct is None:
+        risk_levels_pct = RISK_SWEEP_LEVELS_PCT
+    if len(trades) < 10:
+        return []
+    if max_trades_per_path is None:
+        max_trades_per_path = RISK_SWEEP_MAX_TRADES_PER_PATH * 2
+
+    r_values = np.array([t["r"] for t in trades], dtype=float)
+    trades_per_day = estimate_trades_per_day(trades)
+    rng = np.random.default_rng(seed)
+    r_matrix = bootstrap_resample_r_matrix(r_values, n_iter, max_trades_per_path, rng)
+
+    initial_balance = preset["initial_balance"]
+    phases = preset["phases"]
+    n_phases = len(phases)
+
+    sweep_results = []
+    for risk_pct in risk_levels_pct:
+        outcomes = [
+            simulate_multi_phase_challenge_path(path, initial_balance, risk_pct, phases, trades_per_day)
+            for path in r_matrix
+        ]
+
+        n = len(outcomes)
+        passes = [o for o in outcomes if o["outcome"] == "PASS"]
+        n_pass = len(passes)
+        n_fail = sum(1 for o in outcomes if o["outcome"] == "FAIL")
+        n_inconclusive = n - n_pass - n_fail
+
+        fail_by_phase = {i: 0 for i in range(n_phases)}
+        for o in outcomes:
+            if o["outcome"] == "FAIL" and o["phase_failed"] is not None:
+                fail_by_phase[o["phase_failed"]] += 1
+
+        sweep_results.append({
+            "risk_pct_per_trade": risk_pct,
+            "n_iter": n,
+            "pass_prob": n_pass / n,
+            "fail_prob": n_fail / n,
+            "inconclusive_prob": n_inconclusive / n,
+            "avg_trades_to_pass": float(np.mean([o["trades_taken"] for o in passes])) if passes else float("nan"),
+            "avg_days_to_pass": float(np.mean([o["days_taken"] for o in passes])) if passes else float("nan"),
+            "fail_by_phase": fail_by_phase,
+            "trades_per_day_assumed": trades_per_day,
+        })
+
+    return sweep_results
+
+
+def print_multi_phase_sweep_table(sweep_results, preset, header=None):
+    if not sweep_results:
+        print(f"\n{header or 'MULTI-PHASE PROP FIRM SWEEP'}: not enough trades to run the sweep.")
+        return
+
+    phase_names = [p["name"] for p in preset["phases"]]
+    header = header or f"MULTI-PHASE SWEEP - {preset['display_name']}"
+    print(f"\n{'=' * 78}\n{header}\n"
+          f"({sweep_results[0]['n_iter']} Monte Carlo attempts per risk level, chained across "
+          f"{len(phase_names)} phase(s): {', '.join(phase_names)})\n{'=' * 78}")
+    print(f"{'risk%':>7} {'pass%':>7} {'fail%':>7} {'inconcl%':>9} {'avg trades':>11} {'avg days':>9}  "
+          f"fail-by-phase")
+    for row in sweep_results:
+        avg_trades = f"{row['avg_trades_to_pass']:.0f}" if not math.isnan(row["avg_trades_to_pass"]) else "n/a"
+        avg_days = f"{row['avg_days_to_pass']:.0f}" if not math.isnan(row["avg_days_to_pass"]) else "n/a"
+        fail_breakdown = "  ".join(f"{phase_names[i]}={cnt}" for i, cnt in row["fail_by_phase"].items())
+        print(f"{row['risk_pct_per_trade']:>6.2f}% {row['pass_prob'] * 100:>6.1f}% {row['fail_prob'] * 100:>6.1f}% "
+              f"{row['inconclusive_prob'] * 100:>8.1f}% {avg_trades:>11} {avg_days:>9}  {fail_breakdown}")
+
+    best = max(sweep_results, key=lambda r: r["pass_prob"])
+    print(f"\nHighest full-pass probability: {best['risk_pct_per_trade']:.2f}% risk/trade -> "
+          f"{best['pass_prob'] * 100:.1f}% of attempts cleared every phase.")
+    print(f"\nSource: {', '.join(preset['source_urls'])}")
+    print(f"Sourcing note: {preset['source_note']}")
+    print(f"\nCAVEAT: bootstrap resampling of a FINITE historical trade sample - approximates future "
+          f"variance, not a guarantee. No commission/spread/slippage modeled in the underlying trades. "
+          f"Each phase resets to a fresh account balance (real prop-firm convention), consuming the next "
+          f"unused portion of the same continuous simulated trade sequence.")
+
+
+# =============================================================================
 # LOSING-STREAK PROBABILITY (standalone, sizing-independent diagnostic)
 # =============================================================================
 #

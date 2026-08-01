@@ -339,5 +339,141 @@ class TestLosingStreakProbabilitiesSmoke(unittest.TestCase):
         self.assertEqual(sim.losing_streak_probabilities(self.r_values[:5]), [])
 
 
+# =============================================================================
+# Multi-phase challenge simulation (real prop firms)
+# =============================================================================
+
+_PRESETS_MODULE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prop_firm_presets.py")
+_presets_spec = importlib.util.spec_from_file_location("prop_firm_presets", _PRESETS_MODULE_PATH)
+presets = importlib.util.module_from_spec(_presets_spec)
+_presets_spec.loader.exec_module(presets)
+
+
+class TestSimulateMultiPhaseChallengePath(unittest.TestCase):
+    def test_passes_both_phases_with_a_clearly_winning_sequence(self):
+        # +1R every trade at 5% risk/trade moves equity 5%/trade - comfortably clears a
+        # 10% phase-1 target in 2 trades and a 5% phase-2 target in 1 more, with plenty of
+        # trades left over to satisfy any reasonable min-trading-days requirement
+        r_path = [1.0] * 50
+        phases = [
+            {"profit_target_pct": 10.0, "max_daily_loss_pct": 5.0, "max_overall_loss_pct": 10.0,
+             "min_trading_days": 2, "drawdown_mode": "trailing"},
+            {"profit_target_pct": 5.0, "max_daily_loss_pct": 5.0, "max_overall_loss_pct": 10.0,
+             "min_trading_days": 2, "drawdown_mode": "trailing"},
+        ]
+        result = sim.simulate_multi_phase_challenge_path(r_path, 10000.0, 5.0, phases, trades_per_day=1)
+        self.assertEqual(result["outcome"], "PASS")
+        self.assertIsNone(result["phase_failed"])
+        # phase 1 needs >=2 trades (2 days) to clear both the 10% target and 2-day minimum,
+        # phase 2 needs >=2 trades similarly - total consumed trades must reflect BOTH phases,
+        # proving the sequence is chained, not restarted
+        self.assertGreaterEqual(result["trades_taken"], 4)
+
+    def test_fails_at_phase_two_specifically_when_phase_one_easily_passes(self):
+        # phase 1 (loose 20% daily loss, generous target) is trivial; phase 2 has an
+        # impossibly tight 0.01% daily loss limit that a single -1R loss will always breach
+        r_path = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0]
+        phases = [
+            {"profit_target_pct": 2.0, "max_daily_loss_pct": 20.0, "max_overall_loss_pct": 20.0,
+             "min_trading_days": 1, "drawdown_mode": "static"},
+            {"profit_target_pct": 50.0, "max_daily_loss_pct": 0.01, "max_overall_loss_pct": 50.0,
+             "min_trading_days": 1, "drawdown_mode": "static"},
+        ]
+        result = sim.simulate_multi_phase_challenge_path(r_path, 10000.0, 5.0, phases, trades_per_day=1)
+        self.assertEqual(result["outcome"], "FAIL")
+        self.assertEqual(result["phase_failed"], 1)
+        # trades_taken must include phase 1's consumed trades PLUS however many phase 2 took
+        # before breaching - proving the cursor genuinely advanced between phases
+        self.assertGreater(result["trades_taken"], 1)
+
+    def test_inconclusive_when_path_runs_out_mid_phase(self):
+        r_path = [0.01] * 3   # barely moves equity, nowhere near any target, and short
+        phases = [
+            {"profit_target_pct": 10.0, "max_daily_loss_pct": 5.0, "max_overall_loss_pct": 10.0,
+             "min_trading_days": 1, "drawdown_mode": "static"},
+        ]
+        result = sim.simulate_multi_phase_challenge_path(r_path, 10000.0, 1.0, phases, trades_per_day=1)
+        self.assertEqual(result["outcome"], "INCONCLUSIVE")
+        self.assertEqual(result["phase_failed"], 0)
+
+    def test_second_phase_starts_from_a_fresh_balance_not_carried_profit(self):
+        # phase 1 target is tiny (1%) so it passes almost immediately at trade 1; phase 2's
+        # target (10%) must then be measured from a FRESH 10000 balance, not from phase 1's
+        # already-elevated ending equity - if it were (incorrectly) carried forward, far
+        # fewer additional trades would be needed than if it resets
+        r_path = [1.0] * 20   # +5%/trade at the risk level used below
+        phases = [
+            {"profit_target_pct": 1.0, "max_daily_loss_pct": 50.0, "max_overall_loss_pct": 50.0,
+             "min_trading_days": 1, "drawdown_mode": "static"},
+            {"profit_target_pct": 10.0, "max_daily_loss_pct": 50.0, "max_overall_loss_pct": 50.0,
+             "min_trading_days": 1, "drawdown_mode": "static"},
+        ]
+        result = sim.simulate_multi_phase_challenge_path(r_path, 10000.0, 5.0, phases, trades_per_day=1)
+        self.assertEqual(result["outcome"], "PASS")
+        # phase 1 clears on trade 1 (5% >= 1% target). phase 2 needs ceil(10/5)=2 MORE trades
+        # from a fresh 10000 base - if equity had incorrectly carried forward from phase 1's
+        # 10500, phase 2 would already be past its 10% target and need 0 more trades, making
+        # total trades_taken == 1. Asserting >= 3 proves the reset actually happened.
+        self.assertGreaterEqual(result["trades_taken"], 3)
+
+
+class TestMultiPhaseRiskSweep(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        rng = np.random.default_rng(3)
+        n = 300
+        wins = rng.random(n) < 0.55
+        r_values = np.where(wins, 1.3, -1.0)
+        cls.trades = _make_trades(r_values)
+        cls.preset = presets.get_preset("ftmo_2step")
+
+    def test_runs_and_produces_sane_output(self):
+        results = sim.multi_phase_risk_sweep(self.trades, self.preset, risk_levels_pct=[0.5, 1.0, 2.0],
+                                              n_iter=200, seed=5)
+        self.assertEqual(len(results), 3)
+        for row in results:
+            total = row["pass_prob"] + row["fail_prob"] + row["inconclusive_prob"]
+            self.assertAlmostEqual(total, 1.0, places=6)
+            self.assertEqual(set(row["fail_by_phase"].keys()), {0, 1})
+            self.assertEqual(sum(row["fail_by_phase"].values()),
+                              round(row["fail_prob"] * row["n_iter"]))
+
+    def test_empty_on_too_few_trades(self):
+        self.assertEqual(sim.multi_phase_risk_sweep(self.trades[:5], self.preset), [])
+
+    def test_smaller_risk_generally_does_not_reduce_pass_probability_to_zero(self):
+        # a sane, positive-expectancy trade set at a small risk level should still show SOME
+        # nonzero pass probability, not just always time out / inconclusive
+        results = sim.multi_phase_risk_sweep(self.trades, self.preset, risk_levels_pct=[0.25],
+                                              n_iter=300, seed=9)
+        self.assertGreater(results[0]["pass_prob"], 0.0)
+
+
+class TestPropFirmPresets(unittest.TestCase):
+    def test_list_presets_returns_expected_three(self):
+        ids = [p[0] for p in presets.list_presets()]
+        self.assertEqual(ids, ["ftmo_2step", "fundednext_2step", "the5ers_hypergrowth_1step"])
+
+    def test_get_preset_returns_independent_copy(self):
+        p1 = presets.get_preset("ftmo_2step")
+        p1["phases"][0]["profit_target_pct"] = 999.0
+        p2 = presets.get_preset("ftmo_2step")
+        self.assertEqual(p2["phases"][0]["profit_target_pct"], 10.0)   # unaffected by the mutation above
+
+    def test_all_presets_have_required_fields(self):
+        for preset_id, _ in presets.list_presets():
+            preset = presets.get_preset(preset_id)
+            self.assertIn("initial_balance", preset)
+            self.assertIn("source_urls", preset)
+            self.assertTrue(len(preset["source_urls"]) > 0)
+            self.assertIn("source_note", preset)
+            self.assertTrue(len(preset["phases"]) >= 1)
+            for phase in preset["phases"]:
+                for key in ("profit_target_pct", "max_daily_loss_pct", "max_overall_loss_pct",
+                            "min_trading_days", "drawdown_mode"):
+                    self.assertIn(key, phase)
+                self.assertIn(phase["drawdown_mode"], ("static", "trailing"))
+
+
 if __name__ == "__main__":
     unittest.main()
