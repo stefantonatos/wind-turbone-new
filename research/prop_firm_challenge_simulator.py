@@ -36,6 +36,7 @@
 # !pip install --upgrade dukascopy-python -q   # uncomment this line in Colab
 
 import datetime
+import math
 import random as _random
 
 import numpy as np
@@ -86,6 +87,27 @@ MAX_OVERALL_LOSS_PCT = 10.0
 MIN_TRADING_DAYS = 4
 DRAWDOWN_MODE = "static"        # "static" = measured from INITIAL_BALANCE; "trailing" = measured from the equity peak so far
 N_MONTE_CARLO_RUNS = 300
+
+# --- risk-per-trade sweep (see the big comment block above simulate_challenge_path) ---
+# The set below deliberately spans from "obviously too small to finish in a reasonable
+# number of trades" (0.1%) to "obviously too large to survive even one bad day" (5%,
+# which at these default account rules breaches the daily-loss limit on the very FIRST
+# losing trade - see consecutive_losses_to_breach) - both ends are kept ON PURPOSE
+# because showing that collapse at each extreme IS the point of the sweep, not something
+# to filter out before showing the reader.
+RISK_SWEEP_LEVELS_PCT = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0]
+RISK_SWEEP_N_ITER = 2000               # matches this project's other Monte Carlo work, e.g.
+                                        # ict_po3_forex_dukascopy_optimization.py's MC_ITERATIONS
+RISK_SWEEP_MAX_TRADES_PER_PATH = 2000  # hard cap per simulated path so a too-small risk level
+                                        # can't spin forever - if it doesn't resolve by then the
+                                        # attempt is marked INCONCLUSIVE, which is itself signal
+                                        # (that risk level is impractically slow for this edge)
+
+# --- losing-streak probability (standalone, sizing-independent diagnostic) ---
+LOSING_STREAK_KS = [2, 3, 4, 5, 6, 8]
+LOSING_STREAK_REFERENCE_N = 250   # ~1 trade/trading-day/year - a standardized sample size so
+                                   # results are comparable across strategies with very
+                                   # different real historical trade counts
 
 
 def to_london_time(index):
@@ -367,6 +389,402 @@ def monte_carlo_pass_rate(trades, n_simulations=N_MONTE_CARLO_RUNS, **challenge_
     return results
 
 
+# =============================================================================
+# RISK-PER-TRADE SWEEP
+# =============================================================================
+#
+# The point this section demonstrates: with a FIXED edge (this strategy's real,
+# already-backtested win rate and R-multiple distribution - not a hypothetical
+# toy 60%/1:1 example), the probability of actually reaching the challenge's
+# profit target BEFORE violating a loss rule depends heavily on risk-per-trade
+# sizing. Not because the edge changes - it's the exact same trade sample at
+# every risk level below - but because a bigger risk-per-trade means the account
+# can survive fewer consecutive losing trades before hitting the daily-loss or
+# max-drawdown limit, and a real edge needs enough "runway" (enough trades) to
+# actually converge toward its expected outcome. Smaller risk isn't
+# unconditionally better either: shrink it enough and the average number of
+# trades needed to reach the profit target becomes impractically large. There's
+# a real tradeoff curve here - see print_risk_sweep_table's output.
+#
+# Bootstrap resampling (WITH replacement) matches this project's established
+# Monte Carlo convention from the optimization scripts (see
+# ict_po3_forex_dukascopy_optimization.py's monte_carlo_bootstrap): one
+# (n_iter, n_per_path) integer draw + fancy indexing, not a Python-level loop.
+# The per-path account-rule walkthrough (running balance, early-stop on
+# breach/pass) still needs a per-path loop - kept as small and cheap per
+# iteration as reasonably possible.
+
+
+def consecutive_losses_to_breach(risk_pct_per_trade, max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+                                  max_overall_loss_pct=MAX_OVERALL_LOSS_PCT):
+    """Deterministic (NOT a simulation): starting from a flat, fresh account (equity ==
+    peak == initial balance, so static and trailing overall-drawdown modes agree), how
+    many full -1R losing trades IN A ROW can the account absorb before the NEXT one
+    breaches a loss rule? Assumes the worst realistic case for the daily-loss check -
+    all the losses landing inside the same trading day, since the daily limit resets
+    every day and that's the scenario a real trader could actually face.
+
+    Each -1R loss at `risk_pct_per_trade`% of the (fixed, non-compounded) starting
+    balance moves daily/overall drawdown by exactly `risk_pct_per_trade` percentage
+    points, so the k-th consecutive loss breaches whichever limit is hit first:
+    daily at k = ceil(max_daily_loss_pct / risk_pct_per_trade), overall at
+    k = ceil(max_overall_loss_pct / risk_pct_per_trade). The account survives
+    (breach_at - 1) losses; the breach_at-th one ends the challenge.
+
+    Returns (survivable_losses, breach_reason, breach_at_loss_count).
+    """
+    if risk_pct_per_trade <= 0:
+        return float("inf"), "n/a", float("inf")
+    eps = 1e-9
+    daily_breach_at = math.ceil(max_daily_loss_pct / risk_pct_per_trade - eps)
+    overall_breach_at = math.ceil(max_overall_loss_pct / risk_pct_per_trade - eps)
+    if daily_breach_at <= overall_breach_at:
+        return daily_breach_at - 1, "daily_drawdown", daily_breach_at
+    return overall_breach_at - 1, "overall_drawdown", overall_breach_at
+
+
+def estimate_trades_per_day(trades):
+    """Average trades/day empirically observed in the real trade list - used to bucket
+    a bootstrap-resampled trade sequence into SYNTHETIC trading days for the
+    daily-loss-limit check. This is a modeling simplification (real trading days don't
+    all have the same trade count) made necessary because resampling individual
+    R-multiples with replacement destroys the real calendar dates that
+    simulate_challenge() above groups by - called out explicitly in the sweep's
+    printed caveats, not hidden."""
+    if not trades:
+        return 1
+    n_days = len(set(t["date"] for t in trades))
+    if n_days == 0:
+        return 1
+    return max(1, round(len(trades) / n_days))
+
+
+def bootstrap_resample_r_matrix(r_values, n_iter, n_per_path, rng):
+    """Bootstrap resample WITH replacement, vectorized exactly like this project's other
+    Monte Carlo work: one (n_iter, n_per_path) integer draw + fancy indexing, not a
+    Python-level loop. Shared by the risk sweep and the losing-streak diagnostic below."""
+    r = np.asarray(r_values, dtype=float)
+    n = len(r)
+    idx = rng.integers(0, n, size=(n_iter, n_per_path))
+    return r[idx]
+
+
+def simulate_challenge_path(r_values_path, initial_balance, risk_pct_per_trade, profit_target_pct,
+                             max_daily_loss_pct, max_overall_loss_pct, min_trading_days,
+                             drawdown_mode, trades_per_day):
+    """One bootstrap-resampled trade sequence run through the SAME account-rule
+    mechanics as simulate_challenge() above (early-stop on the first PASS/FAIL) - just
+    fed synthetic R-multiples instead of the real chronological trade list.
+    trades_per_day buckets the sequence into synthetic trading days for the daily-loss
+    check (see estimate_trades_per_day's docstring for why)."""
+    trades_per_day = max(1, trades_per_day)
+    equity = initial_balance
+    peak_equity = initial_balance
+    profit_target_level = initial_balance * (1 + profit_target_pct / 100)
+    static_floor = initial_balance * (1 - max_overall_loss_pct / 100)
+    risk_dollars = initial_balance * (risk_pct_per_trade / 100)
+
+    day_start_equity = equity
+    trading_days_seen = 0
+    consecutive_losses = 0
+    max_consecutive_losses = 0
+
+    for idx, r in enumerate(r_values_path):
+        if idx % trades_per_day == 0:
+            day_start_equity = equity
+            trading_days_seen += 1
+
+        equity += r * risk_dollars
+        peak_equity = max(peak_equity, equity)
+        consecutive_losses = consecutive_losses + 1 if r < 0 else 0
+        max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+
+        daily_loss_pct = (day_start_equity - equity) / initial_balance * 100
+        if daily_loss_pct >= max_daily_loss_pct:
+            return {"outcome": "FAIL", "reason": "daily_drawdown", "trades_taken": idx + 1,
+                    "days_taken": trading_days_seen, "final_equity": equity,
+                    "max_consecutive_losses": max_consecutive_losses}
+
+        overall_floor = static_floor if drawdown_mode == "static" else peak_equity * (1 - max_overall_loss_pct / 100)
+        if equity <= overall_floor:
+            return {"outcome": "FAIL", "reason": f"overall_drawdown_{drawdown_mode}", "trades_taken": idx + 1,
+                    "days_taken": trading_days_seen, "final_equity": equity,
+                    "max_consecutive_losses": max_consecutive_losses}
+
+        if equity >= profit_target_level and trading_days_seen >= min_trading_days:
+            return {"outcome": "PASS", "trades_taken": idx + 1, "days_taken": trading_days_seen,
+                    "final_equity": equity, "max_consecutive_losses": max_consecutive_losses}
+
+    return {"outcome": "INCONCLUSIVE", "reason": "ran_out_of_bootstrap_path", "trades_taken": len(r_values_path),
+            "days_taken": trading_days_seen, "final_equity": equity,
+            "max_consecutive_losses": max_consecutive_losses}
+
+
+def risk_sweep(trades, risk_levels_pct=None, n_iter=RISK_SWEEP_N_ITER,
+                max_trades_per_path=RISK_SWEEP_MAX_TRADES_PER_PATH,
+                initial_balance=INITIAL_BALANCE, profit_target_pct=PROFIT_TARGET_PCT,
+                max_daily_loss_pct=MAX_DAILY_LOSS_PCT, max_overall_loss_pct=MAX_OVERALL_LOSS_PCT,
+                min_trading_days=MIN_TRADING_DAYS, drawdown_mode=DRAWDOWN_MODE, seed=2026):
+    """THE risk-per-trade sweep. For each risk level, bootstrap-resamples n_iter trade
+    sequences WITH replacement from `trades`' real R-multiples (not a synthetic/assumed
+    win rate) and runs each one through the exact same account-rule mechanics as
+    simulate_challenge() - just repeated at scale, across many risk-per-trade fractions.
+
+    The SAME underlying bootstrap-resampled paths (same random draw, same seed) are
+    reused across every risk level - only risk_dollars and the resulting pass/fail
+    thresholds change - so differences in outcome ACROSS risk levels are attributable to
+    risk sizing, not extra sampling noise (a common-random-numbers variance-reduction
+    trick).
+
+    Returns a list of dicts, one per risk level, in the order given."""
+    if risk_levels_pct is None:
+        risk_levels_pct = RISK_SWEEP_LEVELS_PCT
+    if len(trades) < 10:
+        return []
+
+    r_values = np.array([t["r"] for t in trades], dtype=float)
+    trades_per_day = estimate_trades_per_day(trades)
+    rng = np.random.default_rng(seed)
+    r_matrix = bootstrap_resample_r_matrix(r_values, n_iter, max_trades_per_path, rng)
+
+    sweep_results = []
+    for risk_pct in risk_levels_pct:
+        survivable_losses, breach_reason, breach_at = consecutive_losses_to_breach(
+            risk_pct, max_daily_loss_pct, max_overall_loss_pct)
+
+        outcomes = [
+            simulate_challenge_path(path, initial_balance, risk_pct, profit_target_pct,
+                                     max_daily_loss_pct, max_overall_loss_pct, min_trading_days,
+                                     drawdown_mode, trades_per_day)
+            for path in r_matrix
+        ]
+
+        n = len(outcomes)
+        passes = [o for o in outcomes if o["outcome"] == "PASS"]
+        n_pass, n_fail = len(passes), sum(1 for o in outcomes if o["outcome"] == "FAIL")
+        n_inconclusive = n - n_pass - n_fail
+        hit_breach_streak = sum(1 for o in outcomes if o["max_consecutive_losses"] >= breach_at)
+
+        sweep_results.append({
+            "risk_pct_per_trade": risk_pct,
+            "n_iter": n,
+            "pass_prob": n_pass / n,
+            "fail_prob": n_fail / n,
+            "inconclusive_prob": n_inconclusive / n,
+            "avg_trades_to_pass": float(np.mean([o["trades_taken"] for o in passes])) if passes else float("nan"),
+            "avg_days_to_pass": float(np.mean([o["days_taken"] for o in passes])) if passes else float("nan"),
+            "max_survivable_consecutive_losses": survivable_losses,
+            "breach_reason": breach_reason,
+            "consecutive_losses_that_would_breach": breach_at,
+            "frac_paths_hitting_breach_streak": hit_breach_streak / n,
+            "trades_per_day_assumed": trades_per_day,
+        })
+
+    return sweep_results
+
+
+def print_risk_sweep_table(sweep_results, header="RISK-PER-TRADE SWEEP"):
+    if not sweep_results:
+        print(f"\n{header}: not enough trades to run the sweep.")
+        return
+
+    print(f"\n{'=' * 78}\n{header} - same real bootstrap-resampled trade sequences, "
+          f"{sweep_results[0]['n_iter']} Monte Carlo attempts per risk level (synthetic trading days of "
+          f"{sweep_results[0]['trades_per_day_assumed']} trades/day, from this strategy's own trade rate)\n"
+          f"{'=' * 78}")
+    print(f"{'risk%':>7} {'pass%':>7} {'fail%':>7} {'inconcl%':>9} {'avg trades':>11} {'avg days':>9} "
+          f"{'survives':>9} {'breach@':>8} {'streak seen':>12}")
+    for row in sweep_results:
+        avg_trades = f"{row['avg_trades_to_pass']:.0f}" if not math.isnan(row["avg_trades_to_pass"]) else "n/a"
+        avg_days = f"{row['avg_days_to_pass']:.0f}" if not math.isnan(row["avg_days_to_pass"]) else "n/a"
+        print(f"{row['risk_pct_per_trade']:>6.2f}% {row['pass_prob'] * 100:>6.1f}% {row['fail_prob'] * 100:>6.1f}% "
+              f"{row['inconclusive_prob'] * 100:>8.1f}% {avg_trades:>11} {avg_days:>9} "
+              f"{row['max_survivable_consecutive_losses']:>9} {row['consecutive_losses_that_would_breach']:>8} "
+              f"{row['frac_paths_hitting_breach_streak'] * 100:>10.1f}%")
+
+    best = max(sweep_results, key=lambda r: r["pass_prob"])
+    finite_speed = [r for r in sweep_results if not math.isnan(r["avg_trades_to_pass"])]
+    fastest = min(finite_speed, key=lambda r: r["avg_trades_to_pass"]) if finite_speed else None
+
+    print(f"\nHighest payout probability: {best['risk_pct_per_trade']:.2f}% risk/trade -> "
+          f"{best['pass_prob'] * 100:.1f}% of attempts reached the target (surviving up to "
+          f"{best['max_survivable_consecutive_losses']} losses in a row before the {best['breach_reason']} "
+          f"rule would end the challenge).")
+    if fastest is not None:
+        print(f"Fastest average time-to-payout (among attempts that passed): "
+              f"{fastest['risk_pct_per_trade']:.2f}% risk/trade -> {fastest['avg_trades_to_pass']:.0f} trades "
+              f"/ {fastest['avg_days_to_pass']:.0f} days on average.")
+        if fastest["risk_pct_per_trade"] != best["risk_pct_per_trade"]:
+            print("These are DIFFERENT risk levels - that IS the tradeoff: the level that passes most often is "
+                  "not necessarily the level that pays out fastest. Smaller risk/trade buys more 'runway' (more "
+                  "consecutive losses survivable), which raises pass probability, but each trade also moves the "
+                  "account a smaller fraction of the way to the profit target, so reaching it takes more trades "
+                  "on average - see the avg-trades column climb as risk shrinks. There is a real sweet spot here, "
+                  "not a monotonic 'always shrink it' answer.")
+        else:
+            print("Here the highest-pass-probability level and the fastest-to-payout level coincide.")
+
+    print(f"\nCAVEAT: this uses bootstrap resampling of a FINITE historical trade sample (with replacement) - "
+          f"it approximates true future variance but is not a guarantee of any specific probability, especially "
+          f"at the tails. Trading-day boundaries inside each resampled path are SYNTHETIC (grouped by this "
+          f"strategy's own average trades/day, since resampling individual R-multiples destroys the real "
+          f"calendar dates the single-run simulator groups by) - a real trader's actual daily clustering could "
+          f"differ. No commission/spread/slippage modeled in the underlying trades. 'max survivable consecutive "
+          f"losses' is a deterministic worst-case calculation from the account rules alone, not itself a Monte "
+          f"Carlo output - it assumes the losses land on the same trading day, the true worst case.")
+
+
+# =============================================================================
+# LOSING-STREAK PROBABILITY (standalone, sizing-independent diagnostic)
+# =============================================================================
+#
+# A related but DIFFERENT idea from the risk sweep above: the probability of
+# hitting a losing streak of a given length is a property of the strategy's win
+# rate and sample size, NOT of position sizing - it doesn't involve risk-per-trade
+# or account rules at all. Even a genuinely good edge will very likely produce a
+# scary-looking losing streak somewhere in a typical year of trading, and that's
+# normal variance, not proof the edge broke. This section quantifies exactly how
+# likely, using this strategy's own real trade sequence.
+
+
+def prob_run_at_least_k(n, k, p):
+    """Exact probability, assuming n iid Bernoulli(p) trials (p = probability a single
+    trial is a 'loss'), of at least one run of >= k consecutive losses somewhere in the
+    n trials. Computed via a small forward DP over "current consecutive-loss count"
+    states 0..k-1 plus an absorbing state k ("a qualifying run has already occurred") -
+    exact for the iid-Bernoulli MODEL, not an approximation. Whether real trade outcomes
+    actually behave like iid Bernoulli draws is a separate question - that's exactly
+    what comparing this to the empirical bootstrap number (below) checks."""
+    if k <= 0:
+        return 1.0
+    if n < k:
+        return 0.0
+    p = min(max(p, 0.0), 1.0)
+    state = [0.0] * (k + 1)
+    state[0] = 1.0
+    for _ in range(n):
+        new_state = [0.0] * (k + 1)
+        new_state[k] = state[k]
+        for i in range(k):
+            si = state[i]
+            if si == 0.0:
+                continue
+            nxt = min(i + 1, k)
+            new_state[nxt] += si * p
+            new_state[0] += si * (1 - p)
+        state = new_state
+    return state[k]
+
+
+def losing_streak_probabilities(r_values, ks=None, n_iter=RISK_SWEEP_N_ITER, sample_sizes=None, seed=7):
+    """Standalone diagnostic (no risk-per-trade or account rules involved - purely a
+    property of the strategy's win/loss SEQUENCE): for a typical run of N trades, what's
+    the probability of a losing streak of length >= k somewhere in it? A trade counts as
+    a loss iff its R-multiple is < 0 (a breakeven trade, r == 0, is neither a win nor a
+    loss and resets a losing streak same as a win would).
+
+    Reports BOTH:
+      - empirical: bootstrap-resample N trades WITH replacement from the real R-multiple
+        history (same machinery as the risk-per-trade sweep above), n_iter times, and
+        measure how often the longest consecutive-loss run in the simulated sequence
+        reaches >= k.
+      - theoretical: the exact iid-Bernoulli closed form (prob_run_at_least_k) at the
+        strategy's empirical loss rate, for comparison. A big gap between the two means
+        real outcomes are NOT well-approximated as independent draws (e.g. correlated
+        market regimes) - reported plainly, not smoothed over.
+    """
+    if ks is None:
+        ks = LOSING_STREAK_KS
+    r = np.asarray(r_values, dtype=float)
+    n_total = len(r)
+    if n_total < 10:
+        return []
+
+    loss_rate = float((r < 0).mean())
+    win_rate = float((r > 0).mean())
+
+    if sample_sizes is None:
+        sample_sizes = sorted(set([n_total, LOSING_STREAK_REFERENCE_N]))
+
+    rng = np.random.default_rng(seed)
+    results = []
+    for n in sample_sizes:
+        if n <= 0:
+            continue
+        r_matrix = bootstrap_resample_r_matrix(r, n_iter, n, rng)
+        loss_bool = r_matrix < 0
+        consec = np.zeros((n_iter, n), dtype=np.int64)
+        consec[:, 0] = loss_bool[:, 0]
+        for j in range(1, n):
+            consec[:, j] = np.where(loss_bool[:, j], consec[:, j - 1] + 1, 0)
+        longest = consec.max(axis=1)
+
+        per_k = []
+        for k in ks:
+            empirical_p = float((longest >= k).mean())
+            theoretical_p = prob_run_at_least_k(n, k, loss_rate)
+            per_k.append({"k": k, "empirical_p": empirical_p, "theoretical_p": theoretical_p})
+
+        results.append({"sample_size": n, "n_iter": n_iter, "loss_rate": loss_rate,
+                         "win_rate": win_rate, "avg_r_per_trade": float(r.mean()), "per_k": per_k})
+
+    return results
+
+
+def print_losing_streak_table(streak_results, header="LOSING-STREAK PROBABILITY (sizing-independent)"):
+    if not streak_results:
+        print(f"\n{header}: not enough trades to run this diagnostic.")
+        return
+
+    win_rate = streak_results[0]["win_rate"]
+    avg_r = streak_results[0]["avg_r_per_trade"]
+    print(f"\n{'=' * 78}\n{header}\n{'=' * 78}")
+    print(f"Real empirical win rate: {win_rate * 100:.1f}%   Avg R/trade: {avg_r:+.4f}   "
+          f"(does NOT depend on risk-per-trade or account rules - a property of the win/loss sequence alone)")
+
+    for res in streak_results:
+        print(f"\n  Sample size N={res['sample_size']} trades ({res['n_iter']} bootstrap iterations):")
+        print(f"    {'k (streak len)':>16} {'empirical P(>=k)':>18} {'theoretical P(>=k)':>20} {'gap':>8}")
+        for row in res["per_k"]:
+            gap = row["empirical_p"] - row["theoretical_p"]
+            print(f"    {row['k']:>16} {row['empirical_p'] * 100:>17.1f}% {row['theoretical_p'] * 100:>19.1f}% "
+                  f"{gap * 100:>+7.1f}pp")
+
+    ref = next((r for r in streak_results if r["sample_size"] == LOSING_STREAK_REFERENCE_N), streak_results[-1])
+    k_focus = 4 if any(row["k"] == 4 for row in ref["per_k"]) else ref["per_k"][0]["k"]
+    focus_row = next(row for row in ref["per_k"] if row["k"] == k_focus)
+    p_pct = focus_row["empirical_p"] * 100
+
+    if avg_r > 0:
+        print(f"\nSummary: even at this strategy's real {win_rate * 100:.1f}% win rate (positive expectancy, "
+              f"{avg_r:+.4f}R/trade average), there's a {p_pct:.0f}% chance of a {k_focus}-in-a-row losing "
+              f"streak somewhere in a typical {ref['sample_size']}-trade run - expected variance from a real "
+              f"edge, not necessarily a sign the edge broke.")
+    elif avg_r == 0:
+        print(f"\nSummary: this strategy's real average R/trade is exactly breakeven ({avg_r:+.4f}R) - a "
+              f"{p_pct:.0f}% chance of a {k_focus}-in-a-row losing streak in {ref['sample_size']} trades here "
+              f"isn't reassuring OR damning on its own, since there's no real edge either way to attribute "
+              f"the streak to variance around.")
+    else:
+        print(f"\nSummary: this strategy's real average R/trade is NEGATIVE ({avg_r:+.4f}R/trade) - a "
+              f"{p_pct:.0f}% chance of a {k_focus}-in-a-row losing streak in {ref['sample_size']} trades is NOT "
+              f"'just variance' to wave off here. With a decisively negative edge, losing streaks are the "
+              f"expected long-run OUTCOME, not noise around a real edge.")
+
+    max_gap = max(abs(row["empirical_p"] - row["theoretical_p"]) for res in streak_results for row in res["per_k"])
+    if max_gap > 0.05:
+        print(f"\nNOTE: empirical and theoretical (iid-Bernoulli) probabilities diverge by up to "
+              f"{max_gap * 100:.1f} percentage points across the k values checked - real trade outcomes here "
+              f"are NOT well approximated as independent draws (likely correlated market regimes/clustering), "
+              f"so trust the empirical bootstrap column over the theoretical one.")
+    else:
+        print(f"\nEmpirical and theoretical probabilities are close (max gap {max_gap * 100:.1f}pp) - the "
+              f"iid-Bernoulli approximation is reasonable for this strategy's loss sequence.")
+
+    print(f"\nCAVEAT: bootstrap resampling of a FINITE historical sample - approximates true future variance, "
+          f"not a guarantee. No commission/spread/slippage modeled in the underlying trades.")
+
+
 def main():
     all_trades = []
     for label, instrument_const in TICKERS:
@@ -443,6 +861,16 @@ def main():
           f"equity - real firms often also watch floating equity intra-trade, which isn't reproducible "
           f"from R-multiple outcomes alone. Treat this pass rate as an upper bound, not an exact figure. "
           f"Also: no commission/spread/slippage modeled in the underlying trades themselves.")
+
+    sweep_results = risk_sweep(
+        all_trades, initial_balance=INITIAL_BALANCE, profit_target_pct=PROFIT_TARGET_PCT,
+        max_daily_loss_pct=MAX_DAILY_LOSS_PCT, max_overall_loss_pct=MAX_OVERALL_LOSS_PCT,
+        min_trading_days=MIN_TRADING_DAYS, drawdown_mode=DRAWDOWN_MODE,
+    )
+    print_risk_sweep_table(sweep_results)
+
+    streak_results = losing_streak_probabilities([t["r"] for t in all_trades])
+    print_losing_streak_table(streak_results)
 
 
 if __name__ == "__main__":

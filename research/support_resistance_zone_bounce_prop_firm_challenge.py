@@ -22,6 +22,7 @@
 # !pip install --upgrade dukascopy-python -q   # uncomment this line in Colab
 
 import datetime
+import os
 import random as _random
 
 import numpy as np
@@ -287,6 +288,23 @@ def monte_carlo_pass_rate(trades, n_simulations=N_MONTE_CARLO_RUNS, **challenge_
     return results
 
 
+def _load_prop_firm_simulator():
+    """The risk-per-trade sweep and losing-streak-probability diagnostic live in
+    prop_firm_challenge_simulator.py (the generic script) since that logic is
+    strategy-agnostic - it only needs a list of real R-multiples, not this script's
+    zone-bounce-specific backtest machinery. Loaded via spec_from_file_location (same
+    pattern already used elsewhere in this project, e.g. day_trading_rauf_dukascopy_
+    optimization.py importing day_trading_rauf_dukascopy_backtest.py) rather than a
+    package import, since this directory has no __init__.py and these scripts are
+    designed to also run standalone in Colab."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prop_firm_challenge_simulator.py")
+    spec = importlib.util.spec_from_file_location("prop_firm_challenge_simulator", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main():
     years = (FETCH_END - FETCH_START).days / 365
     print(f"Using the validated S/R zone bounce strategy (fixed 2:1 fallback R:R, nearest-zone target).")
@@ -359,6 +377,19 @@ def main():
           f"see support_resistance_zone_bounce_dukascopy_backtest.py's cost-sensitivity check - so real "
           f"costs would meaningfully change this pass rate, not just round it). Treat this as a rough "
           f"real-world estimate, not exact.")
+
+    sim = _load_prop_firm_simulator()
+    sweep_results = sim.risk_sweep(
+        all_trades, initial_balance=INITIAL_BALANCE, profit_target_pct=PROFIT_TARGET_PCT,
+        max_daily_loss_pct=MAX_DAILY_LOSS_PCT, max_overall_loss_pct=MAX_OVERALL_LOSS_PCT,
+        min_trading_days=MIN_TRADING_DAYS, drawdown_mode=DRAWDOWN_MODE,
+    )
+    sim.print_risk_sweep_table(sweep_results,
+                                header="RISK-PER-TRADE SWEEP - S/R zone bounce (strongest raw result)")
+
+    streak_results = sim.losing_streak_probabilities([t["r"] for t in all_trades])
+    sim.print_losing_streak_table(streak_results,
+                                   header="LOSING-STREAK PROBABILITY - S/R zone bounce (sizing-independent)")
 
 
 if __name__ == "__main__":

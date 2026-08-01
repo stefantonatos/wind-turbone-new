@@ -20,6 +20,7 @@
 # !pip install --upgrade dukascopy-python -q   # uncomment this line in Colab
 
 import datetime
+import os
 import random as _random
 
 import numpy as np
@@ -320,6 +321,23 @@ def monte_carlo_pass_rate(trades, n_simulations=N_MONTE_CARLO_RUNS, **challenge_
     return results
 
 
+def _load_prop_firm_simulator():
+    """The risk-per-trade sweep and losing-streak-probability diagnostic live in
+    prop_firm_challenge_simulator.py (the generic script) since that logic is
+    strategy-agnostic - it only needs a list of real R-multiples, not this script's
+    ORB-specific backtest machinery. Loaded via spec_from_file_location (same pattern
+    already used elsewhere in this project, e.g. day_trading_rauf_dukascopy_
+    optimization.py importing day_trading_rauf_dukascopy_backtest.py) rather than a
+    package import, since this directory has no __init__.py and these scripts are
+    designed to also run standalone in Colab."""
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prop_firm_challenge_simulator.py")
+    spec = importlib.util.spec_from_file_location("prop_firm_challenge_simulator", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def main():
     print(f"Using the validated combo: RANGE_MINUTES={RANGE_MINUTES}, REWARD_RISK={REWARD_RISK}, filters on.")
     print(f"This pulls {len(INDICES)} indices over ~9 years - expect roughly 5-10 minutes.\n")
@@ -384,6 +402,18 @@ def main():
 
     print(f"\nCAVEAT: daily drawdown checked at trade-close granularity, not tick-by-tick floating equity. "
           f"No commission/spread/slippage modeled. Treat this as a rough real-world estimate, not exact.")
+
+    sim = _load_prop_firm_simulator()
+    sweep_results = sim.risk_sweep(
+        all_trades, initial_balance=INITIAL_BALANCE, profit_target_pct=PROFIT_TARGET_PCT,
+        max_daily_loss_pct=MAX_DAILY_LOSS_PCT, max_overall_loss_pct=MAX_OVERALL_LOSS_PCT,
+        min_trading_days=MIN_TRADING_DAYS, drawdown_mode=DRAWDOWN_MODE,
+    )
+    sim.print_risk_sweep_table(sweep_results, header="RISK-PER-TRADE SWEEP - ORB indices (validated strategy)")
+
+    streak_results = sim.losing_streak_probabilities([t["r"] for t in all_trades])
+    sim.print_losing_streak_table(streak_results,
+                                   header="LOSING-STREAK PROBABILITY - ORB indices (sizing-independent)")
 
 
 if __name__ == "__main__":
