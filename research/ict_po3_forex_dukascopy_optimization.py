@@ -50,6 +50,16 @@
 #      walk-forward analysis, not a proof of anything either way - printed
 #      explicitly as a caveat, not asserted as ground truth.
 #
+# SEARCH_METHOD / OBJECTIVE (research/optimization_engine.py): step 1's grid search and step 4's
+# per-fold in-sample search now dispatch through a shared, strategy-agnostic search engine that
+# also offers Bayesian (Optuna/TPE) and genetic search as alternatives to exhaustive grid search,
+# and a selectable objective (total R, avg R/trade, a trade-based Sharpe-like ratio, Calmar, win
+# rate) instead of always picking the winner by raw total R. SEARCH_METHOD="grid" and
+# OBJECTIVE="total_r" remain this script's defaults, and DELIBERATELY so: this script's parameter
+# space is only 20 combos, where exhaustive grid search is the better choice, not a fallback - see
+# optimization_engine.py's own header for the full reasoning on when the alternatives actually earn
+# their keep (they don't, here, today).
+#
 # WINDOWING CONVENTION (follows orb_indices_optimization_and_ml.py's
 # split_before/split_after pattern, generalized to a window_start/
 # window_end pair so rolling folds - not just one fixed split point - are
@@ -63,17 +73,28 @@
 # (there is no cross-day carryover in this strategy to break). See the
 # window-slicing unit tests below for a direct verification of this.
 
-# !pip install --upgrade dukascopy-python scikit-learn matplotlib -q   # uncomment in Colab
+# !pip install --upgrade dukascopy-python scikit-learn matplotlib optuna -q   # uncomment in Colab
+# (optuna is only needed for SEARCH_METHOD="bayesian" below - see optimization_engine.py's header
+# for why it's an optional dependency handled with a graceful skip, same pattern as sklearn/matplotlib)
 
 import datetime
 import logging
 import os
 import pickle
+import sys
 
 import numpy as np
 import pandas as pd
 import dukascopy_python
 from dukascopy_python import instruments as dki
+
+# research/optimization_engine.py is a sibling module in this same directory, not a package -
+# this sys.path insert makes `import optimization_engine` resolve correctly regardless of HOW
+# this file is loaded (run directly, run via `python research/....py`, or loaded by
+# importlib.util.spec_from_file_location the way test_ict_po3_forex_dukascopy_optimization.py
+# loads this module) rather than depending on the caller's own sys.path/cwd.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import optimization_engine as opt_engine
 
 from tqdm.auto import tqdm   # auto-picks the Colab/Jupyter widget bar when available, a plain terminal bar otherwise
 
@@ -132,6 +153,26 @@ MIN_RANGE_PCT = 0.02   # fixed floor on accumulation-range-derived stop distance
 # --- step 1/2/3/4 grid: the two parameters that actually matter for PO3's payout structure ---
 STOP_BUFFER_PCT_GRID = [0.01, 0.02, 0.05, 0.1]
 FALLBACK_REWARD_RISK_GRID = [1.0, 1.5, 2.0, 2.5, 3.0]
+
+# --- search strategy + objective config (research/optimization_engine.py) ---
+# SEARCH_METHOD: "grid" (exhaustive, default), "bayesian" (Optuna/TPE), or "genetic" (hand-rolled
+# GA). DEFAULT IS "grid" DELIBERATELY, NOT AS A PLACEHOLDER: this script's parameter space is only
+# 4x5=20 combos - at that size exhaustive grid search is not just adequate, it is the BETTER
+# choice (deterministic, no cell left unexplored, no sampling noise to explain away). Bayesian and
+# genetic search are offered here for when this project's parameter spaces grow past what
+# exhaustive search can comfortably cover (3+ parameters, or much wider candidate lists) - not
+# because they beat grid search on today's 20-cell grid. See optimization_engine.py's header for
+# the full reasoning. Changing this to "bayesian"/"genetic" changes STEP 1 and STEP 4's per-fold
+# in-sample search below; STEP 3's neighbor-plateau check requires the full grid and is skipped
+# (with a clear message) under either non-grid method - see print_cluster_analysis().
+SEARCH_METHOD = "grid"
+# OBJECTIVE: which of optimization_engine.OBJECTIVES the search maximizes by. DEFAULT IS
+# "total_r" DELIBERATELY - this is the exact selection rule this script already used before this
+# refactor existed (every already-shipped, already-verified number this script has ever produced
+# picked its "best" cell by raw total R), so leaving this at "total_r" with SEARCH_METHOD="grid"
+# reproduces that behavior exactly, not a new default. See optimization_engine.py's OBJECTIVES
+# registry for the other options (avg_r, sharpe, calmar, win_rate) and their caveats.
+OBJECTIVE = "total_r"
 
 MC_ITERATIONS = 2000   # per cell, per method (bootstrap and shuffle)
 
@@ -371,6 +412,104 @@ def run_grid_search(data, window_start=None, window_end=None, grid=None, desc="g
             "per_instrument": per_instrument,
         })
     return results
+
+
+# ==================== SEARCH_METHOD/OBJECTIVE dispatch (research/optimization_engine.py) ====================
+
+def _make_po3_eval_fn(data, window_start=None, window_end=None):
+    """Builds an optimization_engine-compatible eval_fn(params) -> list_of_trade_dicts: runs
+    run_po3_backtest across every instrument in `data`, restricted to [window_start, window_end),
+    tagging each trade with its instrument label (run_po3_backtest itself doesn't tag this -
+    it's added here purely so _search_result_to_grid_cells can rebuild the same per_instrument
+    breakdown run_grid_search's legacy shape already has)."""
+    def eval_fn(params):
+        trades = []
+        for label, ind in data.items():
+            for t in run_po3_backtest(ind, params["stop_buffer_pct"], params["fallback_reward_risk"],
+                                       window_start, window_end):
+                t["instrument"] = label
+                trades.append(t)
+        return trades
+    return eval_fn
+
+
+def _search_result_to_grid_cells(search_result):
+    """Converts an optimization_engine search result's "all" list (list of {"params", "trades",
+    "score"}) into this script's pre-existing grid-cell dict shape (stop_buffer_pct,
+    fallback_reward_risk, total_r, n_trades, avg_r, trades_r, per_instrument - the exact same
+    shape run_grid_search() above already returns) so every downstream consumer
+    (print_grid_table, plot_heatmap, run_monte_carlo_all_cells, cluster analysis) keeps working
+    completely unchanged regardless of which SEARCH_METHOD produced the results. Adds a "score"
+    key too (the configured OBJECTIVE's value for that cell, which equals total_r exactly when
+    OBJECTIVE="total_r")."""
+    cells = []
+    for entry in search_result["all"]:
+        params, trades = entry["params"], entry["trades"]
+        all_r = [t["r"] for t in trades]
+        n = len(all_r)
+        total_r_sum = sum(all_r)
+        per_instrument = {}
+        for t in trades:
+            per_instrument.setdefault(t.get("instrument", "?"), []).append(t["r"])
+        cells.append({
+            "stop_buffer_pct": params["stop_buffer_pct"],
+            "fallback_reward_risk": params["fallback_reward_risk"],
+            "total_r": total_r_sum,
+            "n_trades": n,
+            "avg_r": total_r_sum / n if n else 0.0,
+            "trades_r": all_r,
+            "per_instrument": per_instrument,
+            "score": entry["score"],
+        })
+    return cells
+
+
+def _find_cell(grid_results, params):
+    for c in grid_results:
+        if c["stop_buffer_pct"] == params["stop_buffer_pct"] and c["fallback_reward_risk"] == params["fallback_reward_risk"]:
+            return c
+    return None
+
+
+def run_param_search(data, window_start=None, window_end=None, grid=None, method=None, objective=None,
+                      desc="param search", **search_kwargs):
+    """Dispatches the parameter search (STEP 1's full-range pass, and STEP 4's per-fold
+    in-sample pass) to whichever SEARCH_METHOD is configured (module-level SEARCH_METHOD/
+    OBJECTIVE globals by default, overridable via the method/objective kwargs), via
+    optimization_engine.run_search(), then converts the result back into this script's
+    pre-existing grid-cell dict shape so every existing downstream consumer is unaffected.
+
+    With method="grid" and objective="total_r" (this script's defaults) this reproduces
+    run_grid_search()'s exact combos, evaluation order, and per-cell numbers - see
+    test_ict_po3_forex_dukascopy_optimization.py's TestSearchEngineRetrofit regression test for a
+    direct, assertion-based comparison against the OLD hand-written grid loop.
+
+    Returns (grid_results, search_result): grid_results in the legacy shape described above,
+    and the raw optimization_engine result dict (has "n_evals"/"best"/"method", useful for
+    reporting how many combos an alternative search method actually evaluated)."""
+    method = method if method is not None else SEARCH_METHOD
+    objective = objective if objective is not None else OBJECTIVE
+
+    if grid is None:
+        sb_grid, frr_grid = list(STOP_BUFFER_PCT_GRID), list(FALLBACK_REWARD_RISK_GRID)
+    else:
+        sb_grid = sorted({sb for sb, _ in grid})
+        frr_grid = sorted({frr for _, frr in grid})
+    param_grid = {"stop_buffer_pct": sb_grid, "fallback_reward_risk": frr_grid}
+
+    objective_fn = opt_engine.get_objective(objective)
+    if window_start is not None and window_end is not None:
+        years = (window_end - window_start).days / 365.0
+    elif window_start is None and window_end is None:
+        years = (FETCH_END - FETCH_START).days / 365.0
+    else:
+        years = None   # a one-sided window has no well-defined span - sharpe will degrade to its sentinel
+
+    eval_fn = _make_po3_eval_fn(data, window_start, window_end)
+    search_result = opt_engine.run_search(method, param_grid, eval_fn, objective_fn, years=years,
+                                           **search_kwargs)
+    grid_results = _search_result_to_grid_cells(search_result)
+    return grid_results, search_result
 
 
 def build_grid_matrix(grid_results):
@@ -629,21 +768,48 @@ def sklearn_cluster_analysis(grid_results, sb_grid=None, frr_grid=None, k=3, ran
     }
 
 
-def print_cluster_analysis(grid_results):
+def print_cluster_analysis(grid_results, search_method=None):
+    """search_method defaults to the module-level SEARCH_METHOD global. The always-available
+    neighbor-plateau check looks up each of the best cell's immediate grid NEIGHBORS by position
+    in the full STOP_BUFFER_PCT_GRID x FALLBACK_REWARD_RISK_GRID - that lookup assumes every
+    neighboring combo was actually evaluated, which is only guaranteed under an exhaustive grid
+    search. Bayesian/genetic search evaluate a SAMPLE of the grid, not every cell, so a "neighbor"
+    combo may simply never have been tried - running the same lookup there wouldn't raise (the
+    lookup dict would just be missing keys the real base-script version doesn't guard for), but
+    silently degrading to fewer-than-4 comparisons would mean quietly producing a PLATEAU/SPIKE
+    verdict from a smaller and non-random sample than the check was designed for, without saying
+    so - a materially misleading verdict, not just an incomplete one. So it's skipped outright
+    (with this explicit message) instead, rather than run in a way that could look authoritative
+    but isn't. The sklearn cluster analysis below has NO such requirement - it derives its own
+    axis positions from whatever distinct parameter values are actually PRESENT in grid_results
+    (see sklearn_cluster_analysis's sb_grid/frr_grid defaults), so it stays fully valid - just
+    over however many points were actually evaluated - under any SEARCH_METHOD, and always runs."""
+    search_method = search_method if search_method is not None else SEARCH_METHOD
+
     print("\n" + "-" * 70)
     print("STEP 3: cluster / plateau-vs-spike analysis")
     print("-" * 70)
 
-    neighbor_result = neighbor_plateau_check(grid_results)
-    print(f"\nAlways-available neighbor check (best cell = STOP_BUFFER_PCT="
-          f"{neighbor_result['best_stop_buffer_pct']:.3f}, FALLBACK_REWARD_RISK="
-          f"{neighbor_result['best_fallback_reward_risk']:.1f}, avg R/trade="
-          f"{neighbor_result['best_avg_r']:+.4f}):")
-    print(f"  {neighbor_result['n_decent_neighbors']}/{neighbor_result['n_neighbors']} immediate neighbors "
-          f"are 'decent' (same sign, at least half the peak's magnitude) -> {neighbor_result['verdict']}")
+    neighbor_result = None
+    if search_method == "grid":
+        neighbor_result = neighbor_plateau_check(grid_results)
+        print(f"\nAlways-available neighbor check (best cell = STOP_BUFFER_PCT="
+              f"{neighbor_result['best_stop_buffer_pct']:.3f}, FALLBACK_REWARD_RISK="
+              f"{neighbor_result['best_fallback_reward_risk']:.1f}, avg R/trade="
+              f"{neighbor_result['best_avg_r']:+.4f}):")
+        print(f"  {neighbor_result['n_decent_neighbors']}/{neighbor_result['n_neighbors']} immediate neighbors "
+              f"are 'decent' (same sign, at least half the peak's magnitude) -> {neighbor_result['verdict']}")
+    else:
+        print(f"\nNeighbor-plateau check: SKIPPED - requires the full grid, not available under "
+              f"SEARCH_METHOD={search_method!r} (only a sample of the grid was evaluated, so an "
+              f"immediate-neighbor combo may never have been tried; see this function's docstring).")
 
     cluster_result = sklearn_cluster_analysis(grid_results)
     if cluster_result is not None:
+        if search_method != "grid":
+            print(f"\nNOTE: cluster analysis below is over the {len(grid_results)} points "
+                  f"SEARCH_METHOD={search_method!r} actually evaluated, not the full grid - axis "
+                  f"positions are relative to those observed points only.")
         print(f"\nsklearn KMeans (k=3) cluster containing the best-in-sample cell: "
               f"{cluster_result['cluster_size']} of {len(grid_results)} cells")
         print(f"  cluster avg R/trade: min={cluster_result['cluster_min_avg_r']:+.4f}  "
@@ -684,10 +850,20 @@ def generate_walk_forward_folds(fetch_start_year, fetch_end_year,
     return folds
 
 
-def run_walk_forward(data, folds, grid=None):
-    """For each fold: re-run the full grid search restricted to the fold's in-sample window,
-    pick the best combo by in-sample total R, apply that exact combo to the immediately-
-    following out-of-sample window. Chains all folds' OOS trades together."""
+def run_walk_forward(data, folds, grid=None, method=None, objective=None):
+    """For each fold: re-run the in-sample parameter search (via run_param_search, dispatching to
+    whichever SEARCH_METHOD is configured - module-level default unless overridden by `method`
+    here) restricted to the fold's in-sample window, pick the best combo by whichever OBJECTIVE is
+    configured (module-level default unless overridden by `objective` here), apply that exact
+    combo to the immediately-following out-of-sample window. Chains all folds' OOS trades
+    together.
+
+    DEFAULTS REPRODUCE THE ORIGINAL BEHAVIOR EXACTLY: method=None/objective=None resolve to the
+    module-level SEARCH_METHOD="grid"/OBJECTIVE="total_r" globals, i.e. the exact same exhaustive
+    grid search + raw-total-R selection this function used before this refactor - this function's
+    call signature and default numeric behavior are unchanged; see
+    test_ict_po3_forex_dukascopy_optimization.py's existing TestSmokeEndToEnd, which calls this
+    with no method/objective override and must still pass unmodified."""
     fold_results = []
     combined_oos_r = []
 
@@ -695,9 +871,10 @@ def run_walk_forward(data, folds, grid=None):
         is_start, is_end = fold["is_start"], fold["is_end"]
         oos_start, oos_end = fold["oos_start"], fold["oos_end"]
 
-        is_grid = run_grid_search(data, window_start=is_start, window_end=is_end, grid=grid,
-                                   desc=f"fold {fold_idx} in-sample grid")
-        best = max(is_grid, key=lambda r: r["total_r"])
+        is_grid, is_search_result = run_param_search(
+            data, window_start=is_start, window_end=is_end, grid=grid, method=method, objective=objective,
+            desc=f"fold {fold_idx} in-sample search")
+        best = _find_cell(is_grid, is_search_result["best"]["params"])
 
         oos_all_r = []
         for label, ind in data.items():
@@ -804,18 +981,29 @@ def main():
         print("No data downloaded - check output above.")
         return
 
-    # ---------------- STEP 1: parameter grid (full 2016-2025, all instruments) ----------------
+    # ---------------- STEP 1: parameter search (full 2016-2025, all instruments) ----------------
     print("\n" + "=" * 70)
-    print("STEP 1: parameter stability grid - full 2016-2025 range, all instruments per cell")
+    print(f"STEP 1: parameter search (SEARCH_METHOD={SEARCH_METHOD!r}, OBJECTIVE={OBJECTIVE!r}) - "
+          f"full 2016-2025 range, all instruments per combo")
     print("=" * 70)
-    grid_results = run_grid_search(data, desc="step 1 full-range grid")
+    if OBJECTIVE == "win_rate":
+        print("\nCAVEAT (OBJECTIVE=win_rate): optimizing for win rate alone ignores payout size and is a "
+              "known trap in this exact project - see optimization_engine.py's win_rate() docstring. This "
+              "run is selecting the combo with the highest win rate, which is not necessarily the most "
+              "profitable one; total_r/avg_r for the SAME combo are also printed below so this can be "
+              "cross-checked, not taken on faith.")
+    grid_results, step1_search_result = run_param_search(data, desc="step 1 full-range search")
+    if SEARCH_METHOD != "grid":
+        n_possible = len(STOP_BUFFER_PCT_GRID) * len(FALLBACK_REWARD_RISK_GRID)
+        print(f"\n{SEARCH_METHOD} search evaluated {step1_search_result['n_evals']} of {n_possible} possible "
+              f"combos this run (vs grid_search's exhaustive {n_possible}).")
     print_grid_table(grid_results)
     try:
         plot_heatmap(grid_results)
     except ImportError:
         print("\nmatplotlib not installed - skipping heatmap plot (text table above is the fallback).")
 
-    best_cell = max(grid_results, key=lambda r: r["total_r"])
+    best_cell = _find_cell(grid_results, step1_search_result["best"]["params"])
     worst_cell = min(grid_results, key=lambda r: r["total_r"])
     spread = best_cell["avg_r"] - worst_cell["avg_r"]
     print(f"\nBest cell:  STOP_BUFFER_PCT={best_cell['stop_buffer_pct']:.3f}  "
@@ -836,13 +1024,41 @@ def main():
     print_monte_carlo_table(mc_results)
 
     # ---------------- STEP 3: cluster analysis ----------------
-    neighbor_result, cluster_result = print_cluster_analysis(grid_results)
+    neighbor_result, cluster_result = print_cluster_analysis(grid_results, search_method=SEARCH_METHOD)
 
     # ---------------- STEP 4: rolling walk-forward ----------------
     folds = generate_walk_forward_folds(FETCH_START.year, FETCH_END.year)
     fold_results, combined_oos_r = run_walk_forward(data, folds)
     wfe_stats = compute_walk_forward_efficiency(fold_results, combined_oos_r)
     print_walk_forward(fold_results, wfe_stats)
+
+    # ---------------- corrected z-score + multiple-testing (Bonferroni) check ----------------
+    # See optimization_engine.zscore()'s docstring: this is a CORRECTED replacement for the
+    # `avg_r * sqrt(n)` shortcut used in ict_po3_forex_dukascopy_backtest.py's header-quoted
+    # single-fixed-parameter result (that shortcut implicitly assumes std(r) == 1, which inflates
+    # every z-score computed with it) - this run's best cell gets the corrected version, plus an
+    # honest Bonferroni-adjusted bar reflecting how many combos were actually tested this run
+    # (multiple-testing correction; see bonferroni_adjusted_z_threshold's docstring for why the
+    # naive |z| > 1.96 rule of thumb alone is not a fair bar once more than one combo is tested
+    # against the same data).
+    print("\n" + "-" * 70)
+    print("CORRECTED SIGNIFICANCE CHECK: best-cell z-score + Bonferroni-adjusted bar")
+    print("-" * 70)
+    best_cell_trades = [{"r": r} for r in best_cell["trades_r"]]
+    best_z = opt_engine.zscore(best_cell_trades)
+    n_trials_this_run = step1_search_result["n_evals"]
+    z_bar = opt_engine.bonferroni_adjusted_z_threshold(n_trials_this_run)
+    clears_adjusted = abs(best_z) >= z_bar
+    print(f"Best cell (STOP_BUFFER_PCT={best_cell['stop_buffer_pct']:.3f}, "
+          f"FALLBACK_REWARD_RISK={best_cell['fallback_reward_risk']:.1f}) corrected z-score: {best_z:+.2f} "
+          f"(sample-std-based, not the old avg_r*sqrt(n) shortcut)")
+    print(f"Combos tested this run: {n_trials_this_run} -> Bonferroni-adjusted |z| bar = {z_bar:.2f} "
+          f"(vs the naive single-test 1.96 rule of thumb)")
+    print(f"-> {'CLEARS' if clears_adjusted else 'does NOT clear'} the multiple-testing-adjusted bar "
+          f"({'|z|={:.2f} >= {:.2f}'.format(abs(best_z), z_bar) if clears_adjusted else '|z|={:.2f} < {:.2f}'.format(abs(best_z), z_bar)})")
+    print("CAVEAT: this correction is for THIS SCRIPT's own combos-per-run only - a fully project-wide "
+          "correction would need a running total across every strategy script's every run, which this "
+          "print deliberately does not claim to be.")
 
     # ---------------- final honest verdict (computed, not asserted in advance) ----------------
     print("\n" + "=" * 70)
@@ -858,7 +1074,7 @@ def main():
               "still negative everywhere. No corner of this parameter space rescues PO3; the base "
               "script's decisively negative result holds up here too, not because a flattering cell "
               "wasn't found, but because there isn't one.")
-    elif best_cell_positive and neighbor_result["verdict"] == "ISOLATED SPIKE / overfit warning":
+    elif best_cell_positive and neighbor_result is not None and neighbor_result["verdict"] == "ISOLATED SPIKE / overfit warning":
         print("The best in-sample cell was positive, but it is an ISOLATED SPIKE - its immediate "
               "neighbors are starkly worse or flip sign, which is what overfitting to a lucky parameter "
               "combination looks like. Combined with the out-of-sample check below, treat any positive "
@@ -884,6 +1100,10 @@ def main():
           "Every grid cell, Monte Carlo band, cluster label, and walk-forward fold above used the exact "
           "same entry/exit rules as ict_po3_forex_dukascopy_backtest.py - only STOP_BUFFER_PCT and "
           "FALLBACK_REWARD_RISK were varied.")
+    print(f"\nMultiple-testing note: the best cell's corrected z-score ({best_z:+.2f}) "
+          f"{'DID' if clears_adjusted else 'did NOT'} clear the Bonferroni-adjusted |z| bar ({z_bar:.2f}) "
+          f"for the {n_trials_this_run} combos tested this run - weight the verdict above accordingly, "
+          "not against the naive 1.96 rule of thumb alone.")
 
 
 if __name__ == "__main__":

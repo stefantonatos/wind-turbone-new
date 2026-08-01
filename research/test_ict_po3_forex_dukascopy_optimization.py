@@ -317,5 +317,193 @@ class TestSmokeEndToEnd(unittest.TestCase):
         print(f"[smoke test] WFE stats: {wfe_stats}")
 
 
+# ============================= NEW: optimization_engine retrofit (SEARCH_METHOD/OBJECTIVE) =============================
+#
+# Everything above this line is UNMODIFIED from before the optimization_engine retrofit - it must
+# keep passing exactly as-is (see pytest output: same test count, same names, all green) as direct
+# proof this refactor didn't change already-verified behavior. Everything below is NEW coverage for
+# the retrofit itself.
+
+def _small_multi_year_data(start_year=2016, end_year_exclusive=2019, label="SYN"):
+    """Same synthetic-data shape as TestSmokeEndToEnd._build_multi_year_synthetic_data above,
+    factored out to a module-level helper so the new tests below can reuse it without duplicating
+    TestSmokeEndToEnd's internals or depending on that class."""
+    dates = pd.bdate_range(datetime.date(start_year, 1, 1),
+                            datetime.date(end_year_exclusive, 1, 1), inclusive="left")
+    overrides = {}
+    for i, ts in enumerate(dates):
+        d = ts.date()
+        if i % 2 == 0:
+            overrides[d] = {"05:00": _manipulation_break_high(),
+                             "05:05": (1.0990, 1.1000, 1.0980, 1.0985)}   # TP path
+        else:
+            overrides[d] = {"05:00": _manipulation_break_high(),
+                             "05:05": (1.1030, 1.1040, 1.1020, 1.1035)}   # SL path
+    df = _build_synthetic_df([ts.date() for ts in dates], overrides=overrides)
+    return {label: opt.precompute_indicators(df)}
+
+
+class TestSearchEngineRetrofit(unittest.TestCase):
+    """New tests for the optimization_engine retrofit: SEARCH_METHOD/OBJECTIVE options end-to-end
+    on this file's existing synthetic smoke-test data shape, plus a direct regression check that
+    the new engine-dispatched search reproduces the OLD hand-written run_grid_search's numbers
+    exactly under default settings (method="grid", objective="total_r")."""
+
+    def test_run_param_search_grid_default_matches_old_run_grid_search_exactly(self):
+        """REGRESSION TEST: run_param_search's default (SEARCH_METHOD="grid", OBJECTIVE="total_r")
+        must reproduce the OLD hand-written run_grid_search's exact per-cell numbers and the exact
+        same best combo, on the same synthetic data - proving this refactor did not change default
+        behavior."""
+        data = _small_multi_year_data()
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+
+        old_results = opt.run_grid_search(data, grid=small_grid, desc="old-style")
+        new_results, search_result = opt.run_param_search(data, grid=small_grid, method="grid",
+                                                            objective="total_r", desc="new-style")
+
+        self.assertEqual(len(old_results), len(new_results))
+        for old, new in zip(old_results, new_results):
+            self.assertEqual(old["stop_buffer_pct"], new["stop_buffer_pct"])
+            self.assertEqual(old["fallback_reward_risk"], new["fallback_reward_risk"])
+            self.assertEqual(old["n_trades"], new["n_trades"])
+            self.assertAlmostEqual(old["total_r"], new["total_r"], places=9)
+            self.assertAlmostEqual(old["avg_r"], new["avg_r"], places=9)
+            self.assertEqual(sorted(old["trades_r"]), sorted(new["trades_r"]))
+
+        old_best = max(old_results, key=lambda r: r["total_r"])
+        new_best_params = search_result["best"]["params"]
+        self.assertEqual(old_best["stop_buffer_pct"], new_best_params["stop_buffer_pct"])
+        self.assertEqual(old_best["fallback_reward_risk"], new_best_params["fallback_reward_risk"])
+        self.assertAlmostEqual(old_best["total_r"], search_result["best"]["score"], places=9)
+
+    def test_search_method_genetic_end_to_end(self):
+        data = _small_multi_year_data()
+        small_grid = [(sb, frr) for sb in [0.01, 0.02, 0.05, 0.1] for frr in [1.0, 1.5, 2.0, 2.5]]
+        grid_results, search_result = opt.run_param_search(
+            data, grid=small_grid, method="genetic", objective="total_r",
+            population_size=4, generations=3, seed=1)
+        self.assertEqual(search_result["method"], "genetic")
+        self.assertGreater(len(grid_results), 0)
+        self.assertIsNotNone(search_result["best"])
+        self.assertLessEqual(search_result["n_evals"], 16)   # <= the full 4x4 grid it's sampling from
+
+    def test_search_method_bayesian_end_to_end_or_falls_back_cleanly(self):
+        data = _small_multi_year_data()
+        small_grid = [(sb, frr) for sb in [0.01, 0.02, 0.05, 0.1] for frr in [1.0, 1.5, 2.0, 2.5]]
+        grid_results, search_result = opt.run_param_search(
+            data, grid=small_grid, method="bayesian", objective="total_r", n_trials=6, seed=1)
+        # either optuna ran (method == "bayesian") or run_search fell back to grid gracefully -
+        # both are acceptable, crash-free outcomes; the important thing is it never raises.
+        self.assertIn(search_result["method"], ("bayesian", "grid"))
+        self.assertGreater(len(grid_results), 0)
+        self.assertIsNotNone(search_result["best"])
+
+    def test_objective_options_all_run_without_crashing(self):
+        data = _small_multi_year_data()
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+        for objective_name in opt.opt_engine.OBJECTIVES:
+            grid_results, search_result = opt.run_param_search(
+                data, grid=small_grid, method="grid", objective=objective_name, desc=objective_name)
+            self.assertEqual(len(grid_results), 4)
+            self.assertIsNotNone(search_result["best"])
+            self.assertFalse(np.isnan(search_result["best"]["score"]))
+
+    def test_win_rate_objective_can_disagree_with_total_r_objective(self):
+        """The whole reason win_rate is offered as a SELECTABLE (not default) objective: it can
+        pick a different "best" cell than total_r would - proving the two are genuinely different
+        selection rules being exercised, not just two names for the same outcome."""
+        data = _small_multi_year_data(2016, 2020)
+        full_grid = [(sb, frr) for sb in opt.STOP_BUFFER_PCT_GRID for frr in opt.FALLBACK_REWARD_RISK_GRID]
+        _, total_r_result = opt.run_param_search(data, grid=full_grid, method="grid", objective="total_r")
+        _, win_rate_result = opt.run_param_search(data, grid=full_grid, method="grid", objective="win_rate")
+        self.assertIsNotNone(total_r_result["best"])
+        self.assertIsNotNone(win_rate_result["best"])
+        # not asserting they always differ (depends on data), just that both ran to a real result
+        # independently and win_rate's score is a valid fraction in [0, 1].
+        self.assertGreaterEqual(win_rate_result["best"]["score"], 0.0)
+        self.assertLessEqual(win_rate_result["best"]["score"], 1.0)
+
+    def test_walk_forward_honors_configured_method_and_objective_override(self):
+        data = _small_multi_year_data(2016, 2021)
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+        folds = opt.generate_walk_forward_folds(2016, 2021)
+        fold_results, combined_oos_r = opt.run_walk_forward(data, folds, grid=small_grid,
+                                                              method="genetic", objective="avg_r")
+        self.assertEqual(len(fold_results), len(folds))
+        for f in fold_results:
+            self.assertIn("best_stop_buffer_pct", f)
+            self.assertIn("best_fallback_reward_risk", f)
+
+    def test_walk_forward_default_still_matches_old_behavior(self):
+        """Defaults (no method/objective override) must still select each fold's winner by raw
+        total R via an exhaustive grid search, exactly as before this refactor."""
+        data = _small_multi_year_data(2016, 2021)
+        small_grid = [(sb, frr) for sb in [0.02, 0.05] for frr in [1.0, 2.0]]
+        folds = opt.generate_walk_forward_folds(2016, 2021)
+
+        fold_results, combined_oos_r = opt.run_walk_forward(data, folds, grid=small_grid)
+
+        for f in fold_results:
+            is_grid = opt.run_grid_search(data, window_start=f["is_start"], window_end=f["is_end"],
+                                           grid=small_grid, desc="check")
+            expected_best = max(is_grid, key=lambda r: r["total_r"])
+            self.assertEqual(f["best_stop_buffer_pct"], expected_best["stop_buffer_pct"])
+            self.assertEqual(f["best_fallback_reward_risk"], expected_best["fallback_reward_risk"])
+            self.assertAlmostEqual(f["is_total_r"], expected_best["total_r"], places=9)
+
+    def test_print_cluster_analysis_skips_neighbor_check_under_non_grid_search(self):
+        data = _small_multi_year_data()
+        small_grid = [(sb, frr) for sb in [0.01, 0.02, 0.05, 0.1] for frr in [1.0, 1.5, 2.0, 2.5]]
+        grid_results, _ = opt.run_param_search(data, grid=small_grid, method="genetic",
+                                                 population_size=4, generations=3, seed=2)
+        neighbor_result, cluster_result = opt.print_cluster_analysis(grid_results, search_method="genetic")
+        self.assertIsNone(neighbor_result)   # explicitly skipped, per print_cluster_analysis's docstring
+
+    def test_print_cluster_analysis_runs_neighbor_check_under_grid_search(self):
+        data = _small_multi_year_data()
+        small_grid = [(sb, frr) for sb in [0.01, 0.02, 0.05, 0.1] for frr in [1.0, 1.5, 2.0, 2.5]]
+        grid_results, _ = opt.run_param_search(data, grid=small_grid, method="grid")
+        neighbor_result, cluster_result = opt.print_cluster_analysis(grid_results, search_method="grid")
+        self.assertIsNotNone(neighbor_result)
+        self.assertIn(neighbor_result["verdict"], ("PLATEAU", "ISOLATED SPIKE / overfit warning"))
+
+    def test_search_method_and_objective_module_defaults_are_grid_and_total_r(self):
+        """The actual behavior-preservation guarantee: unless something explicitly overrides them,
+        this script's own module-level config must still be exactly what shipped before this
+        refactor existed."""
+        self.assertEqual(opt.SEARCH_METHOD, "grid")
+        self.assertEqual(opt.OBJECTIVE, "total_r")
+
+
+class TestCorrectedZScoreAndBonferroni(unittest.TestCase):
+    """Covers this script's use of optimization_engine's CORRECTED z-score (replacing the old
+    avg_r*sqrt(n) shortcut that implicitly assumed std(r) == 1) and the Bonferroni multiple-testing
+    helper - see optimization_engine.py's own test suite for unit-level coverage of
+    zscore()/bonferroni_adjusted_z_threshold() themselves; this just confirms this script actually
+    wires them up correctly against its own real trade-shaped data."""
+
+    def test_zscore_differs_from_old_broken_shortcut_on_real_trade_shaped_data(self):
+        data = _small_multi_year_data(2016, 2020)
+        full_grid = [(sb, frr) for sb in opt.STOP_BUFFER_PCT_GRID for frr in opt.FALLBACK_REWARD_RISK_GRID]
+        grid_results, _ = opt.run_param_search(data, grid=full_grid, method="grid", objective="total_r")
+        best_cell = max(grid_results, key=lambda r: r["total_r"])
+        r = np.array(best_cell["trades_r"])
+        self.assertGreaterEqual(len(r), 2)
+
+        corrected = opt.opt_engine.zscore([{"r": v} for v in r])
+        old_broken = (r.mean()) * np.sqrt(len(r))   # the old avg_r * sqrt(n) shortcut being replaced
+        self.assertFalse(np.isnan(corrected))
+        if r.std(ddof=1) > 0:
+            # the corrected version divides by the REAL sample std, not an implicit std==1 -
+            # whenever that real std isn't ~1, the two numbers must differ.
+            if abs(r.std(ddof=1) - 1.0) > 1e-6:
+                self.assertNotAlmostEqual(corrected, old_broken, places=6)
+
+    def test_bonferroni_threshold_accessible_and_sane_for_this_script_grid_size(self):
+        n_combos = len(opt.STOP_BUFFER_PCT_GRID) * len(opt.FALLBACK_REWARD_RISK_GRID)
+        z_bar = opt.opt_engine.bonferroni_adjusted_z_threshold(n_combos)
+        self.assertGreater(z_bar, 1.959963985)   # strictly above the naive single-test 1.96 bar
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

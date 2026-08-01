@@ -95,6 +95,16 @@
 # reused in-memory for every grid cell and fold (never re-downloaded), which
 # is the main thing keeping this tractable at all.
 #
+# SEARCH_METHOD / OBJECTIVE (research/optimization_engine.py): step 1's grid search and step 4's
+# per-fold in-sample search now dispatch through a shared, strategy-agnostic search engine that
+# also offers Bayesian (Optuna/TPE) and genetic search as alternatives to exhaustive grid search,
+# and a selectable objective (total R, avg R/trade, a trade-based Sharpe-like ratio, Calmar, win
+# rate) instead of always picking the winner by raw total R. SEARCH_METHOD="grid" and
+# OBJECTIVE="total_r" remain this script's defaults, and DELIBERATELY so: this script's parameter
+# space is only 16 combos, where exhaustive grid search is the better choice, not a fallback - see
+# optimization_engine.py's own header for the full reasoning on when the alternatives actually earn
+# their keep (they don't, here, today).
+#
 # TESTING NOTE: per the task's own instruction, the full real 9-year x 4-
 # instrument x 2-range x 16-cell x 6-fold backtest was deliberately NOT run
 # in the sandbox that produced this file (too slow/network-heavy for that
@@ -106,7 +116,9 @@
 # Actually running main() against real Dukascopy data (in Colab or
 # similar) is what produces the real numbers and the FINAL VERDICT line.
 
-# !pip install --upgrade dukascopy-python scikit-learn matplotlib -q   # uncomment in Colab
+# !pip install --upgrade dukascopy-python scikit-learn matplotlib optuna -q   # uncomment in Colab
+# (optuna is only needed for SEARCH_METHOD="bayesian" below - see optimization_engine.py's header
+# for why it's an optional dependency handled with a graceful skip, same pattern as sklearn/matplotlib)
 
 import datetime
 import logging
@@ -124,6 +136,13 @@ try:
 except ImportError:   # only needed for main()'s real fetch - unit tests / smoke test don't need it
     dukascopy_python = None
     dki = None
+
+# research/optimization_engine.py is a sibling module in this same directory, not a package -
+# this sys.path insert makes `import optimization_engine` resolve correctly regardless of HOW
+# this file is loaded (run directly, run via `python research/....py --test`, or loaded by
+# importlib.util.spec_from_file_location the way a test file would load this module).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import optimization_engine as opt_engine
 
 from tqdm.auto import tqdm   # auto-picks the Colab/Jupyter widget bar when available, a plain terminal bar otherwise
 
@@ -167,6 +186,26 @@ CONFIRMATION_CANDLES_GRID = [2, 3, 4, 5]
 # base script's fixed defaults, kept here only as a reference point for the equivalence unit test
 BASE_STOP_BUFFER_PCT = 0.02
 BASE_CONFIRMATION_CANDLES = 3
+
+# --- search strategy + objective config (research/optimization_engine.py) ---
+# SEARCH_METHOD: "grid" (exhaustive, default), "bayesian" (Optuna/TPE), or "genetic" (hand-rolled
+# GA). DEFAULT IS "grid" DELIBERATELY, NOT AS A PLACEHOLDER: this script's parameter space is only
+# 4x4=16 combos - at that size exhaustive grid search is not just adequate, it is the BETTER choice
+# (deterministic, no cell left unexplored, no sampling noise to explain away). Bayesian and genetic
+# search are offered here for when this project's parameter spaces grow past what exhaustive search
+# can comfortably cover (3+ parameters, or much wider candidate lists) - not because they beat grid
+# search on today's 16-cell grid. See optimization_engine.py's header for the full reasoning.
+# Changing this to "bayesian"/"genetic" changes STEP 1 and STEP 4's per-fold in-sample search below;
+# STEP 3's neighbor-plateau check requires the full grid and is skipped (with a clear message)
+# under either non-grid method - see run_full_pipeline()'s STEP 3 section.
+SEARCH_METHOD = "grid"
+# OBJECTIVE: which of optimization_engine.OBJECTIVES the search maximizes by. DEFAULT IS
+# "total_r" DELIBERATELY - this is the exact selection rule this script already used before this
+# refactor existed (every already-shipped, already-verified number this script has ever produced
+# picked its "best" cell by raw total R), so leaving this at "total_r" with SEARCH_METHOD="grid"
+# reproduces that behavior exactly, not a new default. See optimization_engine.py's OBJECTIVES
+# registry for the other options (avg_r, sharpe, calmar, win_rate) and their caveats.
+OBJECTIVE = "total_r"
 
 MC_ITERATIONS = 2000
 MC_SEED = 42
@@ -574,6 +613,97 @@ def neighbor_plateau_check(grid_results, stop_buffer_grid, confirmation_grid, de
     return {"best_cell": best_cell, "neighbors": neighbors, "verdict": verdict}
 
 
+# ==================== SEARCH_METHOD/OBJECTIVE dispatch (research/optimization_engine.py) ====================
+
+def _make_eval_fn(all_arrays, window_start=None, window_end=None):
+    """Builds an optimization_engine-compatible eval_fn(params) -> list_of_trade_dicts: runs
+    backtest_instrument across every instrument in `all_arrays`, restricted to
+    [window_start, window_end), tagging each trade with its instrument label - the exact same
+    tagging run_grid_search() below already does, kept identical here so
+    _search_result_to_grid_cells can rebuild the same cell shape run_grid_search's output has."""
+    def eval_fn(params):
+        trades = []
+        for label, arrays in all_arrays.items():
+            cell_trades = backtest_instrument(arrays, params["stop_buffer_pct"], params["confirmation_candles"],
+                                               window_start=window_start, window_end=window_end)
+            for t in cell_trades:
+                t["instrument"] = label
+            trades.extend(cell_trades)
+        return trades
+    return eval_fn
+
+
+def _search_result_to_grid_cells(search_result):
+    """Converts an optimization_engine search result's "all" list (list of {"params", "trades",
+    "score"}) into this script's pre-existing grid-cell dict shape (stop_buffer_pct,
+    confirmation_candles, trades, r_values, total_r, n_trades, avg_r - the exact same shape
+    run_grid_search() below already returns) so every downstream consumer (print_grid_text_table,
+    plot_heatmap, run_cluster_analysis, neighbor_plateau_check, the Monte Carlo loop in
+    run_full_pipeline) keeps working completely unchanged regardless of which SEARCH_METHOD
+    produced the results. Adds a "score" key too (the configured OBJECTIVE's value for that cell,
+    which equals total_r exactly when OBJECTIVE="total_r")."""
+    cells = []
+    for entry in search_result["all"]:
+        params, trades = entry["params"], entry["trades"]
+        r_values = [t["r"] for t in trades]
+        total_r = sum(r_values)
+        n_trades = len(r_values)
+        cells.append({
+            "stop_buffer_pct": params["stop_buffer_pct"],
+            "confirmation_candles": params["confirmation_candles"],
+            "trades": trades,
+            "r_values": r_values,
+            "total_r": total_r,
+            "n_trades": n_trades,
+            "avg_r": (total_r / n_trades) if n_trades else 0.0,
+            "score": entry["score"],
+        })
+    return cells
+
+
+def _find_cell(grid_results, params):
+    for c in grid_results:
+        if c["stop_buffer_pct"] == params["stop_buffer_pct"] and c["confirmation_candles"] == params["confirmation_candles"]:
+            return c
+    return None
+
+
+def run_param_search(all_arrays, stop_buffer_grid, confirmation_grid, window_start=None, window_end=None,
+                      method=None, objective=None, years=None, desc="param search", show_progress=False,
+                      **search_kwargs):
+    """Dispatches the parameter search (STEP 1's full-range pass, and STEP 4's per-fold in-sample
+    pass) to whichever SEARCH_METHOD is configured (module-level SEARCH_METHOD/OBJECTIVE globals
+    by default, overridable via the method/objective kwargs), via optimization_engine.run_search(),
+    then converts the result back into this script's pre-existing grid-cell dict shape so every
+    existing downstream consumer is unaffected.
+
+    With method="grid" and objective="total_r" (this script's defaults) this reproduces
+    run_grid_search()'s exact combos, evaluation order, and per-cell numbers - see
+    TestSearchEngineRetrofit's regression test (below, in this same file's --test suite) for a
+    direct, assertion-based comparison against the OLD hand-written grid loop.
+
+    Returns (grid_results, search_result): grid_results in the legacy shape described above, and
+    the raw optimization_engine result dict (has "n_evals"/"best"/"method")."""
+    method = method if method is not None else SEARCH_METHOD
+    objective = objective if objective is not None else OBJECTIVE
+    param_grid = {"stop_buffer_pct": list(stop_buffer_grid), "confirmation_candles": list(confirmation_grid)}
+    objective_fn = opt_engine.get_objective(objective)
+
+    if years is None:
+        if window_start is not None and window_end is not None:
+            years = (window_end - window_start).days / 365.0
+        elif window_start is None and window_end is None:
+            years = (FETCH_END - FETCH_START).days / 365.0
+        # else: a one-sided window has no well-defined span - years stays None (sharpe will
+        # degrade to its documented sentinel rather than crash or guess at a span)
+
+    eval_fn = _make_eval_fn(all_arrays, window_start, window_end)
+    search_result = opt_engine.run_search(method, param_grid, eval_fn, objective_fn, years=years,
+                                           **search_kwargs)
+    grid_results = _search_result_to_grid_cells(search_result)
+    return grid_results, search_result
+
+
 # ============================= STEP 1: grid search + heatmap =============================
 
 def run_grid_search(all_arrays, stop_buffer_grid, confirmation_grid, window_start=None, window_end=None,
@@ -662,7 +792,14 @@ def plot_heatmap(grid_results, stop_buffer_grid, confirmation_grid, png_path=HEA
 
 # ============================= STEP 4 (continued): walk-forward orchestration =============================
 
-def run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_start, fetch_end, show_progress=True):
+def run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_start, fetch_end, show_progress=True,
+                      method=None, objective=None):
+    """method/objective default to the module-level SEARCH_METHOD/OBJECTIVE globals (None resolves
+    to them inside run_param_search) - i.e. by default this reproduces the exact original behavior
+    (exhaustive grid search, raw-total-R fold-winner selection) this function used before this
+    refactor; this function's call signature and default numeric behavior are unchanged. See
+    TestSearchEngineRetrofit.test_walk_forward_default_still_matches_old_behavior for the direct
+    regression check."""
     folds = list(walk_forward_folds(fetch_start, fetch_end))
     fold_rows = []
     combined_oos_trades = []
@@ -670,9 +807,10 @@ def run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_star
 
     fold_iter = tqdm(folds, desc="Walk-forward folds", unit="fold") if show_progress else folds
     for is_start, is_end, oos_start, oos_end in fold_iter:
-        is_grid = run_grid_search(all_arrays, stop_buffer_grid, confirmation_grid,
-                                   window_start=is_start, window_end=is_end, show_progress=False)
-        best = max(is_grid, key=lambda c: c["total_r"])
+        is_grid, is_search_result = run_param_search(
+            all_arrays, stop_buffer_grid, confirmation_grid, window_start=is_start, window_end=is_end,
+            method=method, objective=objective, desc="fold in-sample search")
+        best = _find_cell(is_grid, is_search_result["best"]["params"])
 
         oos_trades = []
         for label, arrays in all_arrays.items():
@@ -720,21 +858,45 @@ def run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_star
 # ============================= orchestration used by both main() and the smoke test =============================
 
 def run_full_pipeline(all_arrays, stop_buffer_grid, confirmation_grid, fetch_start, fetch_end,
-                       mc_iterations=MC_ITERATIONS, make_plots=True, show_progress=True, verbose=True):
+                       mc_iterations=MC_ITERATIONS, make_plots=True, show_progress=True, verbose=True,
+                       method=None, objective=None):
     """Runs all 4 steps against whatever data/grid/date-range it's given - used both by main()
     (real data, full grid, full 2016-2025 range) and by run_smoke_test() (small synthetic data,
-    small grid, a shrunk date range) so the two paths can never silently diverge in logic."""
+    small grid, a shrunk date range) so the two paths can never silently diverge in logic.
+
+    method/objective default to the module-level SEARCH_METHOD/OBJECTIVE globals (None resolves
+    to them) - this function's default call signature and default numeric behavior are UNCHANGED
+    from before the optimization_engine retrofit: with the defaults, STEP 1 and STEP 4 still run
+    an exhaustive grid search and select each winner by raw total R, exactly as before. See
+    TestSmoke.test_full_pipeline_end_to_end_on_synthetic_data (unchanged, still passing) and
+    TestSearchEngineRetrofit's new regression test for a direct comparison against the OLD
+    hand-written grid loop."""
+    resolved_method = method if method is not None else SEARCH_METHOD
     results = {}
 
     # ---- STEP 1 ----
     if verbose:
         print("\n" + "=" * 70)
-        print(f"STEP 1: {len(stop_buffer_grid)}x{len(confirmation_grid)} parameter grid, full "
+        print(f"STEP 1: {len(stop_buffer_grid)}x{len(confirmation_grid)} parameter search "
+              f"(SEARCH_METHOD={resolved_method!r}, OBJECTIVE={(objective if objective is not None else OBJECTIVE)!r}), full "
               f"{fetch_start.date() if hasattr(fetch_start,'date') else fetch_start} to "
               f"{fetch_end.date() if hasattr(fetch_end,'date') else fetch_end}")
         print("=" * 70)
-    grid_results = run_grid_search(all_arrays, stop_buffer_grid, confirmation_grid, show_progress=show_progress)
+        if (objective if objective is not None else OBJECTIVE) == "win_rate":
+            print("CAVEAT (OBJECTIVE=win_rate): optimizing for win rate alone ignores payout size and is a "
+                  "known trap in THIS exact project - the Day Trading Rauf base backtest has a real 51.6% "
+                  "win rate and is still net-negative because losers outsize winners. See "
+                  "optimization_engine.py's win_rate() docstring. total_r/avg_r for the same selected combo "
+                  "are also printed below so this can be cross-checked, not taken on faith.")
+    grid_results, step1_search_result = run_param_search(
+        all_arrays, stop_buffer_grid, confirmation_grid, method=method, objective=objective,
+        show_progress=show_progress, desc="STEP 1 search")
     results["grid_results"] = grid_results
+    results["step1_search_result"] = step1_search_result
+    if verbose and resolved_method != "grid":
+        n_possible = len(stop_buffer_grid) * len(confirmation_grid)
+        print(f"\n{resolved_method} search evaluated {step1_search_result['n_evals']} of {n_possible} "
+              f"possible combos this run (vs grid_search's exhaustive {n_possible}).")
 
     if verbose:
         for cell in grid_results:
@@ -776,6 +938,24 @@ def run_full_pipeline(all_arrays, stop_buffer_grid, confirmation_grid, fetch_sta
     results["mc_results"] = mc_results
 
     # ---- STEP 3 ----
+    # Cluster analysis is grid-agnostic: build_cluster_features() looks up each evaluated cell's
+    # axis POSITION in the static stop_buffer_grid/confirmation_grid candidate lists (an .index()
+    # call), which is well-defined for any cell that was evaluated at all, exhaustively or not -
+    # so it always runs, over however many points were actually evaluated this run.
+    #
+    # The neighbor-plateau check is NOT grid-agnostic in the same way: it looks up each of the
+    # best cell's immediate NEIGHBORS by (stop_buffer_pct, confirmation_candles) position, and
+    # under a non-exhaustive search (bayesian/genetic) a neighboring combo may simply never have
+    # been evaluated. neighbor_plateau_check() itself tolerates this without crashing (missing
+    # neighbors are skipped via a .get()/None-check, degrading to "ISOLATED SPIKE / overfit
+    # warning (no in-grid neighbors to compare - degenerate grid)" if none were found at all) -
+    # but silently comparing against however-many-of-4 non-random neighbors happened to be
+    # sampled, and potentially defaulting to a spike-warning purely because of under-sampling
+    # rather than a real spike, is still a materially weaker and potentially misleading signal
+    # than the full 4-neighbor check the PLATEAU/SPIKE verdict implies. So, for the same reasoning
+    # (and for consistency with ict_po3_forex_dukascopy_optimization.py's identical choice), this
+    # check is SKIPPED outright under a non-grid SEARCH_METHOD, with an explicit message, rather
+    # than run in a way that could look authoritative but isn't.
     if verbose:
         print("\n" + "=" * 70)
         print("STEP 3: cluster analysis + neighbor-plateau check")
@@ -783,21 +963,31 @@ def run_full_pipeline(all_arrays, stop_buffer_grid, confirmation_grid, fetch_sta
     cluster_result = run_cluster_analysis(grid_results, stop_buffer_grid, confirmation_grid)
     results["cluster_result"] = cluster_result
     if verbose and cluster_result is not None:
+        if resolved_method != "grid":
+            print(f"  NOTE: cluster analysis below is over the {len(grid_results)} points "
+                  f"SEARCH_METHOD={resolved_method!r} actually evaluated, not the full grid.")
         print(f"  Best-in-sample cell's cluster: label={cluster_result['best_cluster_label']}, "
               f"size={cluster_result['best_cluster_size']}, "
               f"min avg R/trade={cluster_result['best_cluster_min_avg_r']:+.4f}, "
               f"mean avg R/trade={cluster_result['best_cluster_mean_avg_r']:+.4f}")
 
-    neighbor_result = neighbor_plateau_check(grid_results, stop_buffer_grid, confirmation_grid)
-    results["neighbor_result"] = neighbor_result
-    if verbose:
-        bc = neighbor_result["best_cell"]
-        print(f"  Neighbor check around best cell (STOP_BUFFER_PCT={bc['stop_buffer_pct']}, "
-              f"CONFIRMATION_CANDLES={bc['confirmation_candles']}, avg R/trade={bc['avg_r']:+.4f}): "
-              f"{neighbor_result['verdict']}")
-        for nb in neighbor_result["neighbors"]:
-            print(f"    neighbor STOP_BUFFER_PCT={nb['stop_buffer_pct']} CONFIRMATION_CANDLES={nb['confirmation_candles']}"
-                  f" avg R/trade={nb['avg_r']:+.4f} decent={nb['decent']}")
+    if resolved_method == "grid":
+        neighbor_result = neighbor_plateau_check(grid_results, stop_buffer_grid, confirmation_grid)
+        results["neighbor_result"] = neighbor_result
+        if verbose:
+            bc = neighbor_result["best_cell"]
+            print(f"  Neighbor check around best cell (STOP_BUFFER_PCT={bc['stop_buffer_pct']}, "
+                  f"CONFIRMATION_CANDLES={bc['confirmation_candles']}, avg R/trade={bc['avg_r']:+.4f}): "
+                  f"{neighbor_result['verdict']}")
+            for nb in neighbor_result["neighbors"]:
+                print(f"    neighbor STOP_BUFFER_PCT={nb['stop_buffer_pct']} CONFIRMATION_CANDLES={nb['confirmation_candles']}"
+                      f" avg R/trade={nb['avg_r']:+.4f} decent={nb['decent']}")
+    else:
+        results["neighbor_result"] = None
+        if verbose:
+            print(f"  Neighbor-plateau check: SKIPPED - requires the full grid, not available under "
+                  f"SEARCH_METHOD={resolved_method!r} (only a sample of the grid was evaluated, so an "
+                  f"immediate-neighbor combo may never have been tried).")
 
     # ---- STEP 4 ----
     if verbose:
@@ -805,7 +995,7 @@ def run_full_pipeline(all_arrays, stop_buffer_grid, confirmation_grid, fetch_sta
         print(f"STEP 4: rolling walk-forward ({WF_IS_YEARS}yr IS / {WF_OOS_YEARS}yr OOS, step {WF_STEP_YEARS}yr)")
         print("=" * 70)
     wf_result = run_walk_forward(all_arrays, stop_buffer_grid, confirmation_grid, fetch_start, fetch_end,
-                                  show_progress=show_progress)
+                                  show_progress=show_progress, method=method, objective=objective)
     results["wf_result"] = wf_result
     if verbose:
         print(f"  {'Fold':<6}{'IS window':<24}{'OOS window':<24}{'Best params':<22}"
@@ -857,6 +1047,35 @@ def print_final_verdict(results):
               "check PASSED the >=0.5 rule of thumb. Cross-check this against the cluster/neighbor-plateau "
               "results above before treating it as a real edge - a pass here is supportive evidence, not "
               "proof, per the caveat printed with the WFE result.")
+
+    # ---- corrected z-score + multiple-testing (Bonferroni) check ----
+    # See optimization_engine.zscore()'s docstring: this is a CORRECTED replacement for the
+    # `avg_r * sqrt(n)` shortcut used in day_trading_rauf_dukascopy_backtest.py's header-quoted
+    # single-fixed-parameter result (that shortcut implicitly assumes std(r) == 1, which inflates
+    # every z-score computed with it) - this run's best cell gets the corrected version, plus an
+    # honest Bonferroni-adjusted bar reflecting how many combos were actually tested this run.
+    step1_search_result = results.get("step1_search_result")
+    if step1_search_result is not None and step1_search_result.get("best") is not None:
+        best_cell = _find_cell(grid_results, step1_search_result["best"]["params"])
+        if best_cell is not None and best_cell["n_trades"] > 0:
+            print("\n" + "-" * 70)
+            print("CORRECTED SIGNIFICANCE CHECK: best-cell z-score + Bonferroni-adjusted bar")
+            print("-" * 70)
+            best_trades = [{"r": r} for r in best_cell["r_values"]]
+            best_z = opt_engine.zscore(best_trades)
+            n_trials_this_run = step1_search_result["n_evals"]
+            z_bar = opt_engine.bonferroni_adjusted_z_threshold(n_trials_this_run)
+            clears_adjusted = abs(best_z) >= z_bar
+            print(f"Best cell (STOP_BUFFER_PCT={best_cell['stop_buffer_pct']:.3g}, "
+                  f"CONFIRMATION_CANDLES={best_cell['confirmation_candles']}) corrected z-score: {best_z:+.2f} "
+                  f"(sample-std-based, not the old avg_r*sqrt(n) shortcut)")
+            print(f"Combos tested this run: {n_trials_this_run} -> Bonferroni-adjusted |z| bar = {z_bar:.2f} "
+                  f"(vs the naive single-test 1.96 rule of thumb)")
+            print(f"-> {'CLEARS' if clears_adjusted else 'does NOT clear'} the multiple-testing-adjusted bar "
+                  f"(|z|={abs(best_z):.2f} {'>=' if clears_adjusted else '<'} {z_bar:.2f})")
+            print("CAVEAT: this correction is for THIS SCRIPT's own combos-per-run only - a fully "
+                  "project-wide correction would need a running total across every strategy script's "
+                  "every run, which this print deliberately does not claim to be.")
 
 
 def main():
@@ -1248,6 +1467,195 @@ class TestSmoke(unittest.TestCase):
         results = run_smoke_test(verbose=False)
         self.assertEqual(len(results["grid_results"]), 4)
         self.assertEqual(len(results["wf_result"]["fold_rows"]), 2)
+
+
+# ============================= NEW: optimization_engine retrofit (SEARCH_METHOD/OBJECTIVE) =============================
+#
+# Everything above this line is UNMODIFIED from before the optimization_engine retrofit - it must
+# keep passing exactly as-is (see `--test` output: same test count, same names, all green) as
+# direct proof this refactor didn't change already-verified behavior. Everything below is NEW
+# coverage for the retrofit itself.
+
+def _build_small_multi_year_arrays(start_year=2016, end_year_exclusive=2019, labels=("SYN_A", "SYN_B")):
+    """Same tiling approach run_smoke_test() above already uses (a short synthetic series
+    repeated with a date offset per "week" so every calendar week in the span has SOME bars,
+    without simulating every single bar) - factored out to a module-level helper so the new tests
+    below can build small multi-year datasets without depending on run_smoke_test()'s internals."""
+    start = datetime.datetime(start_year, 1, 1)
+    end = datetime.datetime(end_year_exclusive, 1, 1)
+    all_arrays = {}
+    for i, label in enumerate(labels):
+        chunks = []
+        current = start
+        day_index = 0
+        while current < end:
+            day_df = _make_synthetic_ohlc(current, periods=200, freq_minutes=5, seed=(i + 1) * 100000 + day_index)
+            chunks.append(day_df)
+            current += datetime.timedelta(days=7)
+            day_index += 1
+        df = pd.concat(chunks).sort_index()
+        all_arrays[label] = precompute_arrays(df)
+    return all_arrays
+
+
+class TestSearchEngineRetrofit(unittest.TestCase):
+    """New tests for the optimization_engine retrofit: SEARCH_METHOD/OBJECTIVE options end-to-end
+    on this file's existing synthetic smoke-test data shape, plus a direct regression check that
+    the new engine-dispatched search reproduces the OLD hand-written run_grid_search's numbers
+    exactly under default settings (method="grid", objective="total_r")."""
+
+    def test_run_param_search_grid_default_matches_old_run_grid_search_exactly(self):
+        """REGRESSION TEST: run_param_search's default (SEARCH_METHOD="grid", OBJECTIVE="total_r")
+        must reproduce the OLD hand-written run_grid_search's exact per-cell numbers and the exact
+        same best combo, on the same synthetic data - proving this refactor did not change default
+        behavior."""
+        all_arrays = _build_small_multi_year_arrays()
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+
+        old_results = run_grid_search(all_arrays, sb_grid, cc_grid, show_progress=False)
+        new_results, search_result = run_param_search(all_arrays, sb_grid, cc_grid, method="grid",
+                                                        objective="total_r")
+
+        self.assertEqual(len(old_results), len(new_results))
+        for old, new in zip(old_results, new_results):
+            self.assertEqual(old["stop_buffer_pct"], new["stop_buffer_pct"])
+            self.assertEqual(old["confirmation_candles"], new["confirmation_candles"])
+            self.assertEqual(old["n_trades"], new["n_trades"])
+            self.assertAlmostEqual(old["total_r"], new["total_r"], places=9)
+            self.assertAlmostEqual(old["avg_r"], new["avg_r"], places=9)
+            self.assertEqual(sorted(old["r_values"]), sorted(new["r_values"]))
+
+        old_best = max(old_results, key=lambda c: c["total_r"])
+        new_best_params = search_result["best"]["params"]
+        self.assertEqual(old_best["stop_buffer_pct"], new_best_params["stop_buffer_pct"])
+        self.assertEqual(old_best["confirmation_candles"], new_best_params["confirmation_candles"])
+        self.assertAlmostEqual(old_best["total_r"], search_result["best"]["score"], places=9)
+
+    def test_run_full_pipeline_default_matches_old_grid_total_r_behavior(self):
+        """A second regression check at the run_full_pipeline level (the function main() and the
+        smoke test both actually call): defaults must select the exact same fold winners
+        run_grid_search + max(..., key=total_r) would have, per fold."""
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+
+        results = run_full_pipeline(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
+                                     mc_iterations=100, make_plots=False, show_progress=False, verbose=False)
+
+        for row in results["wf_result"]["fold_rows"]:
+            is_grid = run_grid_search(all_arrays, sb_grid, cc_grid, window_start=row["is_start"],
+                                       window_end=row["is_end"], show_progress=False)
+            expected_best = max(is_grid, key=lambda c: c["total_r"])
+            self.assertEqual(row["best_stop_buffer_pct"], expected_best["stop_buffer_pct"])
+            self.assertEqual(row["best_confirmation_candles"], expected_best["confirmation_candles"])
+            self.assertAlmostEqual(row["is_total_r"], expected_best["total_r"], places=9)
+
+    def test_search_method_genetic_end_to_end(self):
+        all_arrays = _build_small_multi_year_arrays()
+        sb_grid, cc_grid = STOP_BUFFER_PCT_GRID, CONFIRMATION_CANDLES_GRID
+        grid_results, search_result = run_param_search(
+            all_arrays, sb_grid, cc_grid, method="genetic", objective="total_r",
+            population_size=4, generations=3, seed=1)
+        self.assertEqual(search_result["method"], "genetic")
+        self.assertGreater(len(grid_results), 0)
+        self.assertIsNotNone(search_result["best"])
+        self.assertLessEqual(search_result["n_evals"], len(sb_grid) * len(cc_grid))
+
+    def test_search_method_bayesian_end_to_end_or_falls_back_cleanly(self):
+        all_arrays = _build_small_multi_year_arrays()
+        sb_grid, cc_grid = STOP_BUFFER_PCT_GRID, CONFIRMATION_CANDLES_GRID
+        grid_results, search_result = run_param_search(
+            all_arrays, sb_grid, cc_grid, method="bayesian", objective="total_r", n_trials=6, seed=1)
+        self.assertIn(search_result["method"], ("bayesian", "grid"))
+        self.assertGreater(len(grid_results), 0)
+        self.assertIsNotNone(search_result["best"])
+
+    def test_objective_options_all_run_without_crashing(self):
+        all_arrays = _build_small_multi_year_arrays()
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        for objective_name in opt_engine.OBJECTIVES:
+            grid_results, search_result = run_param_search(all_arrays, sb_grid, cc_grid, method="grid",
+                                                             objective=objective_name)
+            self.assertEqual(len(grid_results), 4)
+            self.assertIsNotNone(search_result["best"])
+            self.assertFalse(np.isnan(search_result["best"]["score"]))
+
+    def test_walk_forward_honors_configured_method_and_objective_override(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+        wf_result = run_walk_forward(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
+                                      show_progress=False, method="genetic", objective="avg_r")
+        self.assertEqual(len(wf_result["fold_rows"]), 2)
+        for row in wf_result["fold_rows"]:
+            self.assertIn("best_stop_buffer_pct", row)
+            self.assertIn("best_confirmation_candles", row)
+
+    def test_run_full_pipeline_skips_neighbor_check_under_non_grid_search(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2019)
+        sb_grid, cc_grid = STOP_BUFFER_PCT_GRID, CONFIRMATION_CANDLES_GRID
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2019, 1, 1)
+        results = run_full_pipeline(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
+                                     mc_iterations=50, make_plots=False, show_progress=False, verbose=False,
+                                     method="genetic", objective="total_r")
+        self.assertIsNone(results["neighbor_result"])   # skipped, per documented choice
+        self.assertIsNotNone(results["cluster_result"])  # cluster analysis still runs (grid-agnostic)
+
+    def test_run_full_pipeline_runs_neighbor_check_under_grid_search(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2019)
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2019, 1, 1)
+        results = run_full_pipeline(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
+                                     mc_iterations=50, make_plots=False, show_progress=False, verbose=False,
+                                     method="grid", objective="total_r")
+        self.assertIsNotNone(results["neighbor_result"])
+        self.assertIn(results["neighbor_result"]["verdict"],
+                       ("PLATEAU", "ISOLATED SPIKE / overfit warning",
+                        "ISOLATED SPIKE / overfit warning (no in-grid neighbors to compare - degenerate grid)"))
+
+    def test_module_defaults_are_grid_and_total_r(self):
+        """The actual behavior-preservation guarantee: unless something explicitly overrides them,
+        this script's own module-level config must still be exactly what shipped before this
+        refactor existed."""
+        self.assertEqual(SEARCH_METHOD, "grid")
+        self.assertEqual(OBJECTIVE, "total_r")
+
+
+class TestCorrectedZScoreAndBonferroni(unittest.TestCase):
+    """Covers this script's use of optimization_engine's CORRECTED z-score (replacing the old
+    avg_r*sqrt(n) shortcut that implicitly assumed std(r) == 1) and the Bonferroni multiple-testing
+    helper - see optimization_engine.py's own test suite for unit-level coverage of
+    zscore()/bonferroni_adjusted_z_threshold() themselves; this just confirms this script actually
+    wires them up correctly against its own real trade-shaped data, and that print_final_verdict
+    doesn't crash when the wiring runs."""
+
+    def test_zscore_differs_from_old_broken_shortcut_on_real_trade_shaped_data(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2019)
+        grid_results, _ = run_param_search(all_arrays, STOP_BUFFER_PCT_GRID, CONFIRMATION_CANDLES_GRID,
+                                            method="grid", objective="total_r")
+        best_cell = max(grid_results, key=lambda c: c["total_r"])
+        r = np.array(best_cell["r_values"])
+        if len(r) < 2:
+            self.skipTest("not enough trades in this synthetic fixture to exercise the comparison")
+
+        corrected = opt_engine.zscore([{"r": v} for v in r])
+        old_broken = r.mean() * np.sqrt(len(r))   # the old avg_r * sqrt(n) shortcut being replaced
+        self.assertFalse(np.isnan(corrected))
+        if r.std(ddof=1) > 0 and abs(r.std(ddof=1) - 1.0) > 1e-6:
+            self.assertNotAlmostEqual(corrected, old_broken, places=6)
+
+    def test_bonferroni_threshold_accessible_and_sane_for_this_script_grid_size(self):
+        n_combos = len(STOP_BUFFER_PCT_GRID) * len(CONFIRMATION_CANDLES_GRID)
+        z_bar = opt_engine.bonferroni_adjusted_z_threshold(n_combos)
+        self.assertGreater(z_bar, 1.959963985)   # strictly above the naive single-test 1.96 bar
+
+    def test_print_final_verdict_runs_significance_check_without_crashing(self):
+        all_arrays = _build_small_multi_year_arrays(2016, 2021)
+        sb_grid, cc_grid = [0.02, 0.05], [2, 3]
+        fetch_start, fetch_end = datetime.datetime(2016, 1, 1), datetime.datetime(2021, 1, 1)
+        results = run_full_pipeline(all_arrays, sb_grid, cc_grid, fetch_start, fetch_end,
+                                     mc_iterations=50, make_plots=False, show_progress=False, verbose=False)
+        print_final_verdict(results)   # must not raise
 
 
 if __name__ == "__main__":
