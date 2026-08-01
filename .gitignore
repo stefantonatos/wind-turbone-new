@@ -6,3 +6,7 @@ copier/config.py
 copier/*.session
 copier/*.session-journal
 .claude/worktrees/
+
+# webapp/ runtime data - personal local cache and run history, not shipped content
+webapp/cache/
+webapp/run_history_data/
