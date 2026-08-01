@@ -9,6 +9,22 @@ import statistics
 from collections import defaultdict
 
 
+def scale_trades_r(trades, factor):
+    """Returns a shallow-copied trade list with every 'r' multiplied by `factor` - used to
+    convert R-multiples into a %-of-account view (factor = the chosen risk-per-trade %,
+    e.g. r=+2.0 at 1% risk/trade = +2.0% account return) without duplicating compute_stats/
+    equity_curve/per_instrument_breakdown logic for a second unit. z-score is scale-invariant
+    (mean and std both scale by the same factor, so their ratio doesn't change) - no special
+    handling needed there regardless of which unit is displayed."""
+    out = []
+    for t in trades:
+        t = dict(t)
+        if "r" in t and t["r"] is not None:
+            t["r"] = t["r"] * factor
+        out.append(t)
+    return out
+
+
 def compute_stats(trades):
     n = len(trades)
     if n == 0:

@@ -147,24 +147,46 @@ def render_filterable_results(trades, facets, key_prefix):
         st.warning("No trades match the current filters.")
         return
 
+    st.markdown(eyebrow("DISPLAY"), unsafe_allow_html=True)
+    display_cols = st.columns([1, 1, 2])
+    display_mode = display_cols[0].radio("Units", ["% of account", "R-multiples"], index=0,
+                                          horizontal=True, key=f"{key_prefix}_display_mode",
+                                          label_visibility="collapsed")
+    risk_pct = 1.0
+    if display_mode == "% of account":
+        risk_pct = display_cols[1].number_input("Risk per trade (%)", min_value=0.05, max_value=10.0,
+                                                   value=1.0, step=0.25, key=f"{key_prefix}_risk_pct",
+                                                   help="Assumed % of account risked per trade - converts each "
+                                                        "trade's R-multiple into an account % (r x risk%). This "
+                                                        "is a DISPLAY assumption, not something the backtest "
+                                                        "itself used - the underlying trades never change.")
+        display_cols[2].caption(f"Every number below is r × {risk_pct:.2f}% - purely a unit conversion, "
+                                 f"same trades either way.")
+    display_trades = stats_mod.scale_trades_r(filtered, risk_pct) if display_mode == "% of account" else filtered
+    unit_label = "%" if display_mode == "% of account" else "R"
+    unit_fmt = "{:+.2f}%" if display_mode == "% of account" else "{:+.3f}R"
+    s_display = stats_mod.compute_stats(display_trades)
+
     st.markdown(eyebrow("PERFORMANCE METRICS"), unsafe_allow_html=True)
     with st.container(border=True):
         metric_cols = st.columns(6)
-        metric_cols[0].metric("Trades", s["n_trades"])
-        metric_cols[1].metric("Total R", f"{s['total_r']:+.2f}")
-        metric_cols[2].metric("Avg R / trade", f"{s['avg_r']:+.4f}")
-        metric_cols[3].metric("Win rate (TP)", f"{s['tp_pct']:.1f}%")
-        metric_cols[4].metric("Loss rate (SL)", f"{s['sl_pct']:.1f}%")
-        metric_cols[5].metric("Approx z-score", f"{s['z_score']:.2f}")
-    if s["n_trades"] < 100:
-        st.caption(f"Only {s['n_trades']} trades - too few to trust the z-score regardless of its value.")
+        metric_cols[0].metric("Trades", s_display["n_trades"])
+        metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]))
+        metric_cols[2].metric(f"Avg {unit_label} / trade", (unit_fmt if unit_label == "R" else "{:+.3f}%")
+                               .format(s_display["avg_r"]))
+        metric_cols[3].metric("Win rate (TP)", f"{s_display['tp_pct']:.1f}%")
+        metric_cols[4].metric("Loss rate (SL)", f"{s_display['sl_pct']:.1f}%")
+        metric_cols[5].metric("Approx z-score", f"{s_display['z_score']:.2f}")
+    if s_display["n_trades"] < 100:
+        st.caption(f"Only {s_display['n_trades']} trades - too few to trust the z-score regardless of its value.")
     st.caption("Multiple comparisons: this project has shipped many strategies, several with their own "
                "parameter grid searches - a single strategy's z-score in isolation isn't strong evidence, "
                "since data-snooping risk compounds across every strategy and parameter combination tried "
-               "project-wide, not just this one.")
+               "project-wide, not just this one. (z-score is the same number in either display unit above - "
+               "it's scale-invariant.)")
 
-    st.markdown(eyebrow("EQUITY CURVE (CUMULATIVE R)"), unsafe_allow_html=True)
-    xs, ys, chronological = stats_mod.equity_curve(filtered)
+    st.markdown(eyebrow(f"EQUITY CURVE (CUMULATIVE {unit_label})"), unsafe_allow_html=True)
+    xs, ys, chronological = stats_mod.equity_curve(display_trades)
     fig = go.Figure()
     # neon-glow line: wide, low-opacity copies of the same trace stacked behind the crisp
     # main line - a standard "HUD glow" trick, not a real visual effect Plotly has natively
@@ -172,11 +194,12 @@ def render_filterable_results(trades, facets, key_prefix):
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
                                   line=dict(width=glow_width, color=ACCENT),
                                   opacity=glow_opacity, hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(width=2, color=ACCENT), name="Cumulative R"))
+    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(width=2, color=ACCENT),
+                              name=f"Cumulative {unit_label}"))
     fig.update_layout(
         height=320,
         xaxis_title="Trade sequence (chronological)" if chronological else "Trade sequence",
-        yaxis_title="Cumulative R",
+        yaxis_title=f"Cumulative {unit_label}",
         showlegend=False,
         **PLOTLY_LAYOUT_DEFAULTS,
     )
@@ -186,7 +209,7 @@ def render_filterable_results(trades, facets, key_prefix):
                    "per-instrument backtest sequence, not calendar order.")
 
     st.markdown(eyebrow("PER-INSTRUMENT BREAKDOWN"), unsafe_allow_html=True)
-    rows = stats_mod.per_instrument_breakdown(filtered)
+    rows = stats_mod.per_instrument_breakdown(display_trades)
     breakdown_df = pd.DataFrame(rows)
     breakdown_styler = style_signed_columns(breakdown_df, ["total_r", "avg_r"],
                                               fmt={"total_r": "{:+.3f}", "avg_r": "{:+.4f}"})
@@ -195,8 +218,81 @@ def render_filterable_results(trades, facets, key_prefix):
     st.dataframe(breakdown_styler, use_container_width=True, hide_index=True)
 
     st.markdown(eyebrow("TRADE LOG"), unsafe_allow_html=True)
-    trade_df = pd.DataFrame(filtered)
+    trade_df = pd.DataFrame(display_trades)
     st.dataframe(style_signed_columns(trade_df, ["r"]), use_container_width=True, hide_index=True)
+
+    render_prop_firm_fit_section(filtered, key_prefix)
+
+
+def render_prop_firm_fit_section(trades, key_prefix):
+    """% chance of passing a REAL prop firm's evaluation, run against this strategy's actual
+    backtested trades (bootstrap-resampled, chained across every real evaluation phase - see
+    research/prop_firm_challenge_simulator.py's multi_phase_risk_sweep and
+    research/prop_firm_presets.py for the sourced rule sets). Gated behind a button - this is
+    real Monte Carlo compute (thousands of simulated multi-phase attempts), not instant."""
+    st.markdown(eyebrow("PROP FIRM FIT"), unsafe_allow_html=True)
+    if len(trades) < 10:
+        st.caption("Not enough trades in this run (need at least 10) to run a meaningful prop-firm simulation.")
+        return
+
+    prop_presets = importlib.import_module("research.prop_firm_presets")
+    prop_sim = importlib.import_module("research.prop_firm_challenge_simulator")
+
+    preset_options = prop_presets.list_presets()
+    preset_labels = {pid: label for pid, label in preset_options}
+    cols = st.columns([2, 1])
+    chosen_preset_id = cols[0].selectbox("Prop firm", [pid for pid, _ in preset_options],
+                                          format_func=lambda pid: preset_labels[pid],
+                                          key=f"{key_prefix}_propfirm_preset")
+    run_sweep = cols[1].button("Run Prop Firm Simulation", key=f"{key_prefix}_propfirm_run",
+                                use_container_width=True)
+    st.caption("Uses each firm's REAL, sourced evaluation rules (phases, profit targets, drawdown limits) - "
+               "not a generic made-up account. Bootstrap-resamples this run's actual R-multiples across "
+               "thousands of simulated attempts at each risk level, chained through every real evaluation "
+               "phase. Rules change and vary by account type - see the sourcing note below before relying "
+               "on this for a real decision.")
+
+    if not run_sweep:
+        return
+
+    preset = prop_presets.get_preset(chosen_preset_id)
+    with st.spinner(f"Simulating {preset['display_name']} across risk levels - this runs thousands of "
+                     f"multi-phase Monte Carlo attempts, may take a few seconds..."):
+        risk_levels = [0.25, 0.5, 1.0, 1.5, 2.0, 3.0]
+        results = prop_sim.multi_phase_risk_sweep(trades, preset, risk_levels_pct=risk_levels, n_iter=2000)
+
+    if not results:
+        st.warning("Not enough trades to run the sweep.")
+        return
+
+    phase_names = [p["name"] for p in preset["phases"]]
+    rows = []
+    for row in results:
+        rows.append({
+            "risk %/trade": f"{row['risk_pct_per_trade']:.2f}%",
+            "pass %": row["pass_prob"] * 100,
+            "fail %": row["fail_prob"] * 100,
+            "avg trades to pass": row["avg_trades_to_pass"],
+            "avg days to pass": row["avg_days_to_pass"],
+            **{f"fails in {name}": row["fail_by_phase"][i] for i, name in enumerate(phase_names)},
+        })
+    sweep_df = pd.DataFrame(rows)
+    st.dataframe(sweep_df.style.format({"pass %": "{:.1f}%", "fail %": "{:.1f}%",
+                                          "avg trades to pass": "{:.0f}", "avg days to pass": "{:.0f}"},
+                                         na_rep="n/a"),
+                 use_container_width=True, hide_index=True)
+
+    best = max(results, key=lambda r: r["pass_prob"])
+    st.markdown(f"**Best risk level: {best['risk_pct_per_trade']:.2f}% per trade -> "
+                f"{best['pass_prob'] * 100:.1f}% chance of clearing every phase of {preset['display_name']}.**")
+
+    with st.expander("Sourcing & caveats for this preset"):
+        st.caption(f"Source: {', '.join(preset['source_urls'])}")
+        st.caption(preset["source_note"])
+        st.caption("Bootstrap resampling of a finite historical trade sample approximates future variance, "
+                   "it is not a guarantee - especially at the tails. No commission/spread/slippage modeled "
+                   "in the underlying trades. Each phase resets to a fresh account balance (real prop-firm "
+                   "convention) while continuing to consume the same simulated trade sequence.")
 
 
 def _render_optimization_result(result, opt_module_name):
@@ -401,18 +497,25 @@ def run_backtest_page():
                        f"range can take many minutes even with caching. Widen this deliberately once you "
                        f"know what you're doing.")
 
-    st.sidebar.markdown("### Parameters")
+    # Manual parameter tweaking is a power-user feature, not the default flow - most people
+    # don't know what STOP_BUFFER_PCT should be and shouldn't have to. This runs with the
+    # strategy's own defaults unless deliberately opened and changed; the "find the best
+    # combo automatically" path is the Optimization & Robustness tab after a run, not this.
     param_values = {}
-    for p in strategy.params:
-        widget_key = f"{strategy.id}_{p.attr}"
-        if p.kind == "int":
-            param_values[p.attr] = st.sidebar.number_input(p.label, value=int(p.default), min_value=int(p.min_value),
-                                                              max_value=int(p.max_value), step=int(p.step),
-                                                              key=widget_key, help=p.help or None)
-        else:
-            param_values[p.attr] = st.sidebar.number_input(p.label, value=float(p.default), min_value=float(p.min_value),
-                                                              max_value=float(p.max_value), step=float(p.step),
-                                                              key=widget_key, help=p.help or None)
+    with st.sidebar.expander("Advanced parameters (optional)", expanded=False):
+        st.caption("Leave these alone unless you know what they do. Prefer the Optimization & "
+                   "Robustness tab after running once - it searches many combinations "
+                   "automatically instead of you guessing values here.")
+        for p in strategy.params:
+            widget_key = f"{strategy.id}_{p.attr}"
+            if p.kind == "int":
+                param_values[p.attr] = st.number_input(p.label, value=int(p.default), min_value=int(p.min_value),
+                                                          max_value=int(p.max_value), step=int(p.step),
+                                                          key=widget_key, help=p.help or None)
+            else:
+                param_values[p.attr] = st.number_input(p.label, value=float(p.default), min_value=float(p.min_value),
+                                                          max_value=float(p.max_value), step=float(p.step),
+                                                          key=widget_key, help=p.help or None)
 
     st.sidebar.markdown("---")
     run_clicked = st.sidebar.button("Run Backtest", type="primary", use_container_width=True)
