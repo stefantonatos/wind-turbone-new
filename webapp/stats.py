@@ -5,6 +5,7 @@
 
 import datetime
 import math
+import statistics
 from collections import defaultdict
 
 
@@ -12,14 +13,21 @@ def compute_stats(trades):
     n = len(trades)
     if n == 0:
         return None
-    total_r = sum(t.get("r", 0.0) or 0.0 for t in trades)
+    r_values = [t.get("r", 0.0) or 0.0 for t in trades]
+    total_r = sum(r_values)
     avg_r = total_r / n
     tp = sum(1 for t in trades if t.get("outcome") == "TP")
     sl = sum(1 for t in trades if t.get("outcome") == "SL")
     flat = sum(1 for t in trades if t.get("outcome") == "FLAT")
-    # same formula used across every research/*.py script in this project:
-    # z = (total_r / n) / (1 / sqrt(n))
-    z = avg_r / (1 / math.sqrt(n)) if n else 0.0
+    # Corrected formula, matching the project-wide fix in commit 85aca19: the old
+    # z = avg_r / (1/sqrt(n)) implicitly assumed the R-multiple distribution has
+    # stddev exactly 1, which is false and inflates every significance claim. Uses
+    # the real sample stddev instead, same as every research/*.py script now does.
+    if n >= 2:
+        std_r = statistics.stdev(r_values)
+        z = (avg_r / (std_r / math.sqrt(n))) if std_r > 0 else 0.0
+    else:
+        z = 0.0
     return {
         "n_trades": n,
         "total_r": total_r,

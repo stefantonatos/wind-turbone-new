@@ -7,11 +7,14 @@
 # globals at CALL time, so setting `module.FETCH_START = ...` before calling
 # `module.fetch_instrument_data(...)` is enough, no importlib.reload needed.
 #
-# TO ADD A NEW STRATEGY (e.g. once Donchian/MA-cross/Bollinger/RSI land as new
-# research/*.py files): add one more StrategyDef to STRATEGIES at the bottom of
-# this file, with a small `_run_xxx` function following the same shape as the
-# ones below. Nothing else in the app needs to change - app.py only ever talks
-# to the StrategyDef objects, never to research/*.py directly.
+# TO ADD A NEW STRATEGY: add one more StrategyDef to STRATEGIES at the bottom of
+# this file. If the new module follows the day_trading_rauf_dukascopy_backtest.py
+# shape (own disk cache, fetch_instrument_data(label, const), backtest_instrument
+# (label, df) -> trades) - true for 5 of the 9 strategies below so far - just alias
+# `runner=_run_with_own_cache`, no new function needed. Otherwise write a small
+# `_run_xxx` function following the shape of the other entries below. Nothing else
+# in the app needs to change - app.py only ever talks to the StrategyDef objects,
+# never to research/*.py directly.
 
 import datetime
 import importlib
@@ -50,6 +53,10 @@ class StrategyDef:
     notes: str                # caveats shown under the strategy picker
     runner: Callable          # (module, selected_labels, start_dt, end_dt, overrides, progress_cb) -> list[trade dict]
     optimization_module: Optional[str] = None  # research.<x>_optimization module name, if one exists
+    default_history_days: int = 182  # sidebar date-range default width; swing/daily-bar strategies
+                                       # need a much wider default than the intraday ones to see any
+                                       # signal at all (a 50/200-day SMA cross needs 200+ days of
+                                       # history just to warm up, before a rare cross can even fire)
 
 
 def _instrument_labels(strategy_def):
@@ -59,6 +66,34 @@ def _instrument_labels(strategy_def):
 def _apply_overrides(module, overrides):
     for attr, value in overrides.items():
         setattr(module, attr, value)
+
+
+def _run_with_own_cache(module, selected_labels, start_dt, end_dt, overrides, progress_cb):
+    """Shared runner for every module that follows the day_trading_rauf_dukascopy_backtest.py
+    shape exactly: its own pickle disk cache (CACHE_DIR, redirected below into webapp/cache
+    rather than the repo root), fetch_instrument_data(label, instrument_const) -> df, and
+    backtest_instrument(label, df) -> trades (keys: side, outcome, r, date). Used by Rauf,
+    Donchian/Turtle, MA Golden/Death Cross, Bollinger Band mean-reversion, and RSI
+    mean-reversion - all five share this exact shape, confirmed by reading each module's
+    source directly, not assumed from the name."""
+    import os
+    module.FETCH_START, module.FETCH_END = start_dt, end_dt
+    _apply_overrides(module, overrides)
+    module.CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache",
+                                      f"{module.__name__.rsplit('.', 1)[-1]}_dukascopy_cache")
+    chosen = [row for row in module.INSTRUMENTS if row[0] in selected_labels]
+    all_trades = []
+    with cached_dukascopy_fetch():  # backstop only - these modules already cache their combined df themselves
+        for done, (label, const) in enumerate(chosen):
+            progress_cb(done, len(chosen), label)
+            df = module.fetch_instrument_data(label, const)
+            if df is None or df.empty:
+                continue
+            for t in module.backtest_instrument(label, df):
+                t["instrument"] = label
+                all_trades.append(t)
+        progress_cb(len(chosen), len(chosen), "done")
+    return all_trades
 
 
 # ---------------------------------------------------------------------------
@@ -92,25 +127,58 @@ def _run_po3(module, selected_labels, start_dt, end_dt, overrides, progress_cb):
 # CACHE_DIR (own pickle disk cache, redirected into webapp/cache below rather
 # than the repo root), fetch_instrument_data(label, instrument_const) -> df,
 # backtest_instrument(label, df) -> trades (keys: side, outcome, r, date, range).
+# Uses the shared _run_with_own_cache helper - see that function's docstring for
+# the full list of modules confirmed to share this exact shape.
 # ---------------------------------------------------------------------------
-def _run_rauf(module, selected_labels, start_dt, end_dt, overrides, progress_cb):
-    import os
-    module.FETCH_START, module.FETCH_END = start_dt, end_dt
-    _apply_overrides(module, overrides)
-    module.CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "rauf_dukascopy_cache")
-    chosen = [row for row in module.INSTRUMENTS if row[0] in selected_labels]
-    all_trades = []
-    with cached_dukascopy_fetch():  # backstop only - this module already caches its combined df itself
-        for done, (label, const) in enumerate(chosen):
-            progress_cb(done, len(chosen), label)
-            df = module.fetch_instrument_data(label, const)
-            if df is None or df.empty:
-                continue
-            for t in module.backtest_instrument(label, df):
-                t["instrument"] = label
-                all_trades.append(t)
-        progress_cb(len(chosen), len(chosen), "done")
-    return all_trades
+_run_rauf = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# donchian_turtle_breakout_dukascopy_backtest.py (Donchian / Turtle breakout)
+# SWING/POSITION system on daily channels (5-min bars used only for intrabar
+# stop/trail checks) - a trade can stay open for days or weeks. Exposes:
+# INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, CACHE_DIR (own disk
+# cache), DONCHIAN_PERIOD, EXIT_PERIOD, ATR_PERIOD, ATR_STOP_MULT,
+# fetch_instrument_data(label, instrument_const) -> df, backtest_instrument(label,
+# df) -> trades (keys: side, outcome, r, date). Same shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_donchian = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# ma_golden_death_cross_dukascopy_backtest.py (MA Golden/Death Cross)
+# SWING/POSITION system on a 50/200-day SMA cross (5-min bars used only for
+# intrabar ATR-stop checks and a realistic next-day fill) - inherently rare
+# signals, a handful of trades per instrument over a 9-year history is normal,
+# not a bug. Exposes: INSTRUMENTS [(label, const)], FETCH_START, FETCH_END,
+# CACHE_DIR (own disk cache), SMA_FAST, SMA_SLOW, ATR_PERIOD, ATR_STOP_MULT,
+# fetch_instrument_data(label, instrument_const) -> df, backtest_instrument(label,
+# df) -> trades (keys: side, outcome, r, date). Same shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_ma_cross = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# bollinger_band_mean_reversion_dukascopy_backtest.py (Bollinger Band fade)
+# Intraday, 5-min bars, no session window. Exposes: INSTRUMENTS [(label, const)],
+# FETCH_START, FETCH_END, CACHE_DIR (own disk cache), BB_LENGTH, BB_NUM_STD,
+# STOP_BUFFER_PCT, MIN_SL_PCT, MAX_HOLD_BARS, fetch_instrument_data(label,
+# instrument_const) -> df, backtest_instrument(label, df) -> trades (keys: side,
+# outcome, r, date). Same shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_bollinger = _run_with_own_cache
+
+
+# ---------------------------------------------------------------------------
+# rsi_mean_reversion_dukascopy_backtest.py (RSI mean-reversion)
+# Intraday, 5-min bars, no session window. Exposes: INSTRUMENTS [(label, const)],
+# FETCH_START, FETCH_END, CACHE_DIR (own disk cache), RSI_LENGTH, RSI_OVERSOLD,
+# RSI_OVERBOUGHT, STOP_LOOKBACK_BARS, STOP_BUFFER_PCT, MIN_SL_PCT, REWARD_RISK,
+# MAX_HOLD_BARS, fetch_instrument_data(label, instrument_const) -> df,
+# backtest_instrument(label, df) -> trades (keys: side, outcome, r, date). Same
+# shape as Rauf's module.
+# ---------------------------------------------------------------------------
+_run_rsi = _run_with_own_cache
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +321,96 @@ def _build_registry():
         notes="Sweep + 3-candle-reversal confirmation on two daily opening ranges (London, NY).",
         runner=_run_rauf,
         optimization_module=_find_optimization_module("research.day_trading_rauf_dukascopy_backtest"),
+    ))
+
+    donchian_mod = _load_module("research.donchian_turtle_breakout_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="donchian_turtle",
+        name="Donchian / Turtle Breakout",
+        module_name="research.donchian_turtle_breakout_dukascopy_backtest",
+        granularity="5-min bars driving daily channels (swing/position - trades can stay open days-weeks)",
+        instruments=donchian_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("DONCHIAN_PERIOD", "Entry channel (prior days)", "int", donchian_mod.DONCHIAN_PERIOD, 5, 60, 1),
+            ParamSpec("EXIT_PERIOD", "Trailing exit channel (prior days)", "int", donchian_mod.EXIT_PERIOD, 3, 40, 1),
+            ParamSpec("ATR_PERIOD", "ATR length (days)", "int", donchian_mod.ATR_PERIOD, 2, 60, 1),
+            ParamSpec("ATR_STOP_MULT", "Initial stop (x ATR)", "float", donchian_mod.ATR_STOP_MULT, 0.5, 6.0, 0.5),
+        ],
+        facets=[],
+        notes="Swing/position system on DAILY channels - far fewer, much longer-held trades than the "
+              "intraday strategies above. Defaults to a 3-year window (not the app-wide 6 months) since "
+              "a 20-day entry channel needs real history to produce more than a couple of breakouts.",
+        runner=_run_donchian,
+        optimization_module=_find_optimization_module("research.donchian_turtle_breakout_dukascopy_backtest"),
+        default_history_days=3 * 365,
+    ))
+
+    ma_cross_mod = _load_module("research.ma_golden_death_cross_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="ma_golden_death_cross",
+        name="MA Golden/Death Cross",
+        module_name="research.ma_golden_death_cross_dukascopy_backtest",
+        granularity="5-min bars driving a daily 50/200 SMA cross (swing/position)",
+        instruments=ma_cross_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("SMA_FAST", "Fast SMA (days)", "int", ma_cross_mod.SMA_FAST, 5, 100, 5),
+            ParamSpec("SMA_SLOW", "Slow SMA (days)", "int", ma_cross_mod.SMA_SLOW, 50, 300, 10),
+            ParamSpec("ATR_PERIOD", "ATR length (days)", "int", ma_cross_mod.ATR_PERIOD, 2, 60, 1),
+            ParamSpec("ATR_STOP_MULT", "Stop / R basis (x ATR)", "float", ma_cross_mod.ATR_STOP_MULT, 0.5, 8.0, 0.5),
+        ],
+        facets=[],
+        notes="A 50/200-day SMA cross is BY DESIGN rare - low single digits to a dozen crosses per "
+              "instrument over a 9-year history is normal, not a bug. Defaults to a 3-year window (the "
+              "SMA(200) alone needs ~200 trading days just to warm up); 0 trades for some instruments "
+              "even at that width is expected - widen further for a better chance of seeing a cross.",
+        runner=_run_ma_cross,
+        optimization_module=_find_optimization_module("research.ma_golden_death_cross_dukascopy_backtest"),
+        default_history_days=3 * 365,
+    ))
+
+    bollinger_mod = _load_module("research.bollinger_band_mean_reversion_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="bollinger_mean_reversion",
+        name="Bollinger Band Mean-Reversion",
+        module_name="research.bollinger_band_mean_reversion_dukascopy_backtest",
+        granularity="5-min bars",
+        instruments=bollinger_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("BB_LENGTH", "Band length (bars)", "int", bollinger_mod.BB_LENGTH, 5, 100, 5),
+            ParamSpec("BB_NUM_STD", "Band width (x stddev)", "float", bollinger_mod.BB_NUM_STD, 0.5, 4.0, 0.25),
+            ParamSpec("STOP_BUFFER_PCT", "Stop buffer (% of price)", "float", bollinger_mod.STOP_BUFFER_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("MIN_SL_PCT", "Min stop distance (% of price)", "float", bollinger_mod.MIN_SL_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("MAX_HOLD_BARS", "Max hold (5-min bars)", "int", bollinger_mod.MAX_HOLD_BARS, 6, 288, 6),
+        ],
+        facets=[],
+        notes="Confirmed two-bar re-entry into the bands (not a raw touch), target = the moving average "
+              "at entry. Runs continuously, not tied to a session window.",
+        runner=_run_bollinger,
+        optimization_module=_find_optimization_module("research.bollinger_band_mean_reversion_dukascopy_backtest"),
+    ))
+
+    rsi_mod = _load_module("research.rsi_mean_reversion_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="rsi_mean_reversion",
+        name="RSI Mean-Reversion",
+        module_name="research.rsi_mean_reversion_dukascopy_backtest",
+        granularity="5-min bars",
+        instruments=rsi_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("RSI_LENGTH", "RSI length (bars)", "int", rsi_mod.RSI_LENGTH, 2, 50, 1),
+            ParamSpec("RSI_OVERSOLD", "Oversold threshold", "float", rsi_mod.RSI_OVERSOLD, 5.0, 45.0, 1.0),
+            ParamSpec("RSI_OVERBOUGHT", "Overbought threshold", "float", rsi_mod.RSI_OVERBOUGHT, 55.0, 95.0, 1.0),
+            ParamSpec("STOP_LOOKBACK_BARS", "Stop lookback (bars)", "int", rsi_mod.STOP_LOOKBACK_BARS, 3, 60, 1),
+            ParamSpec("STOP_BUFFER_PCT", "Stop buffer (% of price)", "float", rsi_mod.STOP_BUFFER_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("MIN_SL_PCT", "Min stop distance (% of price)", "float", rsi_mod.MIN_SL_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("REWARD_RISK", "Reward:risk", "float", rsi_mod.REWARD_RISK, 0.5, 6.0, 0.5),
+            ParamSpec("MAX_HOLD_BARS", "Max hold (5-min bars)", "int", rsi_mod.MAX_HOLD_BARS, 6, 288, 6),
+        ],
+        facets=[],
+        notes="Confirmed re-entry back through RSI(14) 30/70 (not a raw threshold touch), fixed-R:R "
+              "target off a swing-low/high stop. Runs continuously, not tied to a session window.",
+        runner=_run_rsi,
+        optimization_module=_find_optimization_module("research.rsi_mean_reversion_dukascopy_backtest"),
     ))
 
     sr_mod = _load_module("research.support_resistance_zone_bounce_dukascopy_backtest")

@@ -38,6 +38,21 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
   session/range) never re-fetches data - it only recomputes stats over the trade list
   already produced by your last "Run Backtest" click.
 
+## Strategies in the registry
+
+ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout, MA
+Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion,
+Support/Resistance Zone Bounce, ICT Silver Bullet, and ORB (indices) - 9 total. Two
+of these (Donchian, MA cross) are multi-day SWING/POSITION systems on daily channels
+rather than intraday, so their sidebar date-range default is ~3 years instead of the
+6-month default every intraday strategy uses - a 20-day Donchian channel or a 50/200
+SMA cross needs real history to produce more than a couple of signals, and a 50/200
+cross is inherently rare (low single digits to a dozen per instrument over a 9-year
+history is normal, not a bug - see that script's own header). `trend_following_momentum_
+dukascopy_backtest.py` is deliberately excluded: it produces a monthly-rebalanced
+portfolio return series (NAV/Sharpe/drawdown), not the R-multiple trade list every
+other strategy and this whole results UI is built around.
+
 ## Layout
 
 - `app.py` - the Streamlit app (Run Backtest page + History page).

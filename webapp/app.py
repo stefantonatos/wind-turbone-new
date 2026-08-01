@@ -158,6 +158,10 @@ def render_filterable_results(trades, facets, key_prefix):
         metric_cols[5].metric("Approx z-score", f"{s['z_score']:.2f}")
     if s["n_trades"] < 100:
         st.caption(f"Only {s['n_trades']} trades - too few to trust the z-score regardless of its value.")
+    st.caption("Multiple comparisons: this project has shipped many strategies, several with their own "
+               "parameter grid searches - a single strategy's z-score in isolation isn't strong evidence, "
+               "since data-snooping risk compounds across every strategy and parameter combination tried "
+               "project-wide, not just this one.")
 
     st.markdown(eyebrow("EQUITY CURVE (CUMULATIVE R)"), unsafe_allow_html=True)
     xs, ys, chronological = stats_mod.equity_curve(filtered)
@@ -291,12 +295,14 @@ def run_backtest_page():
 
     st.sidebar.markdown("### Date range")
     default_end = datetime.date.today() - datetime.timedelta(days=1)
-    default_start = default_end - datetime.timedelta(days=182)
+    default_start = default_end - datetime.timedelta(days=strategy.default_history_days)
     date_range = st.sidebar.date_input("Date range", value=(default_start, default_end),
                                           max_value=default_end, label_visibility="collapsed",
                                           key=f"{strategy.id}_daterange")
-    st.sidebar.caption("Defaults to a short 6-month window - first-time fetches of a wide range can take "
-                       "many minutes even with caching. Widen this deliberately once you know what you're doing.")
+    default_window_label = f"~{strategy.default_history_days / 365:.0f}-year" if strategy.default_history_days >= 365 else "6-month"
+    st.sidebar.caption(f"Defaults to a short {default_window_label} window - first-time fetches of a wide "
+                       f"range can take many minutes even with caching. Widen this deliberately once you "
+                       f"know what you're doing.")
 
     st.sidebar.markdown("### Parameters")
     param_values = {}
