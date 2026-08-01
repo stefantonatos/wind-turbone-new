@@ -741,14 +741,31 @@ def multi_phase_risk_sweep(trades, preset, risk_levels_pct=None, n_iter=RISK_SWE
             if o["outcome"] == "FAIL" and o["phase_failed"] is not None:
                 fail_by_phase[o["phase_failed"]] += 1
 
+        # days-to-pass distribution, not just the mean - a mean gets dragged around by a
+        # long right tail (a handful of unlucky-but-still-passing paths that took much
+        # longer than typical), so "how long will THIS actually take me" is better answered
+        # by the median plus a p25-p75 "typical range" than by a single average number.
+        pass_days = [o["days_taken"] for o in passes]
+        pass_trades = [o["trades_taken"] for o in passes]
+        if passes:
+            median_days = float(np.median(pass_days))
+            p25_days, p75_days = (float(x) for x in np.percentile(pass_days, [25, 75]))
+            median_trades = float(np.median(pass_trades))
+        else:
+            median_days = p25_days = p75_days = median_trades = float("nan")
+
         sweep_results.append({
             "risk_pct_per_trade": risk_pct,
             "n_iter": n,
             "pass_prob": n_pass / n,
             "fail_prob": n_fail / n,
             "inconclusive_prob": n_inconclusive / n,
-            "avg_trades_to_pass": float(np.mean([o["trades_taken"] for o in passes])) if passes else float("nan"),
-            "avg_days_to_pass": float(np.mean([o["days_taken"] for o in passes])) if passes else float("nan"),
+            "avg_trades_to_pass": float(np.mean(pass_trades)) if passes else float("nan"),
+            "avg_days_to_pass": float(np.mean(pass_days)) if passes else float("nan"),
+            "median_days_to_pass": median_days,
+            "p25_days_to_pass": p25_days,
+            "p75_days_to_pass": p75_days,
+            "median_trades_to_pass": median_trades,
             "fail_by_phase": fail_by_phase,
             "trades_per_day_assumed": trades_per_day,
         })
@@ -778,6 +795,10 @@ def print_multi_phase_sweep_table(sweep_results, preset, header=None):
     best = max(sweep_results, key=lambda r: r["pass_prob"])
     print(f"\nHighest full-pass probability: {best['risk_pct_per_trade']:.2f}% risk/trade -> "
           f"{best['pass_prob'] * 100:.1f}% of attempts cleared every phase.")
+    if not math.isnan(best["median_days_to_pass"]):
+        print(f"At that risk level, passing attempts typically took {best['median_days_to_pass']:.0f} days "
+              f"(median), usually somewhere between {best['p25_days_to_pass']:.0f} and "
+              f"{best['p75_days_to_pass']:.0f} days (25th-75th percentile).")
     print(f"\nSource: {', '.join(preset['source_urls'])}")
     print(f"Sourcing note: {preset['source_note']}")
     print(f"\nCAVEAT: bootstrap resampling of a FINITE historical trade sample - approximates future "

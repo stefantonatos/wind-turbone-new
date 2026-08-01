@@ -15,6 +15,24 @@
 # `_run_xxx` function following the shape of the other entries below. Nothing else
 # in the app needs to change - app.py only ever talks to the StrategyDef objects,
 # never to research/*.py directly.
+#
+# Quick checklist:
+#   1. `mod = _load_module("research.<your_module>")`
+#   2. `instruments=mod.INSTRUMENTS`
+#   3. `params=[auto_param(mod, "SOME_CONST", "Human label"), ...]` for each tunable
+#      constant (see auto_param() below - it reads the module's own current value as
+#      the default and infers sensible bounds, so you're not hand-typing min/max/step
+#      for every one; pass min_value/max_value/step explicitly to override the guess).
+#   4. `runner=_run_with_own_cache` (or a bespoke `_run_xxx`, see above).
+#   5. `optimization_module=_find_optimization_module("research.<your_module>")` (auto-
+#      detects a companion _optimization.py if one exists on disk - safe to always
+#      include, it's a no-op if there isn't one yet).
+#   6. Trade candlestick charting (the Results tab's TRADE CHART section) is opt-in:
+#      only wire up `chart_fetcher=_chart_fetch_po3_shape` or
+#      `=_chart_fetch_own_cache_shape` once the module's trades.append(...) calls
+#      also record entry_price/stop_price/target_price/exit_price/entry_time/exit_time
+#      - see ict_po3_forex_dukascopy_backtest.py for a worked example. Leave it unset
+#      (default None) otherwise; the chart section just stays hidden for that strategy.
 
 import datetime
 import importlib
@@ -39,6 +57,26 @@ class ParamSpec:
     max_value: float
     step: float
     help: str = ""
+
+
+def auto_param(module, attr, label, min_value=None, max_value=None, step=None, help=""):
+    """Builds a ParamSpec from a module's OWN current value for `attr` - reads the live
+    default straight off the module (so it never drifts out of sync with the research
+    script), infers int vs float from that value's type, and fills in a sensible
+    min/max/step range scaled off the default's magnitude when not given explicitly.
+    Cuts the copy-paste boilerplate of hand-writing every numeric bound when wiring up
+    a new strategy; override min_value/max_value/step/help for anything that needs a
+    tighter or more meaningful range than the generic guess (e.g. a 0-100 oscillator
+    threshold instead of a magnitude-scaled one)."""
+    default = getattr(module, attr)
+    kind = "int" if isinstance(default, int) else "float"
+    if min_value is None:
+        min_value = 0 if default >= 0 else default * 3
+    if max_value is None:
+        max_value = max(default * 5, default + (10 if kind == "int" else 1.0))
+    if step is None:
+        step = 1 if kind == "int" else round(max(abs(default) * 0.1, 0.01), 4)
+    return ParamSpec(attr, label, kind, default, min_value, max_value, step, help)
 
 
 @dataclass

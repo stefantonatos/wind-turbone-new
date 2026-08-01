@@ -9,6 +9,7 @@
 
 import datetime
 import importlib
+import math
 import os
 import sys
 
@@ -348,6 +349,33 @@ def render_prop_firm_fit_section(trades, key_prefix):
         st.warning("Not enough trades to run the sweep.")
         return
 
+    best = max(results, key=lambda r: r["pass_prob"])
+    st.markdown(eyebrow(f"BEST FIT - {best['risk_pct_per_trade']:.2f}% RISK/TRADE"), unsafe_allow_html=True)
+    with st.container(border=True):
+        headline_cols = st.columns(4)
+        headline_cols[0].metric("Chance of passing", f"{best['pass_prob'] * 100:.1f}%")
+        if math.isnan(best["median_days_to_pass"]):
+            headline_cols[1].metric("Days to pass (median)", "n/a")
+        else:
+            headline_cols[1].metric("Days to pass (median)", f"{best['median_days_to_pass']:.0f}")
+        if math.isnan(best["p25_days_to_pass"]):
+            headline_cols[2].metric("Typical range", "n/a")
+        else:
+            headline_cols[2].metric("Typical range",
+                                     f"{best['p25_days_to_pass']:.0f}-{best['p75_days_to_pass']:.0f} days")
+        headline_cols[3].metric("Trades to pass (median)",
+                                 "n/a" if math.isnan(best["median_trades_to_pass"])
+                                 else f"{best['median_trades_to_pass']:.0f}")
+    st.caption(f"Among simulated attempts that passed every phase of {preset['display_name']} at this risk "
+               f"level, half took {best['median_days_to_pass']:.0f} days or less, and the middle 50% of "
+               f"attempts fell between {best['p25_days_to_pass']:.0f} and {best['p75_days_to_pass']:.0f} days - "
+               f"median and a percentile range instead of a plain average, since time-to-pass is usually "
+               f"right-skewed (a few slow-but-still-passing attempts drag a mean average upward)."
+               if not math.isnan(best["median_days_to_pass"]) else
+               "No simulated attempts passed every phase at this risk level, so there's no time-to-pass "
+               "figure to show - see the fail breakdown below.")
+
+    st.markdown(eyebrow("EVERY RISK LEVEL"), unsafe_allow_html=True)
     phase_names = [p["name"] for p in preset["phases"]]
     rows = []
     for row in results:
@@ -355,19 +383,17 @@ def render_prop_firm_fit_section(trades, key_prefix):
             "risk %/trade": f"{row['risk_pct_per_trade']:.2f}%",
             "pass %": row["pass_prob"] * 100,
             "fail %": row["fail_prob"] * 100,
-            "avg trades to pass": row["avg_trades_to_pass"],
-            "avg days to pass": row["avg_days_to_pass"],
+            "median days to pass": row["median_days_to_pass"],
+            "typical range (days)": ("n/a" if math.isnan(row["p25_days_to_pass"])
+                                       else f"{row['p25_days_to_pass']:.0f}-{row['p75_days_to_pass']:.0f}"),
+            "median trades to pass": row["median_trades_to_pass"],
             **{f"fails in {name}": row["fail_by_phase"][i] for i, name in enumerate(phase_names)},
         })
     sweep_df = pd.DataFrame(rows)
     st.dataframe(sweep_df.style.format({"pass %": "{:.1f}%", "fail %": "{:.1f}%",
-                                          "avg trades to pass": "{:.0f}", "avg days to pass": "{:.0f}"},
+                                          "median days to pass": "{:.0f}", "median trades to pass": "{:.0f}"},
                                          na_rep="n/a"),
                  use_container_width=True, hide_index=True)
-
-    best = max(results, key=lambda r: r["pass_prob"])
-    st.markdown(f"**Best risk level: {best['risk_pct_per_trade']:.2f}% per trade -> "
-                f"{best['pass_prob'] * 100:.1f}% chance of clearing every phase of {preset['display_name']}.**")
 
     with st.expander("Sourcing & caveats for this preset"):
         st.caption(f"Source: {', '.join(preset['source_urls'])}")
@@ -557,8 +583,59 @@ def render_run_context(strategy_name, strategy_id, trades, key_prefix):
 # pages
 # --------------------------------------------------------------------------------------
 
+def browse_strategies_page():
+    st.markdown(eyebrow("STRATEGY CATALOG"), unsafe_allow_html=True)
+    st.caption(f"{len(STRATEGIES)} strategies in this build. Pick one to jump straight into Run Backtest "
+               f"with it pre-selected - no need to hunt through the dropdown.")
+
+    cols_per_row = 3
+    for row_start in range(0, len(STRATEGIES), cols_per_row):
+        row = STRATEGIES[row_start:row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, strategy in zip(cols, row):
+            with col:
+                with st.container(border=True):
+                    st.markdown(f"**{strategy.name}**")
+                    st.caption(strategy.granularity)
+                    st.write(strategy.notes)
+                    badges = []
+                    if strategy.chart_fetcher:
+                        badges.append("Trade chart")
+                    if strategy.optimization_module:
+                        badges.append("Optimization & robustness")
+                    st.markdown(eyebrow(" · ".join(badges) if badges else "CORE BACKTEST"),
+                                unsafe_allow_html=True)
+                    st.caption(f"{len(strategy.instruments)} instruments - "
+                               f"{len(strategy.params)} tunable parameters (advanced)")
+                    if st.button("Run this strategy", key=f"browse_run_{strategy.id}", use_container_width=True):
+                        st.session_state.pending_strategy_id = strategy.id
+                        # can't set st.session_state.page_nav directly here - the segmented_control
+                        # widget with that key was already instantiated earlier in this same run, and
+                        # Streamlit refuses to mutate a widget's state after it's mounted. Stash it and
+                        # apply it at the top of NEXT run, before that widget is created again.
+                        st.session_state.pending_page_nav = "Run Backtest"
+                        st.rerun()
+
+    st.markdown(eyebrow("ADDING A NEW STRATEGY"), unsafe_allow_html=True)
+    st.caption("This catalog is meant to keep growing. New strategies get added in "
+               "webapp/registry.py - each one is a single StrategyDef entry pointing at a "
+               "research/*.py backtest module that already exists; see the comment at the top "
+               "of registry.py for the exact shape, or the auto_param() helper for a quicker "
+               "way to wire up its tunable parameters without hand-typing every bound.")
+
+
 def run_backtest_page():
     strategy_names = [s.name for s in STRATEGIES]
+    # jump here from a "Run this strategy" click on the Browse Strategies page - pre-selects
+    # the chosen strategy for exactly this one rerun, then gets out of the way (popped, not
+    # left in session_state) so it never overrides a later manual pick in this same session.
+    pending_id = st.session_state.pop("pending_strategy_id", None)
+    default_index = 0
+    if pending_id:
+        for i, s in enumerate(STRATEGIES):
+            if s.id == pending_id:
+                default_index = i
+                break
 
     # config console - a single horizontal HUD strip replacing the old left sidebar. All
     # run controls live here, top of page, above the results - nothing tucked in a side rail.
@@ -567,7 +644,7 @@ def run_backtest_page():
         c1, c2, c3 = st.columns([1.3, 1.6, 1.3])
         with c1:
             st.markdown('<div class="console-label">Strategy</div>', unsafe_allow_html=True)
-            chosen_name = st.selectbox("Strategy", strategy_names, label_visibility="collapsed")
+            chosen_name = st.selectbox("Strategy", strategy_names, index=default_index, label_visibility="collapsed")
             strategy = next(s for s in STRATEGIES if s.name == chosen_name)
             st.caption(f"{strategy.granularity}. {strategy.notes}")
         with c2:
@@ -729,15 +806,21 @@ def history_page():
 # the top instead of a 2006-era left rail; both pages share it.
 # --------------------------------------------------------------------------------------
 
+pending_page_nav = st.session_state.pop("pending_page_nav", None)
+if pending_page_nav:
+    st.session_state.page_nav = pending_page_nav
+
 header_l, header_r = st.columns([2, 1])
 with header_l:
     st.markdown('<div class="brand">&#9889; STRATEGY BACKTESTS</div>', unsafe_allow_html=True)
 with header_r:
-    page = st.segmented_control("Page", ["Run Backtest", "History"], default="Run Backtest",
-                                 label_visibility="collapsed", key="page_nav")
+    page = st.segmented_control("Page", ["Run Backtest", "Browse Strategies", "History"],
+                                 default="Run Backtest", label_visibility="collapsed", key="page_nav")
 st.markdown('<hr class="brand-rule"/>', unsafe_allow_html=True)
 
 if page == "History":
     history_page()
+elif page == "Browse Strategies":
+    browse_strategies_page()
 else:
     run_backtest_page()
