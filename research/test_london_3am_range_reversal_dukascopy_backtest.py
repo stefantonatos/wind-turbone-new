@@ -15,7 +15,10 @@
 #      test_evendyer_vwap_orb_dukascopy_backtest.py's _mirror_ohlc - mirroring price around a
 #      pivot and swapping high/low turns a hand-verified SHORT scenario into an equally-verified
 #      LONG one without re-deriving the arithmetic by hand a second time).
-#   8. A smoke end-to-end run on synthetic multi-day, multi-instrument data.
+#   8. The full-range-target-dominates-equilibrium invariant the module's own stage-4 comment
+#      relies on to skip trying equilibrium as a fallback target - proven algebraically here
+#      across a grid of ranges/entries/risk sizes, not just asserted.
+#   9. A smoke end-to-end run on synthetic multi-day, multi-instrument data.
 #
 # Run with:  python -m pytest research/test_london_3am_range_reversal_dukascopy_backtest.py -v
 
@@ -50,9 +53,11 @@ def _build_short_day(n_filler=25):
     102.0, a TIGHT 3-bar post-sweep consolidation right under the sweep extreme (lows
     101.95-101.98), then a displacement bar closing at 101.9 (just below the 101.95 cluster
     floor, still well above the new range's equilibrium of 100.75). Verified by hand:
-      new range = [102.0, 99.5] -> equilibrium = 100.75
+      new range = [102.0, 99.5] -> equilibrium = 100.75 (still used for the premium/discount
+      gate, but no longer the TARGET - see the module's own stage-4 comment)
       entry = 101.9, stop = 102.0 + 0.02% buffer = 102.02038, sl_distance = 0.12038
-      target = 100.75, reward = 1.15, reward:risk = 9.55 (comfortably clears MIN_REWARD_RISK)
+      target = 99.5 (the full opposite-range boundary), reward = 2.4, reward:risk = 19.94
+      (comfortably clears MIN_REWARD_RISK)
     Flat filler bars after the target keep price away from stop/target so a caller can control
     how the trade resolves (TP hit immediately below without filler, or forced-FLAT with a very
     long flat filler and no filler-hit)."""
@@ -150,7 +155,8 @@ class TestFullChainAndTradeManagement(unittest.TestCase):
         self.assertEqual(t["side"], "SHORT")
         self.assertAlmostEqual(t["entry_price"], 101.9, places=6)
         self.assertAlmostEqual(t["stop_price"], 102.0 + (lrr.STOP_BUFFER_PCT / 100.0) * 101.9, places=6)
-        self.assertAlmostEqual(t["target_price"], 100.75, places=6)
+        self.assertAlmostEqual(t["target_price"], 99.5, places=6)
+        self.assertEqual(t["target_mode"], "full_range")
 
     def test_long_mirrors_short_with_signs_flipped(self):
         s_highs, s_lows, s_closes = _build_short_day(n_filler=2)
@@ -161,11 +167,12 @@ class TestFullChainAndTradeManagement(unittest.TestCase):
         t = trades[0]
         self.assertEqual(t["side"], "LONG")
         self.assertAlmostEqual(t["entry_price"], 200.0 - 101.9, places=6)
-        self.assertAlmostEqual(t["target_price"], 200.0 - 100.75, places=6)
+        self.assertAlmostEqual(t["target_price"], 200.0 - 99.5, places=6)
 
     def test_target_hit_is_recorded_as_tp_with_reward_risk_as_r(self):
         highs, lows, closes = _build_short_day(n_filler=2)
-        # bar right after entry (index 29) already dips to/through the target (100.75)
+        # the default filler dips to 99.0/98.9 (close/low) a couple bars after entry, which
+        # crosses the full-range target (99.5) well before MAX_HOLD_BARS
         df = _make_df(closes, highs=highs, lows=lows)
         trades = lrr.backtest_instrument("TEST", df)
         self.assertEqual(len(trades), 1)
@@ -235,8 +242,9 @@ class TestGuards(unittest.TestCase):
 
     def test_reward_risk_below_floor_is_skipped_not_forced(self):
         highs, lows, closes = _build_short_day(n_filler=25)
-        # loosen the post-sweep cluster so displacement only confirms much closer to
-        # equilibrium than to the sweep extreme - a real but sub-2.0 reward:risk setup
+        # loosen the post-sweep cluster so displacement only confirms much closer to the sweep
+        # extreme (entry 100.9, stop ~102.02) - even against the full-range target (99.5) this
+        # is only ~1.25 reward:risk, still below MIN_REWARD_RISK=2.0
         highs[25], lows[25], closes[25] = 101.9, 101.5, 101.6
         highs[26], lows[26], closes[26] = 101.6, 101.2, 101.3
         highs[27], lows[27], closes[27] = 101.3, 100.95, 101.0
@@ -267,6 +275,37 @@ class TestOneTradePerDay(unittest.TestCase):
         trades = lrr.backtest_instrument("TEST", df)
         self.assertEqual(len(trades), 2)
         self.assertEqual(len({t["date"] for t in trades}), 2)
+
+
+# ============================= full-range vs equilibrium target invariant =============================
+
+class TestFullRangeTargetDominatesEquilibrium(unittest.TestCase):
+    def test_full_range_reward_risk_is_always_at_least_equilibriums(self):
+        # Direct algebraic check of the invariant the module's stage-4 comment relies on to skip
+        # trying equilibrium as a fallback target: for any valid new_top > new_bottom, any entry
+        # strictly between equilibrium and new_top (the premium gate's own precondition), and any
+        # positive sl_distance, reward-to-full-range / sl_distance >= reward-to-equilibrium /
+        # sl_distance (SHORT case; LONG is the mirror image of the same algebra). Swept across a
+        # grid of values rather than asserted from a single example.
+        for new_top, new_bottom in [(110.0, 90.0), (105.0, 100.0), (200.0, 50.0), (10.5, 10.0)]:
+            equilibrium = (new_top + new_bottom) / 2.0
+            for entry_frac in [0.01, 0.25, 0.5, 0.75, 0.99]:
+                entry = equilibrium + entry_frac * (new_top - equilibrium)   # strictly in (equilibrium, new_top]
+                reward_equilibrium = entry - equilibrium
+                reward_full_range = entry - new_bottom
+                self.assertGreater(reward_equilibrium, 0)   # the premium gate's own precondition
+                for sl_distance in [0.001, 1.0, 50.0]:
+                    self.assertGreaterEqual(reward_full_range / sl_distance,
+                                             reward_equilibrium / sl_distance)
+
+    def test_every_produced_trade_uses_the_full_range_target_mode(self):
+        # integration-level echo of the same invariant: given it's provably never beaten, no
+        # trade this module ever produces should come back with target_mode == "equilibrium"
+        highs, lows, closes = _build_short_day(n_filler=2)
+        df = _make_df(closes, highs=highs, lows=lows)
+        trades = lrr.backtest_instrument("TEST", df)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["target_mode"], "full_range")
 
 
 # ============================= smoke end-to-end =============================

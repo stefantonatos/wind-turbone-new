@@ -35,8 +35,9 @@
 #   3. NEW DEALING RANGE / EQUILIBRIUM: sweeping the range high forms a new range from that
 #      swept high down to the ORIGINAL range low (mirror image for a low-side sweep) - the
 #      video's own "this high to this low is your new dealing range" framing. EQUILIBRIUM is
-#      the 50% midpoint of this new range - the video's stated target ("you're only looking for
-#      a trade to 50%").
+#      the 50% midpoint of this new range - the first source's stated target ("you're only
+#      looking for a trade to 50%"), still computed below since #8 depends on it, though it's
+#      no longer this script's actual TARGET - see #8.
 #   4. DISPLACEMENT: ict_silver_bullet's own "market structure shift" is anchored to the swing
 #      BEFORE its sweep. This video's own worked example anchors it AFTER the sweep instead -
 #      "you have one, two, three [candles] that also traded above this range high... this
@@ -55,11 +56,20 @@
 #      limit-order model.
 #   7. STOP: beyond the sweep bar's own wick, small buffer - same STOP_BUFFER_PCT convention as
 #      every other script here.
-#   8. TARGET: EQUILIBRIUM (see #3) - the video's own stated target, not a searched or invented
-#      one. If the reward:risk to equilibrium is below MIN_REWARD_RISK, the trade is SKIPPED
-#      rather than resized or forced to a fallback ratio - the video is explicit about this too
-#      ("don't try force a 1:5 with this strategy... at least a 1:2"), unlike ict_po3's
-#      fallback-to-fixed-R:R handling of the same situation.
+#   8. TARGET: the FULL opposite-range boundary (the ORIGINAL range low for a high-side sweep,
+#      ORIGINAL range high for a low-side sweep) - NOT equilibrium. Revised from an earlier pass
+#      that only ever targeted equilibrium, after a second, independent source made the same
+#      claim about this exact strategy and additionally said the target can be "50%... or the
+#      connected range low/high", i.e. the far side, not just the midpoint. Equilibrium is
+#      DELIBERATELY not tried as a fallback when the full-range target misses MIN_REWARD_RISK,
+#      despite that being a real, considered option here: it provably could never have passed
+#      anyway, since the premium/discount gate (#5) already guarantees entry sits on the
+#      profitable side of equilibrium, which makes reward-to-full-range = reward-to-equilibrium
+#      + the (always positive) half-range width - strictly bigger, every time, off the same
+#      risk. If the full-range target's reward:risk is below MIN_REWARD_RISK, the trade is
+#      SKIPPED rather than resized or forced to a fallback ratio - both sources are explicit
+#      about this ("don't try force a 1:5 with this strategy... at least a 1:2"), unlike
+#      ict_po3's fallback-to-fixed-R:R handling of the same situation.
 #
 # One trade/day/instrument (the first sweep found; no retry if displacement fails). No
 # parameter grid search - like ict_po3 and evendyer_vwap_orb, this is a single fixed rule set
@@ -195,15 +205,31 @@ def find_range_reversal_trade(highs, lows, closes, times, day_bars, n):
     if sweep_side == "SHORT":
         stop = sweep_extreme + buffer_price
         sl_distance = stop - entry
-        target = equilibrium
-        reward = entry - target
+        target = new_bottom
     else:
         stop = sweep_extreme - buffer_price
         sl_distance = entry - stop
-        target = equilibrium
-        reward = target - entry
+        target = new_top
 
-    if sl_distance <= 0 or reward <= 0:
+    if sl_distance <= 0:
+        return None
+
+    # TARGET: the FULL opposite-range boundary, not equilibrium - a second source (a different
+    # video, same claim independently) confirms the target isn't always just 50%: "target 50%...
+    # or the connected range low/high". Equilibrium is deliberately NOT tried as a fallback when
+    # the full-range target misses MIN_REWARD_RISK, because it provably never would have passed
+    # anyway: the premium/discount gate above already guarantees entry sits strictly on the
+    # profitable side of equilibrium (reward-to-equilibrium > 0 is a precondition for i_entry to
+    # exist at all), and reward-to-full-range = reward-to-equilibrium + the (always positive)
+    # half-range width - so for the same entry/stop, the full-range reward:risk is provably always
+    # >= equilibrium's. A "try full-range, fall back to equilibrium" version would have an
+    # equilibrium branch that can mathematically never execute; simplified away here rather than
+    # carried as dead code - see test_london_3am_range_reversal_dukascopy_backtest.py's
+    # TestFullRangeTarget.test_full_range_reward_risk_is_always_at_least_equilibriums for the
+    # proof-by-test.
+    target_mode = "full_range"
+    reward = (entry - target) if sweep_side == "SHORT" else (target - entry)
+    if reward <= 0:
         return None
     reward_risk = reward / sl_distance
     if reward_risk < MIN_REWARD_RISK:
@@ -236,7 +262,7 @@ def find_range_reversal_trade(highs, lows, closes, times, day_bars, n):
         exit_price = stop if outcome == "SL" else target
 
     return {"side": sweep_side, "outcome": outcome, "r": exit_r, "date": times[i_sweep].date(),
-            "stop_pct": sl_distance / entry,
+            "stop_pct": sl_distance / entry, "target_mode": target_mode,
             "entry_price": entry, "stop_price": stop, "target_price": target,
             "exit_price": exit_price, "entry_time": times[i_entry], "exit_time": times[p]}
 

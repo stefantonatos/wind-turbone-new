@@ -114,14 +114,17 @@ pullback-then-reclaim, with stop/target from confirmed swing pivots rather than 
 R:R - the first strategy in this catalog to size trades that way.
 
 London 3AM Range Reversal is the first strategy here sourced from a video walkthrough
-rather than Pine code - and it shows: several of the source's own stated concepts
-("relatively equal lows", "speed and distance") have no numeric definition anywhere in
-it, and one entry condition (SMT) is stated as required but never actually defined (no
-named second instrument, no divergence rule). SMT is deliberately NOT implemented -
-this strategy only trades the mechanical half (a 00:00-02:00 NY dealing range, a
-02:00-04:30 sweep of one side, a post-sweep displacement, and a trade toward the new
-range's 50%). See the script's own header for the full reasoning before trusting its
-numbers as a faithful test of "the strategy" as marketed.
+rather than Pine code (now two independent ones, corroborating each other) - and it
+shows: several stated concepts ("relatively equal lows", "speed and distance") have no
+numeric definition anywhere in either source, and one entry condition (SMT) is stated
+as required but never actually defined (no named second instrument, no divergence
+rule). SMT is deliberately NOT implemented - this strategy only trades the mechanical
+half (a 00:00-02:00 NY dealing range, a 02:00-04:30 sweep of one side, a post-sweep
+displacement, and a trade toward the FULL opposite side of the range, not just its 50%
+midpoint - the second source's "50%... or the connected range low" made the full-range
+target the one actually used, since it mathematically always dominates the 50% one
+whenever it's reachable at all). See the script's own header for the full reasoning
+before trusting its numbers as a faithful test of "the strategy" as marketed.
 
 Three of these (Donchian, MA cross, Dow Theory) are multi-day SWING/POSITION systems on
 daily channels/pivots rather than intraday, so their date-range default is ~3

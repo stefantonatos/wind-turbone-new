@@ -803,15 +803,18 @@ def _build_registry():
         params=[
             ParamSpec("STOP_BUFFER_PCT", "Stop buffer (% of price)", "float", l3am_mod.STOP_BUFFER_PCT, 0.0, 1.0, 0.01),
             ParamSpec("MIN_RANGE_PCT", "Min dealing-range floor (% of price)", "float", l3am_mod.MIN_RANGE_PCT, 0.0, 1.0, 0.01),
-            ParamSpec("MIN_REWARD_RISK", "Min reward:risk to equilibrium (else skip)", "float", l3am_mod.MIN_REWARD_RISK, 0.5, 5.0, 0.5),
+            ParamSpec("MIN_REWARD_RISK", "Min reward:risk to target (else skip)", "float", l3am_mod.MIN_REWARD_RISK, 0.5, 5.0, 0.5),
         ],
         facets=[],
-        notes="Sourced from a YouTube walkthrough, not Pine code - unlike PO3/Silver Bullet, several of "
-              "its own stated concepts have no numeric definition. One entry condition (SMT) is required "
-              "in the source video but never defined there (no named second instrument, no divergence "
-              "rule) and is DELIBERATELY NOT IMPLEMENTED here - this only trades the mechanical half "
-              "(00:00-02:00 NY dealing range -> 02:00-04:30 sweep -> post-sweep displacement -> trade to "
-              "the new range's 50%). See the script's own header for the full reasoning.",
+        notes="Sourced from two independent YouTube walkthroughs, not Pine code - unlike PO3/Silver "
+              "Bullet, several stated concepts have no numeric definition. One entry condition (SMT) is "
+              "required in both sources but never defined in either (no named second instrument, no "
+              "divergence rule) and is DELIBERATELY NOT IMPLEMENTED here - this only trades the "
+              "mechanical half (00:00-02:00 NY dealing range -> 02:00-04:30 sweep -> post-sweep "
+              "displacement -> trade to the FULL opposite range boundary, not the 50% midpoint - the "
+              "second source's own \"50%... or the connected range low\" made the full-range target the "
+              "one actually used, since it strictly dominates 50% every time it's reachable at all). See "
+              "the script's own header for the full reasoning.",
         runner=_run_london_3am,
         optimization_module=_find_optimization_module("research.london_3am_range_reversal_dukascopy_backtest"),
     ))
