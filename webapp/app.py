@@ -453,6 +453,11 @@ def render_prop_firm_fit_section(trades, key_prefix):
         st.caption("Not enough trades in this run (need at least 10) to run a meaningful prop-firm simulation.")
         return
 
+    st.warning("⚠ **Not a guarantee.** This is a probability estimate from resampling one already-completed "
+               "backtest, not a prediction of what will happen if you trade this for real. A high \"chance of "
+               "passing\" here does not mean you will pass, or that this strategy is safe to fund a real "
+               "account with. See the app-wide disclaimer at the bottom of the page.")
+
     prop_presets = importlib.import_module("research.prop_firm_presets")
     prop_sim = importlib.import_module("research.prop_firm_challenge_simulator")
 
@@ -1102,9 +1107,13 @@ def gallery_page():
                     run_id = r["run_id"]
                     current_name = r.get("name") or f"{r['strategy']} - {r['start_date']}"
                     name_cols = st.columns([4, 1])
+                    # help= surfaces the FULL name as a hover tooltip - the input box itself is only
+                    # as wide as 1/3 of the page (3 cards/row), so a long strategy name (most of
+                    # them, once auto-named "<Strategy> - Compare All <date>") truncates with no way
+                    # to read the rest otherwise.
                     new_name = name_cols[0].text_input("Name", value=current_name,
                                                           key=f"gallery_name_input_{run_id}",
-                                                          label_visibility="collapsed")
+                                                          label_visibility="collapsed", help=current_name)
                     if name_cols[1].button("💾", key=f"gallery_name_save_{run_id}", help="Save name",
                                              use_container_width=True):
                         if new_name.strip() and new_name.strip() != current_name:
@@ -1115,10 +1124,14 @@ def gallery_page():
                     st.caption(f"{r['strategy']} · {', '.join(r.get('instruments') or [])}")
                     st.caption(f"{r['start_date']} to {r['end_date']} · run at {when}")
 
-                    metric_cols = st.columns(3)
+                    # 2 st.metric columns, not 3 - a card is only ~1/3 of the page wide, and a third
+                    # narrow metric column was truncating "Max DD" values with an ellipsis
+                    # ("-77.4…") no matter the formatting, since st.metric doesn't wrap. Max DD gets
+                    # its own full-width caption line instead, which never truncates.
+                    metric_cols = st.columns(2)
                     metric_cols[0].metric("Trades", r["n_trades"])
                     metric_cols[1].metric("Total R", f"{r['total_r']:+.2f}")
-                    metric_cols[2].metric("Max DD", f"-{r.get('max_drawdown_r', 0.0):.2f}R")
+                    st.caption(f"Max drawdown: -{r.get('max_drawdown_r', 0.0):.2f}R")
                     if r["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING:
                         st.caption(f"⚠ Small sample (<{stats_mod.MIN_TRADES_FOR_RANKING} trades) - "
                                    f"directional only, not meaningful evidence either way.")
@@ -1359,3 +1372,20 @@ elif page == "Gallery":
     gallery_page()
 else:
     run_backtest_page()
+
+# Footer, not the top bar - the top bar was deliberately stripped down earlier (explicit
+# feedback that it felt cluttered), so this lives at the bottom instead: present on every page,
+# out of the way of the actual workflow. DRAFT language, not reviewed by a lawyer - needs real
+# legal review before this app is used to make any actual trading or purchase decision, same
+# framing as every other "not measured real data" caveat already in this project.
+st.markdown("---")
+st.caption(
+    "Not financial advice. Nothing on this site is a recommendation to buy, sell, or trade any "
+    "instrument, strategy, or prop firm challenge. Every number here comes from a backtest or a "
+    "resample of a backtest - a model of the past, not a prediction of the future - and none of "
+    "it accounts for live spread, slippage, commission, execution risk, or your own broker's "
+    "actual conditions. Past performance (real or backtested) does not guarantee future results. "
+    "This tool is provided for research and educational purposes only, with no warranty of "
+    "accuracy or completeness, and is not a substitute for independent financial or legal "
+    "advice. [Draft disclaimer - not reviewed by a lawyer.]"
+)
