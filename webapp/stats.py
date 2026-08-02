@@ -8,6 +8,70 @@ import math
 import statistics
 from collections import defaultdict
 
+# Below this many trades, a strategy's return figure is mostly noise - not enough signal to
+# rank against other strategies or crown as "best" of anything. Used to GATE ranking/highlight
+# UI (Compare All leaderboard, Gallery sort-by-return), not just caption around - a strategy
+# under this floor should never win a head-to-head comparison on point estimate alone, however
+# good that estimate looks. 100 trades is a common rule-of-thumb floor for a binomial-ish
+# win/loss series to start being distinguishable from noise; still thin, but a real floor is
+# better than none.
+MIN_TRADES_FOR_RANKING = 100
+
+
+# --- typical retail trading cost, applied by DEFAULT everywhere this app shows results -----
+# Every backtest in this project runs with NO commission/spread/slippage modeled (see each
+# research/*.py script's own header caveat) - each script's own "COST SENSITIVITY" section only
+# ever showed a few illustrative what-if scenarios, never actually applied to the headline
+# numbers. This is a webapp-layer, post-hoc deduction using that exact same formula
+# (cost_adjusted_r = r - (cost_pct / 100) / stop_pct, where stop_pct = sl_distance / entry,
+# already recorded on most trades project-wide since the cost-sensitivity rollout) - applied to
+# every metric, chart, and leaderboard by default, not just an optional report line.
+#
+# SOURCING (same discipline as prop_firm_presets.py - real, checkable, gaps flagged honestly,
+# not guessed): figures below are TYPICAL RETAIL STANDARD-ACCOUNT round-trip spreads, order-of-
+# magnitude from public broker-comparison sources (checked August 2026: EURUSD ~0.6-1.0 pip,
+# GBPUSD ~0.6-1.5 pip, USDJPY ~0.1-0.7 pip typical across tested standard accounts; XAUUSD
+# ~20-35 "pip"/$0.20-0.35 typical standard-account spread), deliberately rounded toward the
+# WIDER/more conservative end of each range - those sources mostly test best-in-class/ECN
+# conditions, and understating cost is the more dangerous error for a tool people might trade
+# real money on. These are NOT live, NOT broker-specific, and exclude commission (many ECN
+# accounts charge a separate per-lot fee on top of a tighter spread) and slippage entirely.
+# Re-verify against your actual broker before relying on this for a real decision.
+DEFAULT_COST_PCT = 0.03   # instruments not in the table below - matches the middle scenario
+                           # every research script's own COST_PCT_SCENARIOS already prints
+TYPICAL_COST_PCT_BY_INSTRUMENT = {
+    "EURUSD": 0.01,    # ~0.8-1.0 pip typical retail standard-account spread at ~1.08
+    "GBPUSD": 0.015,   # ~1.2-1.5 pip at ~1.27
+    "USDJPY": 0.01,    # ~0.5-0.7 pip at ~150 (some brokers tighter; kept conservative)
+    "XAUUSD": 0.02,    # ~20-30 "pip" ($0.20-0.30) standard-account gold spread at ~$2,600
+}
+
+
+def cost_pct_for_instrument(instrument):
+    return TYPICAL_COST_PCT_BY_INSTRUMENT.get(instrument, DEFAULT_COST_PCT)
+
+
+def apply_cost_adjustment(trades):
+    """Returns (adjusted_trades, n_unadjusted). Each trade's 'r' is reduced by its instrument's
+    typical round-trip cost (see TYPICAL_COST_PCT_BY_INSTRUMENT/DEFAULT_COST_PCT above),
+    converted into R-terms via stop_pct - the exact formula every research script's own COST
+    SENSITIVITY section already uses. A trade with no stop_pct (a handful of scripts don't
+    record it) is left unadjusted rather than guessed at - n_unadjusted lets the caller be
+    honest about partial coverage instead of silently mixing adjusted and unadjusted trades."""
+    out = []
+    n_unadjusted = 0
+    for t in trades:
+        t = dict(t)
+        stop_pct = t.get("stop_pct")
+        r = t.get("r")
+        if r is not None and stop_pct:
+            cost_pct = cost_pct_for_instrument(t.get("instrument"))
+            t["r"] = r - (cost_pct / 100.0) / stop_pct
+        else:
+            n_unadjusted += 1
+        out.append(t)
+    return out, n_unadjusted
+
 
 def scale_trades_r(trades, factor):
     """Returns a shallow-copied trade list with every 'r' multiplied by `factor` - used to

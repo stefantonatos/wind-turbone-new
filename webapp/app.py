@@ -187,10 +187,37 @@ def render_filterable_results(trades, strategy, key_prefix):
     st.caption(f"{len(filtered)} of {len(trades)} trades match the current filters. "
                f"Filtering never re-fetches data - it only recomputes over the already-run trade list.")
 
-    s = stats_mod.compute_stats(filtered)
-    if s is None:
+    if not filtered:
         st.warning("No trades match the current filters.")
         return
+
+    st.markdown(eyebrow("TRADING COSTS"), unsafe_allow_html=True)
+    cost_cols = st.columns([1.3, 3])
+    apply_costs = cost_cols[0].checkbox("Apply typical trading costs", value=True,
+                                          key=f"{key_prefix}_apply_costs",
+                                          help="Deducts a typical retail round-trip spread cost per "
+                                               "instrument from every trade (see stats.py's "
+                                               "TYPICAL_COST_PCT_BY_INSTRUMENT). Every backtest here runs "
+                                               "with ZERO cost modeled by default (see each research "
+                                               "script's own header caveat) - this is on by default so the "
+                                               "numbers below don't overstate what's actually achievable. "
+                                               "Turn off to see the raw, no-cost numbers the underlying "
+                                               "research script itself produced.")
+    if apply_costs:
+        filtered, n_unadjusted = stats_mod.apply_cost_adjustment(filtered)
+        cost_note = ("Typical retail round-trip spread costs applied per instrument - order-of-magnitude "
+                      "estimates, not live broker data (see stats.py for sourcing/caveats; re-verify "
+                      "against your actual broker before trusting these for a real decision).")
+        if n_unadjusted:
+            cost_note += f" {n_unadjusted} of {len(filtered)} trades had no recorded stop distance and " \
+                          f"were left unadjusted."
+        cost_cols[1].caption(cost_note)
+    else:
+        cost_cols[1].caption("Showing RAW numbers with no trading costs deducted - this overstates what's "
+                              "actually achievable with real execution. Uncheck only to compare against "
+                              "the underlying research script's own zero-cost report.")
+
+    s = stats_mod.compute_stats(filtered)   # filtered is non-empty and cost adjustment never drops trades
 
     st.markdown(eyebrow("DISPLAY"), unsafe_allow_html=True)
     display_cols = st.columns([1, 1, 2])
@@ -226,8 +253,10 @@ def render_filterable_results(trades, strategy, key_prefix):
         metric_cols[4].metric("Loss rate (SL)", f"{s_display['sl_pct']:.1f}%")
         metric_cols[5].metric(f"Max drawdown ({unit_label})", unit_fmt.format(-s_display["max_drawdown_r"]))
         metric_cols[6].metric("Approx z-score", f"{s_display['z_score']:.2f}")
-    if s_display["n_trades"] < 100:
-        st.caption(f"Only {s_display['n_trades']} trades - too few to trust the z-score regardless of its value.")
+    if s_display["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING:
+        st.warning(f"Only {s_display['n_trades']} trades - below the {stats_mod.MIN_TRADES_FOR_RANKING}-trade "
+                   f"floor this app uses elsewhere (Compare All, Gallery sorting) before treating a result as "
+                   f"rankable. Every number above is directional at best, not evidence either way.")
     st.caption("Multiple comparisons: this project has shipped many strategies, several with their own "
                "parameter grid searches - a single strategy's z-score in isolation isn't strong evidence, "
                "since data-snooping risk compounds across every strategy and parameter combination tried "
@@ -704,7 +733,10 @@ def render_compare_all_section():
                f"range (each using its own usual instrument list and its own defaults - no manual "
                f"parameters here either) and ranks them by total % return - a real, no-mocked-data "
                f"answer to \"which of these actually works best\", not one strategy's numbers in "
-               f"isolation.")
+               f"isolation. Typical per-instrument trading costs are deducted from every trade before "
+               f"ranking (same as the Results page default - see stats.py for sourcing), and strategies "
+               f"under {stats_mod.MIN_TRADES_FOR_RANKING} trades on this range are excluded from ranking "
+               f"entirely, not just caveated.")
 
     with st.container(border=True):
         today = datetime.date.today()
@@ -757,6 +789,7 @@ def render_compare_all_section():
                 labels = _instrument_labels(strategy)
                 trades = strategy.runner(module, labels, start_dt, end_dt, {}, lambda *a: None)
                 trades = stats_mod.normalize_trade_dates(trades)
+                trades, _n_unadjusted = stats_mod.apply_cost_adjustment(trades)
                 s = stats_mod.compute_stats(trades)
             except Exception as exc:
                 results.append({"strategy": strategy.name, "n_trades": 0, "error": str(exc)})
@@ -783,13 +816,20 @@ def render_compare_all_section():
     if not results:
         return
 
-    ranked = [r for r in results if not r.get("error") and r.get("n_trades", 0) > 0]
+    has_trades = [r for r in results if not r.get("error") and r.get("n_trades", 0) > 0]
     empty_or_failed = [r for r in results if r.get("error") or not r.get("n_trades")]
-    ranked.sort(key=lambda r: -r["total_pct"])
+    # A strategy under the trade-count floor CANNOT win the headline comparison, however good
+    # its return looks - that would just be crowning noise. It still gets fully SHOWN (below),
+    # just structurally excluded from ranking/highlighting - see stats.MIN_TRADES_FOR_RANKING.
+    qualifying = [r for r in has_trades if r["n_trades"] >= stats_mod.MIN_TRADES_FOR_RANKING]
+    thin_sample = [r for r in has_trades if r["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING]
+    qualifying.sort(key=lambda r: -r["total_pct"])
+    thin_sample.sort(key=lambda r: -r["n_trades"])
 
-    if ranked:
-        best = ranked[0]
-        st.markdown(eyebrow(f"BEST OF {len(results)} - {best['strategy']}"), unsafe_allow_html=True)
+    if qualifying:
+        best = qualifying[0]
+        st.markdown(eyebrow(f"BEST OF {len(qualifying)} QUALIFYING (of {len(results)} total)"),
+                    unsafe_allow_html=True)
         with st.container(border=True):
             best_cols = st.columns(5)
             best_cols[0].metric("Total %", f"{best['total_pct']:+.2f}%")
@@ -797,13 +837,20 @@ def render_compare_all_section():
             best_cols[2].metric("Trades", best["n_trades"])
             best_cols[3].metric("Win rate", f"{best['win_pct']:.1f}%")
             best_cols[4].metric("Max drawdown", f"-{best['max_drawdown_pct']:.2f}%")
+        st.caption(f"**{best['strategy']}** - only strategies with at least "
+                   f"{stats_mod.MIN_TRADES_FOR_RANKING} trades on this range are eligible to be ranked "
+                   f"\"best\" at all; see \"too few trades to rank\" below for the rest.")
+    else:
+        st.warning(f"None of the {len(results)} strategies produced at least "
+                   f"{stats_mod.MIN_TRADES_FOR_RANKING} trades on this date range, so there's no "
+                   f"meaningful \"best\" to highlight - widen the range and re-run.")
 
-    st.markdown(eyebrow("FULL LEADERBOARD"), unsafe_allow_html=True)
+    st.markdown(eyebrow("LEADERBOARD (RANKED, ≥100 TRADES)"), unsafe_allow_html=True)
     rows = [{
         "strategy": r["strategy"], "trades": r["n_trades"], "total %": r["total_pct"],
         "avg % / trade": r["avg_pct_per_trade"], "win %": r["win_pct"],
         "max drawdown %": r["max_drawdown_pct"], "z-score": r["z_score"],
-    } for r in ranked]
+    } for r in qualifying]
     if rows:
         leaderboard_df = pd.DataFrame(rows)
         st.dataframe(
@@ -811,14 +858,33 @@ def render_compare_all_section():
                                   fmt={"total %": "{:+.2f}%", "avg % / trade": "{:+.3f}%"})
             .format({"win %": "{:.1f}%", "max drawdown %": "-{:.2f}%", "z-score": "{:.2f}"}, na_rep="-"),
             use_container_width=True, hide_index=True)
+    else:
+        st.caption("No strategy qualifies for ranking on this range yet.")
+
+    if thin_sample:
+        st.markdown(eyebrow(f"TOO FEW TRADES TO RANK (<{stats_mod.MIN_TRADES_FOR_RANKING})"),
+                    unsafe_allow_html=True)
+        st.caption("Shown for reference only - NOT sorted by return, NOT eligible for \"best of\" above. "
+                   "A strong-looking % here is not evidence of anything with this few trades.")
+        thin_rows = [{
+            "strategy": r["strategy"], "trades": r["n_trades"], "total %": r["total_pct"],
+            "win %": r["win_pct"],
+        } for r in thin_sample]
+        thin_df = pd.DataFrame(thin_rows)
+        st.dataframe(
+            style_signed_columns(thin_df, ["total %"], fmt={"total %": "{:+.2f}%"})
+            .format({"win %": "{:.1f}%"}, na_rep="-"),
+            use_container_width=True, hide_index=True)
+
     if empty_or_failed:
         with st.expander(f"{len(empty_or_failed)} strategies produced no trades or failed on this range"):
             for r in empty_or_failed:
                 st.caption(f"**{r['strategy']}**: {r.get('error') or 'no trades in this date range'}")
-    st.caption(f"Ranked by total % return at {st.session_state.get('compare_all_risk_pct_used', 1.0):.2f}% "
-               f"risk/trade. Same caveats as everywhere else in this app: no commission/spread/slippage "
-               f"modeled, and a strategy with very few trades on this range isn't meaningfully proven "
-               f"either way - check the trades column, not just the rank.")
+    st.caption(f"Leaderboard ranked by total % return at "
+               f"{st.session_state.get('compare_all_risk_pct_used', 1.0):.2f}% risk/trade, restricted to "
+               f"strategies with at least {stats_mod.MIN_TRADES_FOR_RANKING} trades on this range. Same "
+               f"caveats as everywhere else in this app: no commission/spread/slippage modeled, and this "
+               f"is in-sample performance over the exact period shown, not an out-of-sample test.")
 
 
 def browse_strategies_page():
@@ -932,6 +998,9 @@ def gallery_page():
                     metric_cols[0].metric("Trades", r["n_trades"])
                     metric_cols[1].metric("Total R", f"{r['total_r']:+.2f}")
                     metric_cols[2].metric("Max DD", f"-{r.get('max_drawdown_r', 0.0):.2f}R")
+                    if r["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING:
+                        st.caption(f"⚠ Small sample (<{stats_mod.MIN_TRADES_FOR_RANKING} trades) - "
+                                   f"directional only, not meaningful evidence either way.")
 
                     trades = run_history.load_trades_for_run(run_id)
                     if trades:
