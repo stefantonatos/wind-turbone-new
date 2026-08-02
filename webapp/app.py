@@ -1051,13 +1051,20 @@ def render_compare_all_section():
                f"whole \"holdout\" window is still historical data that already happened.")
 
 
-def browse_strategies_page():
+def _render_strategy_catalog():
+    # This is the actual landing state (no strategy picked yet) - the one thing every first-time
+    # visitor sees before anything else, so it carries the only "what is this" explainer in the
+    # whole app. Kept to a few sentences on purpose: this is a HUD console, not a marketing page.
     st.markdown(eyebrow("STRATEGY CATALOG"), unsafe_allow_html=True)
-    st.caption(f"{len(STRATEGIES)} strategies in this build. Pick one to jump straight into Run Backtest "
-               f"with it pre-selected - no need to hunt through the dropdown.")
-
-    render_compare_all_section()
-    st.markdown("---")
+    with st.container(border=True):
+        st.markdown("**What this is**")
+        st.write(f"A backtesting sandbox for {len(STRATEGIES)} algorithmic trading strategies against "
+                 f"real historical Dukascopy data - nothing here is mocked or precomputed. Pick a "
+                 f"strategy card below to read what it does, then run it. Already know the strategies "
+                 f"and just want to see all {len(STRATEGIES)} ranked against each other? Use "
+                 f"**Compare All** in the top nav instead.")
+        st.caption("⚠ Not financial advice and no guarantee of future performance - see the full "
+                   "disclaimer at the bottom of every page.")
 
     cols_per_row = 3
     for row_start in range(0, len(STRATEGIES), cols_per_row):
@@ -1078,13 +1085,12 @@ def browse_strategies_page():
                                 unsafe_allow_html=True)
                     st.caption(f"{len(strategy.instruments)} instruments - "
                                f"{len(strategy.params)} parameters searched automatically when optimizing")
-                    if st.button("Run this strategy", key=f"browse_run_{strategy.id}", use_container_width=True):
-                        st.session_state.pending_strategy_id = strategy.id
-                        # can't set st.session_state.page_nav directly here - the segmented_control
-                        # widget with that key was already instantiated earlier in this same run, and
-                        # Streamlit refuses to mutate a widget's state after it's mounted. Stash it and
-                        # apply it at the top of NEXT run, before that widget is created again.
-                        st.session_state.pending_page_nav = "Run Backtest"
+                    if st.button("Run this strategy", key=f"catalog_run_{strategy.id}", use_container_width=True):
+                        # Plain session_state we fully own (not a widget's own key), so it's safe to
+                        # set and immediately rerun on - this is what actually transitions the SAME
+                        # "Backtest" page from the catalog into the run-config view below, no separate
+                        # page/nav jump needed any more.
+                        st.session_state.selected_strategy_id = strategy.id
                         st.rerun()
 
     st.markdown(eyebrow("ADDING A NEW STRATEGY"), unsafe_allow_html=True)
@@ -1188,27 +1194,28 @@ def gallery_page():
                         st.rerun()
 
 
-def run_backtest_page():
+def _render_run_config(strategy):
     strategy_names = [s.name for s in STRATEGIES]
-    # jump here from a "Run this strategy" click on the Browse Strategies page - pre-selects
-    # the chosen strategy for exactly this one rerun, then gets out of the way (popped, not
-    # left in session_state) so it never overrides a later manual pick in this same session.
-    pending_id = st.session_state.pop("pending_strategy_id", None)
-    default_index = 0
-    if pending_id:
-        for i, s in enumerate(STRATEGIES):
-            if s.id == pending_id:
-                default_index = i
-                break
+
+    back_l, back_r = st.columns([1, 4])
+    with back_l:
+        if st.button("← Back to catalog", key="backtest_back_to_catalog", use_container_width=True):
+            st.session_state.selected_strategy_id = None
+            st.rerun()
+    with back_r:
+        st.markdown(eyebrow(strategy.name), unsafe_allow_html=True)
 
     # config console - a single compact row, no captions under each control (detail moved into
-    # tooltips) - this is the first thing anyone sees, so it stays minimal: pick 3 things, hit
-    # Run. Nothing here needs opening or reading paragraphs to use.
+    # tooltips) - pick 3 things, hit Run. The Strategy dropdown here still lets you flip between
+    # all strategies without going back to the catalog card grid; picking one updates
+    # selected_strategy_id too, so "Back to catalog" and this dropdown always agree.
     with st.container(border=True):
         c1, c2, c3 = st.columns([1.3, 1.6, 1.3])
         with c1:
-            chosen_name = st.selectbox("Strategy", strategy_names, index=default_index)
+            chosen_name = st.selectbox("Strategy", strategy_names,
+                                        index=strategy_names.index(strategy.name))
             strategy = next(s for s in STRATEGIES if s.name == chosen_name)
+            st.session_state.selected_strategy_id = strategy.id
         with c2:
             labels = _instrument_labels(strategy)
             selected_instruments = st.multiselect("Instruments", labels, default=labels,
@@ -1325,6 +1332,27 @@ def run_backtest_page():
         )
 
 
+def backtest_page():
+    # One continuous flow instead of two separate nav pages: land on the catalog (what/why +
+    # strategy cards), and picking a strategy transitions this SAME page into the run-config +
+    # results view rather than jumping somewhere else. selected_strategy_id is the only thing
+    # deciding which half renders.
+    selected_id = st.session_state.get("selected_strategy_id")
+    strategy = next((s for s in STRATEGIES if s.id == selected_id), None) if selected_id else None
+    if strategy is None:
+        _render_strategy_catalog()
+    else:
+        _render_run_config(strategy)
+
+
+def compare_all_page():
+    # Its own top-level nav item rather than bundled at the top of the strategy catalog - this is
+    # a distinct, power-user workflow ("I already know these strategies, rank all N at once"), not
+    # part of the "what is this / pick one" onboarding path, and it shouldn't compete with that
+    # path for the first thing a new visitor sees.
+    render_compare_all_section()
+
+
 def history_page():
     st.markdown(eyebrow("RUN HISTORY"), unsafe_allow_html=True)
     st.caption("Every completed backtest run from this tool, newest first.")
@@ -1398,18 +1426,18 @@ header_l, header_r = st.columns([2, 1])
 with header_l:
     st.markdown('<div class="brand">&#9889; STRATEGY BACKTESTS</div>', unsafe_allow_html=True)
 with header_r:
-    page = st.segmented_control("Page", ["Run Backtest", "Browse Strategies", "Gallery", "History"],
-                                 default="Run Backtest", label_visibility="collapsed", key="page_nav")
+    page = st.segmented_control("Page", ["Backtest", "Compare All", "Gallery", "History"],
+                                 default="Backtest", label_visibility="collapsed", key="page_nav")
 st.markdown('<hr class="brand-rule"/>', unsafe_allow_html=True)
 
 if page == "History":
     history_page()
-elif page == "Browse Strategies":
-    browse_strategies_page()
+elif page == "Compare All":
+    compare_all_page()
 elif page == "Gallery":
     gallery_page()
 else:
-    run_backtest_page()
+    backtest_page()
 
 # Footer, not the top bar - the top bar was deliberately stripped down earlier (explicit
 # feedback that it felt cluttered), so this lives at the bottom instead: present on every page,
