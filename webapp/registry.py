@@ -750,6 +750,38 @@ def _build_registry():
         optimization_module=_find_optimization_module("research.ict_silver_bullet_forex_dukascopy_backtest"),
     ))
 
+    # ---------------------------------------------------------------------------
+    # london_3am_range_reversal_dukascopy_backtest.py (London 3AM Range Reversal)
+    # Exposes: INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, STOP_BUFFER_PCT,
+    # MIN_RANGE_PCT, MIN_REWARD_RISK, fetch_instrument_data(instrument_const) -> df,
+    # backtest_instrument(label, df) -> trades (keys: side, outcome, r, date, stop_pct). Same
+    # shape as ict_po3 - single-arg fetch, bare trade-list return - so it reuses _run_po3
+    # directly rather than needing its own runner.
+    # ---------------------------------------------------------------------------
+    _run_london_3am = _run_po3
+    l3am_mod = _load_module("research.london_3am_range_reversal_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="london_3am_range_reversal",
+        name="London 3AM Range Reversal",
+        module_name="research.london_3am_range_reversal_dukascopy_backtest",
+        granularity="5-min bars",
+        instruments=l3am_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("STOP_BUFFER_PCT", "Stop buffer (% of price)", "float", l3am_mod.STOP_BUFFER_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("MIN_RANGE_PCT", "Min dealing-range floor (% of price)", "float", l3am_mod.MIN_RANGE_PCT, 0.0, 1.0, 0.01),
+            ParamSpec("MIN_REWARD_RISK", "Min reward:risk to equilibrium (else skip)", "float", l3am_mod.MIN_REWARD_RISK, 0.5, 5.0, 0.5),
+        ],
+        facets=[],
+        notes="Sourced from a YouTube walkthrough, not Pine code - unlike PO3/Silver Bullet, several of "
+              "its own stated concepts have no numeric definition. One entry condition (SMT) is required "
+              "in the source video but never defined there (no named second instrument, no divergence "
+              "rule) and is DELIBERATELY NOT IMPLEMENTED here - this only trades the mechanical half "
+              "(00:00-02:00 NY dealing range -> 02:00-04:30 sweep -> post-sweep displacement -> trade to "
+              "the new range's 50%). See the script's own header for the full reasoning.",
+        runner=_run_london_3am,
+        optimization_module=_find_optimization_module("research.london_3am_range_reversal_dukascopy_backtest"),
+    ))
+
     orb_mod = _load_module("research.orb_indices_dukascopy_backtest")
     entries.append(StrategyDef(
         id="orb_indices",

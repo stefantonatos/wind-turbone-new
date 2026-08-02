@@ -77,16 +77,27 @@ falls back to local-disk-only behavior exactly as before, so this is entirely op
 
 ## Strategies in the registry
 
-14 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+15 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
-Support/Resistance Zone Bounce, ICT Silver Bullet, ORB (indices), and EvenDyer VWAP ORB.
+Support/Resistance Zone Bounce, ICT Silver Bullet, London 3AM Range Reversal, ORB
+(indices), and EvenDyer VWAP ORB.
 
 EvenDyer VWAP ORB is US index CFDs only (SP500/NASDAQ100/DOWJONES) - its opening-range and
 VWAP session windows are scoped to US equity trading hours, there's no forex reading of
 those defaults. It enters WITH an opening-range break's direction after a VWAP
 pullback-then-reclaim, with stop/target from confirmed swing pivots rather than a fixed
 R:R - the first strategy in this catalog to size trades that way.
+
+London 3AM Range Reversal is the first strategy here sourced from a video walkthrough
+rather than Pine code - and it shows: several of the source's own stated concepts
+("relatively equal lows", "speed and distance") have no numeric definition anywhere in
+it, and one entry condition (SMT) is stated as required but never actually defined (no
+named second instrument, no divergence rule). SMT is deliberately NOT implemented -
+this strategy only trades the mechanical half (a 00:00-02:00 NY dealing range, a
+02:00-04:30 sweep of one side, a post-sweep displacement, and a trade toward the new
+range's 50%). See the script's own header for the full reasoning before trusting its
+numbers as a faithful test of "the strategy" as marketed.
 
 Three of these (Donchian, MA cross, Dow Theory) are multi-day SWING/POSITION systems on
 daily channels/pivots rather than intraday, so their date-range default is ~3
