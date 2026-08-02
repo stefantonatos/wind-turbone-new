@@ -143,26 +143,52 @@ def render_filterable_results(trades, strategy, key_prefix):
     sides = sorted({t.get("side") for t in trades if t.get("side")})
     has_dates = all(t.get("date") for t in trades)
 
-    st.markdown(eyebrow("FILTERS"), unsafe_allow_html=True)
-    n_cols = 3 + len(facets)
-    cols = st.columns(n_cols)
-    sel_outcomes = cols[0].multiselect("Outcome", outcomes, default=outcomes, key=f"{key_prefix}_f_outcome")
-    sel_instruments = cols[1].multiselect("Instrument", instruments, default=instruments, key=f"{key_prefix}_f_instrument")
-    sel_sides = cols[2].multiselect("Side", sides, default=sides, key=f"{key_prefix}_f_side")
+    # Everything that changes HOW results are filtered/computed lives in one hidden-by-default
+    # section - sensible defaults (no filters, typical costs applied, % of account, 1% risk)
+    # apply automatically, same "don't make people decide things to see a result" philosophy as
+    # the removed manual-parameter sliders. Nothing below this needs opening it to work.
+    with st.expander("Filters & display settings", expanded=False):
+        n_cols = 3 + len(facets)
+        cols = st.columns(n_cols)
+        sel_outcomes = cols[0].multiselect("Outcome", outcomes, default=outcomes, key=f"{key_prefix}_f_outcome")
+        sel_instruments = cols[1].multiselect("Instrument", instruments, default=instruments,
+                                                key=f"{key_prefix}_f_instrument")
+        sel_sides = cols[2].multiselect("Side", sides, default=sides, key=f"{key_prefix}_f_side")
 
-    facet_selections = {}
-    for i, facet in enumerate(facets):
-        values = sorted({t.get(facet) for t in trades if t.get(facet)})
-        facet_selections[facet] = cols[3 + i].multiselect(facet.capitalize(), values, default=values,
-                                                             key=f"{key_prefix}_f_{facet}")
+        facet_selections = {}
+        for i, facet in enumerate(facets):
+            values = sorted({t.get(facet) for t in trades if t.get(facet)})
+            facet_selections[facet] = cols[3 + i].multiselect(facet.capitalize(), values, default=values,
+                                                                 key=f"{key_prefix}_f_{facet}")
 
-    date_range_filter = None
-    if has_dates:
-        all_dates = sorted({t["date"] for t in trades})
-        min_d, max_d = all_dates[0], all_dates[-1]
-        if min_d != max_d:
-            date_range_filter = st.slider("Date sub-range", min_value=min_d, max_value=max_d,
-                                            value=(min_d, max_d), key=f"{key_prefix}_f_daterange")
+        date_range_filter = None
+        if has_dates:
+            all_dates = sorted({t["date"] for t in trades})
+            min_d, max_d = all_dates[0], all_dates[-1]
+            if min_d != max_d:
+                date_range_filter = st.slider("Date sub-range", min_value=min_d, max_value=max_d,
+                                                value=(min_d, max_d), key=f"{key_prefix}_f_daterange")
+
+        st.markdown("---")
+        set_cols = st.columns([1.5, 1.1, 1.1, 2.3])
+        apply_costs = set_cols[0].checkbox("Apply typical trading costs", value=True,
+                                             key=f"{key_prefix}_apply_costs",
+                                             help="Deducts a typical retail round-trip spread cost per "
+                                                  "instrument from every trade (see stats.py's "
+                                                  "TYPICAL_COST_PCT_BY_INSTRUMENT) - every backtest here "
+                                                  "runs with ZERO cost modeled by default, so this is on by "
+                                                  "default to avoid overstating what's achievable. Turn off "
+                                                  "to see the underlying research script's raw numbers.")
+        display_mode = set_cols[1].radio("Units", ["% of account", "R-multiples"], index=0,
+                                          key=f"{key_prefix}_display_mode", label_visibility="collapsed")
+        risk_pct = set_cols[2].number_input("Risk/trade %", min_value=0.05, max_value=10.0, value=1.0,
+                                              step=0.25, key=f"{key_prefix}_risk_pct",
+                                              help="Assumed % of account risked per trade - converts R into "
+                                                   "an account % and into the dollar equity curve. A "
+                                                   "display assumption only; the underlying trades never "
+                                                   "change.")
+        set_cols[3].caption("Costs applied (typical, not live broker data)" if apply_costs
+                             else "⚠ RAW - no costs deducted")
 
     filtered = []
     for t in trades:
@@ -184,117 +210,86 @@ def render_filterable_results(trades, strategy, key_prefix):
                 continue
         filtered.append(t)
 
-    st.caption(f"{len(filtered)} of {len(trades)} trades match the current filters. "
-               f"Filtering never re-fetches data - it only recomputes over the already-run trade list.")
-
     if not filtered:
         st.warning("No trades match the current filters.")
         return
-
-    st.markdown(eyebrow("TRADING COSTS"), unsafe_allow_html=True)
-    cost_cols = st.columns([1.3, 3])
-    apply_costs = cost_cols[0].checkbox("Apply typical trading costs", value=True,
-                                          key=f"{key_prefix}_apply_costs",
-                                          help="Deducts a typical retail round-trip spread cost per "
-                                               "instrument from every trade (see stats.py's "
-                                               "TYPICAL_COST_PCT_BY_INSTRUMENT). Every backtest here runs "
-                                               "with ZERO cost modeled by default (see each research "
-                                               "script's own header caveat) - this is on by default so the "
-                                               "numbers below don't overstate what's actually achievable. "
-                                               "Turn off to see the raw, no-cost numbers the underlying "
-                                               "research script itself produced.")
+    n_unadjusted = 0
     if apply_costs:
         filtered, n_unadjusted = stats_mod.apply_cost_adjustment(filtered)
-        cost_note = ("Typical retail round-trip spread costs applied per instrument - order-of-magnitude "
-                      "estimates, not live broker data (see stats.py for sourcing/caveats; re-verify "
-                      "against your actual broker before trusting these for a real decision).")
-        if n_unadjusted:
-            cost_note += f" {n_unadjusted} of {len(filtered)} trades had no recorded stop distance and " \
-                          f"were left unadjusted."
-        cost_cols[1].caption(cost_note)
-    else:
-        cost_cols[1].caption("Showing RAW numbers with no trading costs deducted - this overstates what's "
-                              "actually achievable with real execution. Uncheck only to compare against "
-                              "the underlying research script's own zero-cost report.")
+    caption_bits = []
+    if len(filtered) != len(trades):
+        caption_bits.append(f"{len(filtered)} of {len(trades)} trades match the current filters")
+    if n_unadjusted:
+        caption_bits.append(f"{n_unadjusted} trade(s) had no stop distance and were left cost-unadjusted")
+    if caption_bits:
+        st.caption(" · ".join(caption_bits) + ".")
 
     s = stats_mod.compute_stats(filtered)   # filtered is non-empty and cost adjustment never drops trades
-
-    st.markdown(eyebrow("DISPLAY"), unsafe_allow_html=True)
-    display_cols = st.columns([1, 1, 2])
-    display_mode = display_cols[0].radio("Units", ["% of account", "R-multiples"], index=0,
-                                          horizontal=True, key=f"{key_prefix}_display_mode",
-                                          label_visibility="collapsed")
-    # Always visible now, not just for "% of account" - the dollar equity curve below needs
-    # this conversion factor regardless of which unit the metrics table itself is showing.
-    risk_pct = display_cols[1].number_input("Risk per trade (%)", min_value=0.05, max_value=10.0,
-                                               value=1.0, step=0.25, key=f"{key_prefix}_risk_pct",
-                                               help="Assumed % of account risked per trade - converts each "
-                                                    "trade's R-multiple into an account % (r x risk%) for the "
-                                                    "%-unit metrics and the dollar equity curve below. This is "
-                                                    "a DISPLAY assumption, not something the backtest itself "
-                                                    "used - the underlying trades never change.")
-    display_cols[2].caption(f"Every number below is r × {risk_pct:.2f}% - purely a unit conversion, "
-                             f"same trades either way." if display_mode == "% of account" else
-                             f"Metrics below are in raw R; the equity curve further down still uses "
-                             f"{risk_pct:.2f}% risk/trade to convert to dollars.")
     display_trades = stats_mod.scale_trades_r(filtered, risk_pct) if display_mode == "% of account" else filtered
     unit_label = "%" if display_mode == "% of account" else "R"
     unit_fmt = "{:+.2f}%" if display_mode == "% of account" else "{:+.3f}R"
     s_display = stats_mod.compute_stats(display_trades)
 
-    st.markdown(eyebrow("PERFORMANCE METRICS"), unsafe_allow_html=True)
-    with st.container(border=True):
-        metric_cols = st.columns(7)
-        metric_cols[0].metric("Trades", s_display["n_trades"])
-        metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]),
-                               help=f"95% confidence interval: {unit_fmt.format(s_display['total_r_ci_low'])} "
-                                    f"to {unit_fmt.format(s_display['total_r_ci_high'])} (normal "
-                                    f"approximation - wide on a small sample, not a guarantee either way).")
-        avg_fmt = unit_fmt if unit_label == "R" else "{:+.3f}%"
-        metric_cols[2].metric(f"Avg {unit_label} / trade", avg_fmt.format(s_display["avg_r"]),
-                               help=f"95% confidence interval: {avg_fmt.format(s_display['avg_r_ci_low'])} to "
-                                    f"{avg_fmt.format(s_display['avg_r_ci_high'])} (normal approximation - "
-                                    f"wide on a small sample, not a guarantee either way).")
-        metric_cols[3].metric("Win rate (TP)", f"{s_display['tp_pct']:.1f}%")
-        metric_cols[4].metric("Loss rate (SL)", f"{s_display['sl_pct']:.1f}%")
-        metric_cols[5].metric(f"Max drawdown ({unit_label})", unit_fmt.format(-s_display["max_drawdown_r"]))
-        metric_cols[6].metric("Approx z-score", f"{s_display['z_score']:.2f}")
-    if s_display["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING:
-        st.warning(f"Only {s_display['n_trades']} trades - below the {stats_mod.MIN_TRADES_FOR_RANKING}-trade "
-                   f"floor this app uses elsewhere (Compare All, Gallery sorting) before treating a result as "
-                   f"rankable. Every number above is directional at best, not evidence either way.")
-    st.caption("Multiple comparisons: this project has shipped many strategies, several with their own "
-               "parameter grid searches - a single strategy's z-score in isolation isn't strong evidence, "
-               "since data-snooping risk compounds across every strategy and parameter combination tried "
-               "project-wide, not just this one. (z-score is the same number in either display unit above - "
-               "it's scale-invariant.) Max drawdown is the largest peak-to-trough decline in the cumulative "
-               "equity curve below, not the worst single losing trade.")
+    result_tab_labels = ["Overview", "Breakdown", "Prop Firm Fit"]
+    chart_capable = bool(strategy and strategy.chart_fetcher)
+    if chart_capable:
+        result_tab_labels.append("Trade Chart")
+    result_tabs = st.tabs(result_tab_labels)
 
-    st.markdown(eyebrow("EQUITY CURVE (ACCOUNT \\$, \\$10,000 START)"), unsafe_allow_html=True)
-    xs, equity, chronological = stats_mod.dollar_equity_curve(filtered, risk_pct)
-    render_dollar_equity_chart(xs, equity, chronological, key=f"{key_prefix}_equity_chart")
-    st.caption(f"Assumes a \\$10,000 starting account and {risk_pct:.2f}% risked per trade (same assumption as "
-               f"the DISPLAY section above) - green above \\$10,000, red below. This is a sizing assumption for "
-               f"the chart only, not something the backtest itself used.")
-    if not chronological:
-        st.caption("This strategy's trade records don't carry a date field upstream - order shown is "
-                   "per-instrument backtest sequence, not calendar order.")
+    with result_tabs[0]:
+        with st.container(border=True):
+            metric_cols = st.columns(7)
+            metric_cols[0].metric("Trades", s_display["n_trades"])
+            metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]),
+                                   help=f"95% CI: {unit_fmt.format(s_display['total_r_ci_low'])} to "
+                                        f"{unit_fmt.format(s_display['total_r_ci_high'])} (normal "
+                                        f"approximation - wide on a small sample, not a guarantee).")
+            avg_fmt = unit_fmt if unit_label == "R" else "{:+.3f}%"
+            metric_cols[2].metric(f"Avg {unit_label}/trade", avg_fmt.format(s_display["avg_r"]),
+                                   help=f"95% CI: {avg_fmt.format(s_display['avg_r_ci_low'])} to "
+                                        f"{avg_fmt.format(s_display['avg_r_ci_high'])}.")
+            metric_cols[3].metric("Win rate", f"{s_display['tp_pct']:.1f}%")
+            metric_cols[4].metric("Loss rate", f"{s_display['sl_pct']:.1f}%")
+            metric_cols[5].metric(f"Max drawdown", unit_fmt.format(-s_display["max_drawdown_r"]),
+                                   help="Largest peak-to-trough decline in the cumulative equity curve "
+                                        "below, not the worst single losing trade.")
+            metric_cols[6].metric("z-score", f"{s_display['z_score']:.2f}",
+                                   help="Approximate significance vs. zero edge - scale-invariant (same in "
+                                        "either unit). Not strong evidence in isolation: this project has "
+                                        "shipped many strategies/parameter searches, so data-snooping risk "
+                                        "compounds project-wide, not just here.")
+        if s_display["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING:
+            st.warning(f"Only {s_display['n_trades']} trades - below the {stats_mod.MIN_TRADES_FOR_RANKING}-"
+                       f"trade floor this app uses elsewhere (Compare All, Gallery) before treating a result "
+                       f"as rankable. Directional at best, not evidence either way.")
 
-    st.markdown(eyebrow("PER-INSTRUMENT BREAKDOWN"), unsafe_allow_html=True)
-    rows = stats_mod.per_instrument_breakdown(display_trades)
-    breakdown_df = pd.DataFrame(rows)
-    breakdown_styler = style_signed_columns(breakdown_df, ["total_r", "avg_r"],
-                                              fmt={"total_r": "{:+.3f}", "avg_r": "{:+.4f}"})
-    if "win_pct" in breakdown_df.columns and hasattr(breakdown_styler, "format"):
-        breakdown_styler = breakdown_styler.format({"win_pct": "{:.1f}%"})
-    st.dataframe(breakdown_styler, use_container_width=True, hide_index=True)
+        st.markdown(eyebrow("EQUITY CURVE (ACCOUNT \\$, \\$10,000 START)"), unsafe_allow_html=True)
+        xs, equity, chronological = stats_mod.dollar_equity_curve(filtered, risk_pct)
+        render_dollar_equity_chart(xs, equity, chronological, key=f"{key_prefix}_equity_chart")
+        st.caption(f"\\${risk_pct:.2f}% risked/trade, green above \\$10,000 red below - a sizing assumption "
+                   f"for this chart only." + ("" if chronological else " Order shown is backtest sequence, "
+                   "not calendar order (no date field upstream)."))
 
-    st.markdown(eyebrow("TRADE LOG"), unsafe_allow_html=True)
-    trade_df = pd.DataFrame(display_trades)
-    st.dataframe(style_signed_columns(trade_df, ["r"]), use_container_width=True, hide_index=True)
+    with result_tabs[1]:
+        st.markdown(eyebrow("PER-INSTRUMENT BREAKDOWN"), unsafe_allow_html=True)
+        rows = stats_mod.per_instrument_breakdown(display_trades)
+        breakdown_df = pd.DataFrame(rows)
+        breakdown_styler = style_signed_columns(breakdown_df, ["total_r", "avg_r"],
+                                                  fmt={"total_r": "{:+.3f}", "avg_r": "{:+.4f}"})
+        if "win_pct" in breakdown_df.columns and hasattr(breakdown_styler, "format"):
+            breakdown_styler = breakdown_styler.format({"win_pct": "{:.1f}%"})
+        st.dataframe(breakdown_styler, use_container_width=True, hide_index=True)
 
-    render_trade_chart_section(strategy, filtered, key_prefix)
-    render_prop_firm_fit_section(filtered, key_prefix)
+        st.markdown(eyebrow("TRADE LOG"), unsafe_allow_html=True)
+        trade_df = pd.DataFrame(display_trades)
+        st.dataframe(style_signed_columns(trade_df, ["r"]), use_container_width=True, hide_index=True)
+
+    with result_tabs[2]:
+        render_prop_firm_fit_section(filtered, key_prefix)
+
+    if chart_capable:
+        with result_tabs[3]:
+            render_trade_chart_section(strategy, filtered, key_prefix)
 
 
 def render_trade_chart_section(strategy, trades, key_prefix):
@@ -309,8 +304,6 @@ def render_trade_chart_section(strategy, trades, key_prefix):
                  and t.get("entry_price") is not None]
     if not chartable:
         return
-
-    st.markdown(eyebrow("TRADE CHART"), unsafe_allow_html=True)
 
     def _label(t):
         et = pd.Timestamp(t["entry_time"])
@@ -384,7 +377,6 @@ def render_prop_firm_fit_section(trades, key_prefix):
     research/prop_firm_challenge_simulator.py's multi_phase_risk_sweep and
     research/prop_firm_presets.py for the sourced rule sets). Gated behind a button - this is
     real Monte Carlo compute (thousands of simulated multi-phase attempts), not instant."""
-    st.markdown(eyebrow("PROP FIRM FIT"), unsafe_allow_html=True)
     if len(trades) < 10:
         st.caption("Not enough trades in this run (need at least 10) to run a meaningful prop-firm simulation.")
         return
@@ -1040,23 +1032,19 @@ def run_backtest_page():
                 default_index = i
                 break
 
-    # config console - a single horizontal HUD strip replacing the old left sidebar. All
-    # run controls live here, top of page, above the results - nothing tucked in a side rail.
+    # config console - a single compact row, no captions under each control (detail moved into
+    # tooltips) - this is the first thing anyone sees, so it stays minimal: pick 3 things, hit
+    # Run. Nothing here needs opening or reading paragraphs to use.
     with st.container(border=True):
-        st.markdown(eyebrow("BACKTEST CONFIG"), unsafe_allow_html=True)
         c1, c2, c3 = st.columns([1.3, 1.6, 1.3])
         with c1:
-            st.markdown('<div class="console-label">Strategy</div>', unsafe_allow_html=True)
-            chosen_name = st.selectbox("Strategy", strategy_names, index=default_index, label_visibility="collapsed")
+            chosen_name = st.selectbox("Strategy", strategy_names, index=default_index)
             strategy = next(s for s in STRATEGIES if s.name == chosen_name)
-            st.caption(f"{strategy.granularity}. {strategy.notes}")
         with c2:
-            st.markdown('<div class="console-label">Instruments</div>', unsafe_allow_html=True)
             labels = _instrument_labels(strategy)
             selected_instruments = st.multiselect("Instruments", labels, default=labels,
-                                                     label_visibility="collapsed", key=f"{strategy.id}_instruments")
+                                                     key=f"{strategy.id}_instruments")
         with c3:
-            st.markdown('<div class="console-label">Date range</div>', unsafe_allow_html=True)
             today = datetime.date.today()
             latest_available = today - datetime.timedelta(days=1)   # today's trading day isn't complete yet
             default_end = latest_available
@@ -1068,7 +1056,10 @@ def run_backtest_page():
             # selection entirely. Instead: accept whatever's picked, then clamp/validate it in plain code
             # below, so the caption and the actual run always agree on exactly the same range.
             date_range = st.date_input("Date range", value=(default_start, default_end),
-                                          label_visibility="collapsed", key=f"{strategy.id}_daterange")
+                                          key=f"{strategy.id}_daterange",
+                                          help="Widen or narrow freely - first fetches of a wide range can "
+                                               "take many minutes. Capped to yesterday (today's trading day "
+                                               "isn't complete yet).")
 
             date_range_error = None
             if not (isinstance(date_range, tuple) and len(date_range) == 2):
@@ -1084,23 +1075,17 @@ def run_backtest_page():
 
             if date_range_error:
                 st.caption(f"⚠ {date_range_error}")
-            else:
-                span_days = (date_range[1] - date_range[0]).days
-                span_label = f"~{span_days / 365:.1f} years" if span_days >= 365 else f"~{span_days} days"
-                clamp_note = " (end date clamped to yesterday - today's trading day isn't complete yet)" \
-                    if date_range[1] != end_d else ""
-                st.caption(f"Currently set to {span_label} ({date_range[0]} to {date_range[1]}){clamp_note}. "
-                           f"Widen or narrow freely - first fetches of a wide range can take many minutes.")
+            elif date_range[1] != end_d:
+                st.caption("⚠ End date clamped to yesterday.")
 
         # No manual parameter tweaking here any more - every plain Run Backtest uses this
         # strategy's own fixed defaults. Finding a better combination automatically is what the
         # Optimization & Robustness tab (after a run) is for, not hand-guessed sidebar sliders.
         param_values = {}
 
-        run_clicked = st.button("Run Backtest", type="primary", use_container_width=True)
-        st.caption("Every run fetches real historical data live from Dukascopy - nothing here is mocked or "
-                   "precomputed. No commission, spread, or slippage is modeled, matching every underlying "
-                   "research script's own caveat.")
+        run_clicked = st.button("Run Backtest", type="primary", use_container_width=True,
+                                 help="Fetches real historical data live from Dukascopy - nothing here is "
+                                      "mocked or precomputed.")
 
     if run_clicked:
         if not selected_instruments:

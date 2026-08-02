@@ -142,19 +142,12 @@ div[data-testid="stSegmentedControl"] label {{
   letter-spacing: 0.05em;
 }}
 
-/* config console - the bordered panel holding strategy/instrument/date controls that used
-   to live in the sidebar, now a horizontal strip at the top of the page instead */
-.console-label {{
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-muted);
-  margin-bottom: 0.15rem;
-}}
 
-/* primary button - glowing HUD action button */
-.stButton > button, .stDownloadButton > button {{
+/* primary button - glowing HUD action button. Descendant selector (space), not a direct-child
+   combinator (>) - Streamlit wraps a button in an extra tooltip container the moment it has a
+   `help=` tooltip, which broke a `.stButton > button` direct-child match and silently fell back
+   to unstyled default buttons on every button we added a help tooltip to. */
+.stButton button, .stDownloadButton button {{
   background: linear-gradient(180deg, rgba(0, 194, 255, 0.18), rgba(0, 194, 255, 0.08));
   color: var(--accent);
   border: 1px solid rgba(0, 194, 255, 0.55);
@@ -168,15 +161,15 @@ div[data-testid="stSegmentedControl"] label {{
   box-shadow: 0 0 0 rgba(0, 194, 255, 0);
   transition: box-shadow 0.2s ease, background 0.2s ease;
 }}
-.stButton > button:hover, .stDownloadButton > button:hover {{
+.stButton button:hover, .stDownloadButton button:hover {{
   background: linear-gradient(180deg, rgba(0, 194, 255, 0.3), rgba(0, 194, 255, 0.12));
   box-shadow: 0 0 18px rgba(0, 194, 255, 0.35);
   color: #ffffff;
 }}
-.stButton > button:focus:not(:active) {{
+.stButton button:focus:not(:active) {{
   border-color: var(--accent);
 }}
-.stButton > button[kind="primary"] {{
+.stButton button[kind="primary"] {{
   background: linear-gradient(180deg, rgba(0, 194, 255, 0.4), rgba(0, 194, 255, 0.18));
   color: #ffffff;
   box-shadow: 0 0 14px rgba(0, 194, 255, 0.3);
