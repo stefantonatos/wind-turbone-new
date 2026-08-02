@@ -830,21 +830,43 @@ def render_compare_all_section():
         progress_placeholder = st.empty()
         progress_bar = progress_placeholder.progress(0, text="Starting...")
         results = []
+        n_saved = 0
         for i, strategy in enumerate(STRATEGIES):
             progress_bar.progress(i / len(STRATEGIES), text=f"Running {strategy.name} ({i + 1}/{len(STRATEGIES)})...")
             try:
                 module = importlib.import_module(strategy.module_name)
                 labels = _instrument_labels(strategy)
-                trades = strategy.runner(module, labels, start_dt, end_dt, {}, lambda *a: None)
-                trades = stats_mod.normalize_trade_dates(trades)
-                trades, _n_unadjusted = stats_mod.apply_cost_adjustment(trades)
-                s = stats_mod.compute_stats(trades)
+                raw_trades = strategy.runner(module, labels, start_dt, end_dt, {}, lambda *a: None)
+                raw_trades = stats_mod.normalize_trade_dates(raw_trades)
+                cost_trades, _n_unadjusted = stats_mod.apply_cost_adjustment(raw_trades)
+                s = stats_mod.compute_stats(cost_trades)
             except Exception as exc:
                 results.append({"strategy": strategy.name, "n_trades": 0, "error": str(exc)})
                 continue
             if s is None:
                 results.append({"strategy": strategy.name, "n_trades": 0, "error": "no trades produced"})
                 continue
+
+            # Every strategy that produced at least one trade also becomes a real Gallery entry -
+            # same raw (pre-cost-adjustment) trades a normal "Run Backtest" would save, so Gallery/
+            # History treat it identically (its own cost-adjustment toggle, equity curve, etc. all
+            # work the same way). Best-effort: a save failure here must never break the comparison
+            # itself, which is why this whole block is wrapped separately from the run above.
+            run_id = None
+            try:
+                run_id = run_history.append_run(
+                    strategy_name=strategy.name,
+                    instruments=labels,
+                    start_date=date_range[0],
+                    end_date=date_range[1],
+                    params={},
+                    trades=stats_mod.trades_to_jsonable(raw_trades),
+                    name=f"{strategy.name} - Compare All {date_range[0]}",
+                )
+                n_saved += 1
+            except Exception as exc:
+                print(f"Compare All: failed to save {strategy.name} to history/gallery: {exc}")
+
             results.append({
                 "strategy": strategy.name,
                 "n_trades": s["n_trades"],
@@ -856,15 +878,27 @@ def render_compare_all_section():
                 "max_drawdown_pct": s["max_drawdown_r"] * risk_pct_compare,
                 "z_score": s["z_score"],
                 "error": None,
+                "run_id": run_id,
             })
         progress_bar.progress(1.0, text="Done.")
         progress_placeholder.empty()
         st.session_state["compare_all_results"] = results
         st.session_state["compare_all_risk_pct_used"] = risk_pct_compare
+        st.session_state["compare_all_n_saved"] = n_saved
 
     results = st.session_state.get("compare_all_results")
     if not results:
         return
+
+    n_saved = st.session_state.get("compare_all_n_saved", 0)
+    if n_saved:
+        saved_cols = st.columns([3, 1])
+        saved_cols[0].caption(f"Saved {n_saved} of {len(results)} runs to History/Gallery (search "
+                               f"\"Compare All\" in the Gallery to find just these) - each with its own "
+                               f"equity curve, exactly like a normal single Run Backtest.")
+        if saved_cols[1].button("Open Gallery", key="compare_all_open_gallery", use_container_width=True):
+            st.session_state.pending_page_nav = "Gallery"
+            st.rerun()
 
     has_trades = [r for r in results if not r.get("error") and r.get("n_trades", 0) > 0]
     empty_or_failed = [r for r in results if r.get("error") or not r.get("n_trades")]

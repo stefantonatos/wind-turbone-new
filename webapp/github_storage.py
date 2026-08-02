@@ -81,22 +81,37 @@ def _ensure_branch_exists():
         create.raise_for_status()
 
 
-def read_file(path):
-    """Returns the file's text content, or None if it doesn't exist on the history branch yet.
-    Raises on any other failure (auth, network, etc.) - callers treat that as best-effort and
-    fall back to local disk, never let a GitHub hiccup break the app itself."""
+def _read_content_b64(path):
+    """Returns the file's raw base64 content string from the Contents API, or None if it
+    doesn't exist on the history branch yet. Raises on any other failure (auth, network, etc.)
+    - callers treat that as best-effort and fall back to local disk, never let a GitHub hiccup
+    break the app itself."""
     repo = _repo()
     r = requests.get(f"{GITHUB_API}/repos/{repo}/contents/{path}", headers=_headers(),
                       params={"ref": _branch()}, timeout=_TIMEOUT)
     if r.status_code == 404:
         return None
     r.raise_for_status()
-    data = r.json()
-    return base64.b64decode(data["content"]).decode("utf-8")
+    return r.json()["content"]
 
 
-def write_file(path, content, message):
-    """Creates or updates `path` on the dedicated history branch with `content` (text)."""
+def read_file(path):
+    """Returns the file's text content, or None if it doesn't exist on the history branch yet."""
+    b64 = _read_content_b64(path)
+    return None if b64 is None else base64.b64decode(b64).decode("utf-8")
+
+
+def read_file_bytes(path):
+    """Binary-safe variant of read_file, for content that isn't valid UTF-8 text (e.g. a
+    pickled price-data cache blob - see data_cache.py). Returns raw bytes, or None if the file
+    doesn't exist on the history branch yet."""
+    b64 = _read_content_b64(path)
+    return None if b64 is None else base64.b64decode(b64)
+
+
+def _write_content_b64(path, b64_content, message):
+    """Creates or updates `path` on the dedicated history branch with already-base64-encoded
+    content."""
     _ensure_branch_exists()
     repo = _repo()
     # GitHub's Contents API refuses to update an existing file without its current sha (this
@@ -106,10 +121,20 @@ def write_file(path, content, message):
                              params={"ref": _branch()}, timeout=_TIMEOUT)
     sha = existing.json()["sha"] if existing.status_code == 200 else None
 
-    payload = {"message": message, "branch": _branch(),
-               "content": base64.b64encode(content.encode("utf-8")).decode("ascii")}
+    payload = {"message": message, "branch": _branch(), "content": b64_content}
     if sha:
         payload["sha"] = sha
     r = requests.put(f"{GITHUB_API}/repos/{repo}/contents/{path}", headers=_headers(),
                       json=payload, timeout=_TIMEOUT)
     r.raise_for_status()
+
+
+def write_file(path, content, message):
+    """Creates or updates `path` on the dedicated history branch with `content` (text)."""
+    _write_content_b64(path, base64.b64encode(content.encode("utf-8")).decode("ascii"), message)
+
+
+def write_file_bytes(path, content_bytes, message):
+    """Binary-safe variant of write_file, for content that isn't UTF-8 text (e.g. a pickled
+    price-data cache blob - see data_cache.py)."""
+    _write_content_b64(path, base64.b64encode(content_bytes).decode("ascii"), message)

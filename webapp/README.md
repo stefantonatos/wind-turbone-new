@@ -75,6 +75,20 @@ falls back to local-disk-only behavior exactly as before, so this is entirely op
    shows a warning banner whenever this isn't configured yet, so it's obvious at a
    glance whether history will actually survive a restart.
 
+**The same setup above also speeds up every restart, not just run history.** Every
+raw Dukascopy fetch this app makes is cached to local disk (`webapp/cache/`) for the
+life of one running process - but that cache is wiped on the exact same redeploy/
+sleep-wake cycle as everything else, which is why a "warm" app can suddenly take
+minutes again after sitting idle. `data_cache.py` now pushes each fetched chunk to the
+same dedicated GitHub branch (binary-safe, since a pickled price DataFrame isn't UTF-8
+text - see `github_storage.read_file_bytes`/`write_file_bytes`) and pulls it back
+before ever hitting Dukascopy again on a cold start. No separate setup - the same
+`GITHUB_TOKEN`/`GITHUB_REPO` secrets above cover both. One cap worth knowing: a single
+cached chunk over ~8MB (`data_cache._MAX_GITHUB_BLOB_BYTES`) just stays local-only for
+that process instead of syncing - only realistic on a manually widened, non-default
+date range - and gets re-fetched for real on the next cold start, same as before this
+existed.
+
 ## Strategies in the registry
 
 16 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
@@ -136,7 +150,9 @@ trade list every other strategy and this whole results UI is built around.
   existing fetch/backtest functions. Every entry documents exactly which function and
   constant names it relies on, straight from reading that module's source.
 - `data_cache.py` - the generic disk cache used by any research module that doesn't
-  already have its own.
+  already have its own, with the same best-effort GitHub-backed durability layered on
+  top as run history (binary-safe - see `github_storage.py`'s `*_bytes` variants) so a
+  Streamlit Cloud restart doesn't force a full Dukascopy re-fetch.
 - `optimization.py` - surfaces the "Optimization & Robustness" tab. For the two
   strategies that currently have a real companion script (PO3, Rauf), it calls their
   actual grid-search/Monte-Carlo/cluster/walk-forward functions for real - gated behind
@@ -168,8 +184,10 @@ trade list every other strategy and this whole results UI is built around.
   plus one `<run_id>.trades.json` per run for full trade-level re-viewing), with
   best-effort GitHub-backed persistence layered on top - see `github_storage.py` and
   "Persisting history across restarts" above.
-- `github_storage.py` - optional GitHub Contents API read/write for run history,
-  entirely opt-in (falls back to local-disk-only when not configured).
+- `github_storage.py` - optional GitHub Contents API read/write for run history AND
+  the price-data cache, entirely opt-in (falls back to local-disk-only when not
+  configured). Text (`read_file`/`write_file`) and binary-safe (`read_file_bytes`/
+  `write_file_bytes`) variants share the same underlying base64 content plumbing.
 - `.streamlit/config.toml` + `style.py` - the visual theme: a light, near-monochrome
   palette with one accent blue, hairline borders (never drop shadows), no gradients,
   a capped left-aligned content column, and a small set of chart color constants
