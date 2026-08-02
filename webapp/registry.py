@@ -763,6 +763,7 @@ def _build_registry():
               "catalog's intraday strategies.",
         runner=_run_parabolic_sar,
         optimization_module=_find_optimization_module("research.parabolic_sar_dukascopy_backtest"),
+        default_history_days=3 * 365,
     ))
 
     sb_mod = _load_module("research.ict_silver_bullet_forex_dukascopy_backtest")
