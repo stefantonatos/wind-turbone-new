@@ -1,13 +1,18 @@
-# Strategy Backtests - personal local web UI
+# Strategy Backtests - web UI
 
-A local-only Streamlit dashboard over this project's `research/*.py` backtest scripts.
-Pick a strategy, instruments, and a date range, click **Run Backtest**, and watch it
-run a real backtest against live Dukascopy data - then browse the results as charts and
-tables instead of a scrolling terminal wall of text. Past runs are saved locally so you
-can look back at what you've already tested.
+A Streamlit dashboard over this project's `research/*.py` backtest scripts. Pick a
+strategy, instruments, and a date range, click **Run Backtest**, and watch it run a
+real backtest against live Dukascopy data - then browse the results as charts and
+tables instead of a scrolling terminal wall of text. Four pages, top nav (no
+sidebar): **Run Backtest**, **Browse Strategies** (the full catalog, plus a "Compare
+All Strategies" leaderboard that runs every strategy over the same date range and
+ranks them), **Gallery** (every past run as a sortable/filterable card with a
+red/green equity-curve thumbnail and an editable name), and **History** (the full
+detail view for any past run).
 
-This is not deployed anywhere and is not meant to be public - it's a `streamlit run`
-you start on your own machine when you want to look at this project's strategies.
+Runs locally (`streamlit run webapp/app.py`) or deployed to Streamlit Community
+Cloud. See "Persisting history across restarts" below if deployed - Streamlit Cloud's
+local disk does not survive a redeploy or sleep/wake cycle on its own.
 
 ## Run it
 
@@ -21,8 +26,8 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
 ## What to know before you click "Run Backtest"
 
 - **Every run fetches real historical data live from Dukascopy** via each strategy's
-  own `research/*.py` module - nothing is mocked or precomputed. The sidebar defaults
-  to a short 6-month date range on purpose: a first-time fetch of a wide range (the
+  own `research/*.py` module - nothing is mocked or precomputed. The date range
+  defaults to a short 6-month window on purpose: a first-time fetch of a wide range (the
   research scripts themselves often default to 2005/2010/2016 through 2025) can take
   many minutes even with caching. Widen the range deliberately once you know what
   you're doing.
@@ -38,6 +43,38 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
   session/range) never re-fetches data - it only recomputes stats over the trade list
   already produced by your last "Run Backtest" click.
 
+## Persisting history across restarts (optional, recommended if deployed)
+
+Local disk (`webapp/run_history_data/`) is the fast read/write path for the lifetime
+of one running process, but **Streamlit Community Cloud wipes it on every redeploy
+and every sleep/wake cycle after inactivity** - without external storage, every saved
+run (and any Gallery names you've set) is lost the next time the app restarts. This
+is a platform limitation, not something local files alone can fix.
+
+`webapp/github_storage.py` adds an optional, best-effort backing store: it pushes
+every completed run to a dedicated branch of this same GitHub repo, and pulls it back
+on the next cold start. Nothing here touches the app's own code or the branch it
+deploys from - only that dedicated history branch. If it isn't configured, everything
+falls back to local-disk-only behavior exactly as before, so this is entirely opt-in.
+
+**One-time setup:**
+
+1. On GitHub: **Settings -> Developer settings -> Personal access tokens ->
+   Fine-grained tokens -> Generate new token**. Scope it to just this repository,
+   with Repository permissions -> **Contents: Read and write**. Copy the token
+   (starts with `github_pat_`) - GitHub only shows it once.
+2. On Streamlit Cloud: open this app -> **Settings -> Secrets**, and add:
+   ```toml
+   GITHUB_TOKEN = "github_pat_..."
+   GITHUB_REPO = "owner/repo"
+   ```
+   (e.g. `GITHUB_REPO = "stefantonatos/wind-turbone-new"`). `GITHUB_BRANCH` is
+   optional and defaults to `webapp-history-data`.
+3. Save - the app restarts once, and from then on every completed run is pushed to
+   that branch and pulled back automatically on the next cold start. The Gallery page
+   shows a warning banner whenever this isn't configured yet, so it's obvious at a
+   glance whether history will actually survive a restart.
+
 ## Strategies in the registry
 
 13 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
@@ -46,7 +83,7 @@ Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume 
 Support/Resistance Zone Bounce, ICT Silver Bullet, and ORB (indices).
 
 Three of these (Donchian, MA cross, Dow Theory) are multi-day SWING/POSITION systems on
-daily channels/pivots rather than intraday, so their sidebar date-range default is ~3
+daily channels/pivots rather than intraday, so their date-range default is ~3
 years instead of the 6-month default every intraday strategy uses - these need real
 history to produce more than a couple of signals, and a couple of them (MA cross, Dow
 Theory) are inherently rare/selective by design (a handful to a few dozen trades per
@@ -67,7 +104,7 @@ trade list every other strategy and this whole results UI is built around.
 
 ## Layout
 
-- `app.py` - the Streamlit app (Run Backtest page + History page).
+- `app.py` - the Streamlit app (Run Backtest, Browse Strategies, Gallery, History pages).
 - `registry.py` - the only place that imports `research/*.py` modules and calls their
   existing fetch/backtest functions. Every entry documents exactly which function and
   constant names it relies on, straight from reading that module's source.
@@ -97,10 +134,15 @@ trade list every other strategy and this whole results UI is built around.
   lightweight generic detector that shows a plain "not available yet" state until a
   matching `research/<strategy>_optimization.py` lands and exposes recognizable
   function names.
-- `stats.py` - pure functions over an already-computed trade list (summary stats,
-  per-instrument breakdown, equity curve) - no fetching or backtesting here.
+- `stats.py` - pure functions over an already-computed trade list (summary stats
+  including max drawdown, per-instrument breakdown, R and dollar equity curves) - no
+  fetching or backtesting here.
 - `run_history.py` - append-only local run history (`run_history_data/runs.jsonl`
-  plus one `<run_id>.trades.json` per run for full trade-level re-viewing).
+  plus one `<run_id>.trades.json` per run for full trade-level re-viewing), with
+  best-effort GitHub-backed persistence layered on top - see `github_storage.py` and
+  "Persisting history across restarts" above.
+- `github_storage.py` - optional GitHub Contents API read/write for run history,
+  entirely opt-in (falls back to local-disk-only when not configured).
 - `.streamlit/config.toml` + `style.py` - the visual theme: a light, near-monochrome
   palette with one accent blue, hairline borders (never drop shadows), no gradients,
   a capped left-aligned content column, and a small set of chart color constants

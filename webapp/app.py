@@ -20,6 +20,7 @@ import streamlit as st
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))          # webapp/ itself (registry, stats, ...)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root (research/ package)
 
+import github_storage
 import optimization
 import run_history
 import stats as stats_mod
@@ -88,6 +89,48 @@ def style_diverging_heatmap(df):
     return styler.format("{:+.4f}", na_rep="-")
 
 
+def render_dollar_equity_chart(xs, equity, chronological, key, height=320, compact=False,
+                                 starting_balance=10000.0):
+    """Account-equity-in-dollars chart, green above `starting_balance` and red below it, as a
+    filled area - the standard "clip to baseline, fill twice" Plotly technique for a
+    threshold-relative color split (Plotly has no native per-segment line coloring). Two
+    baseline+fill trace pairs: one clipped to show only the ABOVE-baseline excursions (green),
+    one clipped to show only the BELOW-baseline excursions (red) - their line stroke doubles as
+    the visible equity path since raw fill traces alone have no crisp edge. `compact=True` drops
+    axis labels/ticks for gallery thumbnails."""
+    y_pos = [max(v, starting_balance) for v in equity]
+    y_neg = [min(v, starting_balance) for v in equity]
+    baseline = [starting_balance] * len(xs)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=xs, y=baseline, mode="lines", line=dict(width=0),
+                              showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=xs, y=y_pos, mode="lines", line=dict(width=2, color=GOOD),
+                              fill="tonexty", fillcolor="rgba(0, 230, 160, 0.20)",
+                              showlegend=False, hoverinfo="skip" if compact else None,
+                              name="Above $10,000"))
+    fig.add_trace(go.Scatter(x=xs, y=baseline, mode="lines", line=dict(width=0),
+                              showlegend=False, hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=xs, y=y_neg, mode="lines", line=dict(width=2, color=CRITICAL),
+                              fill="tonexty", fillcolor="rgba(255, 77, 106, 0.20)",
+                              showlegend=False, hoverinfo="skip" if compact else None,
+                              name="Below $10,000"))
+    layout_kwargs = dict(PLOTLY_LAYOUT_DEFAULTS)
+    if compact:
+        layout_kwargs["xaxis"] = dict(visible=False)
+        layout_kwargs["yaxis"] = dict(visible=False)
+        layout_kwargs["margin"] = dict(l=0, r=0, t=0, b=0)
+    fig.update_layout(
+        height=height,
+        xaxis_title=None if compact else ("Trade sequence (chronological)" if chronological else "Trade sequence"),
+        yaxis_title=None if compact else "Account equity ($)",
+        showlegend=False,
+        **layout_kwargs,
+    )
+    st.plotly_chart(fig, use_container_width=True, key=key,
+                     config={"displayModeBar": False} if compact else None)
+
+
 # --------------------------------------------------------------------------------------
 # shared results rendering - used for a fresh run AND for re-viewing a past run from
 # History, so the filter/stats/chart/table behavior is identical either way.
@@ -154,16 +197,19 @@ def render_filterable_results(trades, strategy, key_prefix):
     display_mode = display_cols[0].radio("Units", ["% of account", "R-multiples"], index=0,
                                           horizontal=True, key=f"{key_prefix}_display_mode",
                                           label_visibility="collapsed")
-    risk_pct = 1.0
-    if display_mode == "% of account":
-        risk_pct = display_cols[1].number_input("Risk per trade (%)", min_value=0.05, max_value=10.0,
-                                                   value=1.0, step=0.25, key=f"{key_prefix}_risk_pct",
-                                                   help="Assumed % of account risked per trade - converts each "
-                                                        "trade's R-multiple into an account % (r x risk%). This "
-                                                        "is a DISPLAY assumption, not something the backtest "
-                                                        "itself used - the underlying trades never change.")
-        display_cols[2].caption(f"Every number below is r × {risk_pct:.2f}% - purely a unit conversion, "
-                                 f"same trades either way.")
+    # Always visible now, not just for "% of account" - the dollar equity curve below needs
+    # this conversion factor regardless of which unit the metrics table itself is showing.
+    risk_pct = display_cols[1].number_input("Risk per trade (%)", min_value=0.05, max_value=10.0,
+                                               value=1.0, step=0.25, key=f"{key_prefix}_risk_pct",
+                                               help="Assumed % of account risked per trade - converts each "
+                                                    "trade's R-multiple into an account % (r x risk%) for the "
+                                                    "%-unit metrics and the dollar equity curve below. This is "
+                                                    "a DISPLAY assumption, not something the backtest itself "
+                                                    "used - the underlying trades never change.")
+    display_cols[2].caption(f"Every number below is r × {risk_pct:.2f}% - purely a unit conversion, "
+                             f"same trades either way." if display_mode == "% of account" else
+                             f"Metrics below are in raw R; the equity curve further down still uses "
+                             f"{risk_pct:.2f}% risk/trade to convert to dollars.")
     display_trades = stats_mod.scale_trades_r(filtered, risk_pct) if display_mode == "% of account" else filtered
     unit_label = "%" if display_mode == "% of account" else "R"
     unit_fmt = "{:+.2f}%" if display_mode == "% of account" else "{:+.3f}R"
@@ -171,41 +217,30 @@ def render_filterable_results(trades, strategy, key_prefix):
 
     st.markdown(eyebrow("PERFORMANCE METRICS"), unsafe_allow_html=True)
     with st.container(border=True):
-        metric_cols = st.columns(6)
+        metric_cols = st.columns(7)
         metric_cols[0].metric("Trades", s_display["n_trades"])
         metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]))
         metric_cols[2].metric(f"Avg {unit_label} / trade", (unit_fmt if unit_label == "R" else "{:+.3f}%")
                                .format(s_display["avg_r"]))
         metric_cols[3].metric("Win rate (TP)", f"{s_display['tp_pct']:.1f}%")
         metric_cols[4].metric("Loss rate (SL)", f"{s_display['sl_pct']:.1f}%")
-        metric_cols[5].metric("Approx z-score", f"{s_display['z_score']:.2f}")
+        metric_cols[5].metric(f"Max drawdown ({unit_label})", unit_fmt.format(-s_display["max_drawdown_r"]))
+        metric_cols[6].metric("Approx z-score", f"{s_display['z_score']:.2f}")
     if s_display["n_trades"] < 100:
         st.caption(f"Only {s_display['n_trades']} trades - too few to trust the z-score regardless of its value.")
     st.caption("Multiple comparisons: this project has shipped many strategies, several with their own "
                "parameter grid searches - a single strategy's z-score in isolation isn't strong evidence, "
                "since data-snooping risk compounds across every strategy and parameter combination tried "
                "project-wide, not just this one. (z-score is the same number in either display unit above - "
-               "it's scale-invariant.)")
+               "it's scale-invariant.) Max drawdown is the largest peak-to-trough decline in the cumulative "
+               "equity curve below, not the worst single losing trade.")
 
-    st.markdown(eyebrow(f"EQUITY CURVE (CUMULATIVE {unit_label})"), unsafe_allow_html=True)
-    xs, ys, chronological = stats_mod.equity_curve(display_trades)
-    fig = go.Figure()
-    # neon-glow line: wide, low-opacity copies of the same trace stacked behind the crisp
-    # main line - a standard "HUD glow" trick, not a real visual effect Plotly has natively
-    for glow_width, glow_opacity in ((14, 0.06), (8, 0.10), (4, 0.16)):
-        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines",
-                                  line=dict(width=glow_width, color=ACCENT),
-                                  opacity=glow_opacity, hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", line=dict(width=2, color=ACCENT),
-                              name=f"Cumulative {unit_label}"))
-    fig.update_layout(
-        height=320,
-        xaxis_title="Trade sequence (chronological)" if chronological else "Trade sequence",
-        yaxis_title=f"Cumulative {unit_label}",
-        showlegend=False,
-        **PLOTLY_LAYOUT_DEFAULTS,
-    )
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_equity_chart")
+    st.markdown(eyebrow("EQUITY CURVE (ACCOUNT \\$, \\$10,000 START)"), unsafe_allow_html=True)
+    xs, equity, chronological = stats_mod.dollar_equity_curve(filtered, risk_pct)
+    render_dollar_equity_chart(xs, equity, chronological, key=f"{key_prefix}_equity_chart")
+    st.caption(f"Assumes a \\$10,000 starting account and {risk_pct:.2f}% risked per trade (same assumption as "
+               f"the DISPLAY section above) - green above \\$10,000, red below. This is a sizing assumption for "
+               f"the chart only, not something the backtest itself used.")
     if not chronological:
         st.caption("This strategy's trade records don't carry a date field upstream - order shown is "
                    "per-instrument backtest sequence, not calendar order.")
@@ -663,10 +698,136 @@ def render_run_context(strategy_name, strategy_id, trades, instruments, start_da
 # pages
 # --------------------------------------------------------------------------------------
 
+def render_compare_all_section():
+    st.markdown(eyebrow("COMPARE ALL STRATEGIES"), unsafe_allow_html=True)
+    st.caption(f"Runs every one of the {len(STRATEGIES)} strategies in this catalog over the SAME date "
+               f"range (each using its own usual instrument list and its own defaults - no manual "
+               f"parameters here either) and ranks them by total % return - a real, no-mocked-data "
+               f"answer to \"which of these actually works best\", not one strategy's numbers in "
+               f"isolation.")
+
+    with st.container(border=True):
+        today = datetime.date.today()
+        latest_available = today - datetime.timedelta(days=1)
+        widest_default_days = max(s.default_history_days for s in STRATEGIES)
+        default_start = latest_available - datetime.timedelta(days=widest_default_days)
+        date_range = st.date_input("Date range", value=(default_start, latest_available),
+                                     label_visibility="collapsed", key="compare_all_daterange")
+
+        date_range_error = None
+        if not (isinstance(date_range, tuple) and len(date_range) == 2):
+            date_range_error = "Pick both a start and end date."
+        else:
+            start_d, end_d = date_range
+            clamped_end = min(end_d, latest_available)
+            if start_d >= clamped_end:
+                date_range_error = f"Start date must be before {latest_available}."
+            else:
+                date_range = (start_d, clamped_end)
+
+        if date_range_error:
+            st.caption(f"⚠ {date_range_error}")
+        else:
+            span_days = (date_range[1] - date_range[0]).days
+            st.caption(f"Currently set to ~{span_days} days ({date_range[0]} to {date_range[1]}). "
+                       f"Swing/position strategies (Donchian, MA Cross) need real multi-year history to "
+                       f"produce more than a couple of trades - a short range makes them look "
+                       f"artificially empty, not necessarily bad.")
+
+        risk_pct_compare = st.number_input("Risk per trade (%) - for the % column below", min_value=0.05,
+                                             max_value=10.0, value=1.0, step=0.25, key="compare_all_risk_pct")
+
+        run_all_clicked = st.button("Run All Strategies", type="primary", use_container_width=True,
+                                      disabled=bool(date_range_error))
+        st.caption("Real fetches against Dukascopy for every strategy, one at a time - with this many "
+                   "strategies this can take a long time, especially on a wide date range or first-time "
+                   "fetches of a given instrument/range (later strategies sharing an instrument reuse "
+                   "the disk cache, so it does get faster partway through).")
+
+    if run_all_clicked and not date_range_error:
+        start_dt = datetime.datetime.combine(date_range[0], datetime.time.min)
+        end_dt = datetime.datetime.combine(date_range[1] + datetime.timedelta(days=1), datetime.time.min)
+        progress_placeholder = st.empty()
+        progress_bar = progress_placeholder.progress(0, text="Starting...")
+        results = []
+        for i, strategy in enumerate(STRATEGIES):
+            progress_bar.progress(i / len(STRATEGIES), text=f"Running {strategy.name} ({i + 1}/{len(STRATEGIES)})...")
+            try:
+                module = importlib.import_module(strategy.module_name)
+                labels = _instrument_labels(strategy)
+                trades = strategy.runner(module, labels, start_dt, end_dt, {}, lambda *a: None)
+                trades = stats_mod.normalize_trade_dates(trades)
+                s = stats_mod.compute_stats(trades)
+            except Exception as exc:
+                results.append({"strategy": strategy.name, "n_trades": 0, "error": str(exc)})
+                continue
+            if s is None:
+                results.append({"strategy": strategy.name, "n_trades": 0, "error": "no trades produced"})
+                continue
+            results.append({
+                "strategy": strategy.name,
+                "n_trades": s["n_trades"],
+                "total_pct": s["total_r"] * risk_pct_compare,
+                "avg_pct_per_trade": s["avg_r"] * risk_pct_compare,
+                "win_pct": s["tp_pct"],
+                "max_drawdown_pct": s["max_drawdown_r"] * risk_pct_compare,
+                "z_score": s["z_score"],
+                "error": None,
+            })
+        progress_bar.progress(1.0, text="Done.")
+        progress_placeholder.empty()
+        st.session_state["compare_all_results"] = results
+        st.session_state["compare_all_risk_pct_used"] = risk_pct_compare
+
+    results = st.session_state.get("compare_all_results")
+    if not results:
+        return
+
+    ranked = [r for r in results if not r.get("error") and r.get("n_trades", 0) > 0]
+    empty_or_failed = [r for r in results if r.get("error") or not r.get("n_trades")]
+    ranked.sort(key=lambda r: -r["total_pct"])
+
+    if ranked:
+        best = ranked[0]
+        st.markdown(eyebrow(f"BEST OF {len(results)} - {best['strategy']}"), unsafe_allow_html=True)
+        with st.container(border=True):
+            best_cols = st.columns(5)
+            best_cols[0].metric("Total %", f"{best['total_pct']:+.2f}%")
+            best_cols[1].metric("Avg % / trade", f"{best['avg_pct_per_trade']:+.3f}%")
+            best_cols[2].metric("Trades", best["n_trades"])
+            best_cols[3].metric("Win rate", f"{best['win_pct']:.1f}%")
+            best_cols[4].metric("Max drawdown", f"-{best['max_drawdown_pct']:.2f}%")
+
+    st.markdown(eyebrow("FULL LEADERBOARD"), unsafe_allow_html=True)
+    rows = [{
+        "strategy": r["strategy"], "trades": r["n_trades"], "total %": r["total_pct"],
+        "avg % / trade": r["avg_pct_per_trade"], "win %": r["win_pct"],
+        "max drawdown %": r["max_drawdown_pct"], "z-score": r["z_score"],
+    } for r in ranked]
+    if rows:
+        leaderboard_df = pd.DataFrame(rows)
+        st.dataframe(
+            style_signed_columns(leaderboard_df, ["total %", "avg % / trade"],
+                                  fmt={"total %": "{:+.2f}%", "avg % / trade": "{:+.3f}%"})
+            .format({"win %": "{:.1f}%", "max drawdown %": "-{:.2f}%", "z-score": "{:.2f}"}, na_rep="-"),
+            use_container_width=True, hide_index=True)
+    if empty_or_failed:
+        with st.expander(f"{len(empty_or_failed)} strategies produced no trades or failed on this range"):
+            for r in empty_or_failed:
+                st.caption(f"**{r['strategy']}**: {r.get('error') or 'no trades in this date range'}")
+    st.caption(f"Ranked by total % return at {st.session_state.get('compare_all_risk_pct_used', 1.0):.2f}% "
+               f"risk/trade. Same caveats as everywhere else in this app: no commission/spread/slippage "
+               f"modeled, and a strategy with very few trades on this range isn't meaningfully proven "
+               f"either way - check the trades column, not just the rank.")
+
+
 def browse_strategies_page():
     st.markdown(eyebrow("STRATEGY CATALOG"), unsafe_allow_html=True)
     st.caption(f"{len(STRATEGIES)} strategies in this build. Pick one to jump straight into Run Backtest "
                f"with it pre-selected - no need to hunt through the dropdown.")
+
+    render_compare_all_section()
+    st.markdown("---")
 
     cols_per_row = 3
     for row_start in range(0, len(STRATEGIES), cols_per_row):
@@ -702,6 +863,88 @@ def browse_strategies_page():
                "research/*.py backtest module that already exists; see the comment at the top "
                "of registry.py for the exact shape, or the auto_param() helper for a quicker "
                "way to wire up its tunable parameters without hand-typing every bound.")
+
+
+def gallery_page():
+    st.markdown(eyebrow("BACKTEST GALLERY"), unsafe_allow_html=True)
+    runs = run_history.load_runs()
+    if not runs:
+        st.info("No runs yet - go run a backtest first.")
+        return
+
+    if not github_storage.is_configured():
+        st.caption("⚠ GitHub-backed history isn't configured yet - runs are saved locally only and "
+                   "will be lost if this app restarts (Streamlit Cloud wipes local disk on redeploys "
+                   "and sleep/wake cycles). See webapp/github_storage.py's header for one-time setup.")
+
+    strategies_present = sorted({r["strategy"] for r in runs})
+    filter_cols = st.columns([2, 1.6, 1.4])
+    sel_strategies = filter_cols[0].multiselect("Strategy", strategies_present, default=strategies_present,
+                                                  key="gallery_f_strategy")
+    sort_options = {
+        "Newest first": ("timestamp", True),
+        "Oldest first": ("timestamp", False),
+        "Total % / R: high to low": ("total_r", True),
+        "Total % / R: low to high": ("total_r", False),
+        "Most trades": ("n_trades", True),
+        "Worst max drawdown": ("max_drawdown_r", True),
+        "Name (A-Z)": ("name", False),
+    }
+    sort_choice = filter_cols[1].selectbox("Sort by", list(sort_options.keys()), key="gallery_sort")
+    search = filter_cols[2].text_input("Search name", key="gallery_search", placeholder="Filter by name...",
+                                        label_visibility="visible")
+
+    shown = [r for r in runs if r["strategy"] in sel_strategies]
+    if search:
+        shown = [r for r in shown if search.lower() in (r.get("name") or "").lower()]
+    sort_field, reverse = sort_options[sort_choice]
+    if sort_field == "name":
+        shown.sort(key=lambda r: (r.get("name") or "").lower(), reverse=reverse)
+    else:
+        shown.sort(key=lambda r: r.get(sort_field, 0) or 0, reverse=reverse)
+
+    st.caption(f"{len(shown)} of {len(runs)} runs shown.")
+
+    cols_per_row = 3
+    for row_start in range(0, len(shown), cols_per_row):
+        row = shown[row_start:row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for col, r in zip(cols, row):
+            with col:
+                with st.container(border=True):
+                    run_id = r["run_id"]
+                    current_name = r.get("name") or f"{r['strategy']} - {r['start_date']}"
+                    name_cols = st.columns([4, 1])
+                    new_name = name_cols[0].text_input("Name", value=current_name,
+                                                          key=f"gallery_name_input_{run_id}",
+                                                          label_visibility="collapsed")
+                    if name_cols[1].button("💾", key=f"gallery_name_save_{run_id}", help="Save name",
+                                             use_container_width=True):
+                        if new_name.strip() and new_name.strip() != current_name:
+                            run_history.rename_run(run_id, new_name.strip())
+                            st.rerun()
+
+                    when = datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                    st.caption(f"{r['strategy']} · {', '.join(r.get('instruments') or [])}")
+                    st.caption(f"{r['start_date']} to {r['end_date']} · run at {when}")
+
+                    metric_cols = st.columns(3)
+                    metric_cols[0].metric("Trades", r["n_trades"])
+                    metric_cols[1].metric("Total R", f"{r['total_r']:+.2f}")
+                    metric_cols[2].metric("Max DD", f"-{r.get('max_drawdown_r', 0.0):.2f}R")
+
+                    trades = run_history.load_trades_for_run(run_id)
+                    if trades:
+                        xs, equity, chronological = stats_mod.dollar_equity_curve(trades, risk_pct=1.0)
+                        render_dollar_equity_chart(xs, equity, chronological, key=f"gallery_chart_{run_id}",
+                                                     height=140, compact=True)
+                    else:
+                        st.caption("Trade-level detail not found for this run.")
+
+                    if st.button("View full results", key=f"gallery_view_{run_id}", use_container_width=True):
+                        st.session_state.pending_history_run_id = run_id
+                        st.session_state.pending_page_nav = "History"
+                        st.rerun()
 
 
 def run_backtest_page():
@@ -860,6 +1103,7 @@ def history_page():
     table_rows = []
     for r in runs:
         table_rows.append({
+            "name": r.get("name") or f"{r['strategy']} - {r['start_date']}",
             "when": datetime.datetime.fromtimestamp(r["timestamp"]).strftime("%Y-%m-%d %H:%M"),
             "strategy": r["strategy"],
             "instruments": ", ".join(r.get("instruments") or []),
@@ -867,17 +1111,27 @@ def history_page():
             "trades": r["n_trades"],
             "total_r": round(r["total_r"], 2),
             "avg_r": round(r["avg_r"], 4),
+            "max_drawdown_r": round(r.get("max_drawdown_r", 0.0), 2),
             "run_id": r["run_id"],
         })
     df = pd.DataFrame(table_rows)
     st.dataframe(df.drop(columns=["run_id"]), use_container_width=True, hide_index=True)
 
     st.markdown("### Re-view a past run")
-    options = {f"{row['when']} - {row['strategy']} ({row['trades']} trades)": row["run_id"] for row in table_rows}
-    choice = st.selectbox("Pick a run", list(options.keys()), label_visibility="collapsed")
+    # jump here from a "View full results" click on the Gallery page - pre-selects that run
+    # for exactly this rerun, same pattern as Browse Strategies -> Run Backtest
+    pending_run_id = st.session_state.pop("pending_history_run_id", None)
+    option_labels = [f"{row['name']} ({row['when']}, {row['trades']} trades)" for row in table_rows]
+    default_index = 0
+    if pending_run_id:
+        for i, row in enumerate(table_rows):
+            if row["run_id"] == pending_run_id:
+                default_index = i
+                break
+    choice = st.selectbox("Pick a run", option_labels, index=default_index, label_visibility="collapsed")
     if not choice:
         return
-    run_id = options[choice]
+    run_id = table_rows[option_labels.index(choice)]["run_id"]
     trades = run_history.load_trades_for_run(run_id)
     if trades is None:
         st.warning("Trade-level detail wasn't found on disk for this run.")
@@ -910,7 +1164,7 @@ header_l, header_r = st.columns([2, 1])
 with header_l:
     st.markdown('<div class="brand">&#9889; STRATEGY BACKTESTS</div>', unsafe_allow_html=True)
 with header_r:
-    page = st.segmented_control("Page", ["Run Backtest", "Browse Strategies", "History"],
+    page = st.segmented_control("Page", ["Run Backtest", "Browse Strategies", "Gallery", "History"],
                                  default="Run Backtest", label_visibility="collapsed", key="page_nav")
 st.markdown('<hr class="brand-rule"/>', unsafe_allow_html=True)
 
@@ -918,5 +1172,7 @@ if page == "History":
     history_page()
 elif page == "Browse Strategies":
     browse_strategies_page()
+elif page == "Gallery":
+    gallery_page()
 else:
     run_backtest_page()

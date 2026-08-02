@@ -25,6 +25,23 @@ def scale_trades_r(trades, factor):
     return out
 
 
+def max_drawdown(trades):
+    """Peak-to-trough max decline in cumulative R, ordered the SAME way equity_curve() orders
+    trades (chronological when every trade has a date, else the order they were produced in) -
+    so this number always matches what the equity curve chart actually shows. Returns a
+    non-negative R value (0.0 for an equity curve that never dips below its own running peak)."""
+    has_dates = all(t.get("date") for t in trades)
+    ordered = sorted(trades, key=lambda t: str(t.get("date"))) if has_dates else list(trades)
+    cum = 0.0
+    peak = 0.0
+    worst = 0.0
+    for t in ordered:
+        cum += t.get("r", 0.0) or 0.0
+        peak = max(peak, cum)
+        worst = max(worst, peak - cum)
+    return worst
+
+
 def compute_stats(trades):
     n = len(trades)
     if n == 0:
@@ -51,6 +68,7 @@ def compute_stats(trades):
         "tp": tp, "sl": sl, "flat": flat,
         "tp_pct": tp / n * 100, "sl_pct": sl / n * 100, "flat_pct": flat / n * 100,
         "z_score": z,
+        "max_drawdown_r": max_drawdown(trades),
     }
 
 
@@ -88,6 +106,17 @@ def equity_curve(trades):
         xs.append(i + 1)
         ys.append(cum)
     return xs, ys, has_dates
+
+
+def dollar_equity_curve(trades, risk_pct, starting_balance=10000.0):
+    """Same ordering/x-axis convention as equity_curve(), but in account DOLLARS starting from
+    `starting_balance`. Takes RAW (unscaled) R-multiple trades - each trade's % account return
+    is r * risk_pct (same convention as scale_trades_r), so cumulative % return after the first
+    N trades is risk_pct * (cumulative R), added additively onto the starting balance. Returns
+    (x_labels, equity_dollars, chronological)."""
+    xs, cum_r, chronological = equity_curve(trades)
+    equity = [starting_balance * (1 + (r * risk_pct) / 100.0) for r in cum_r]
+    return xs, equity, chronological
 
 
 def normalize_trade_dates(trades):
