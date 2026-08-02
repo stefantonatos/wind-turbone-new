@@ -197,6 +197,21 @@ def dollar_equity_curve(trades, risk_pct, starting_balance=10000.0):
     return xs, equity, chronological
 
 
+def daily_pnl(trades):
+    """Groups trades by calendar date, summing 'r' per day. Returns {date: total_r} for every
+    date that had at least one trade (dates with zero trades are simply absent - the caller
+    decides how to render the gap, e.g. a blank calendar cell vs. an explicit 0). Trades with
+    no date are skipped entirely (nothing calendar-shaped to plot for sequence-only trades,
+    same has_dates convention as equity_curve())."""
+    out = {}
+    for t in trades:
+        d = t.get("date")
+        if d is None or not isinstance(d, datetime.date):
+            continue
+        out[d] = out.get(d, 0.0) + (t.get("r", 0.0) or 0.0)
+    return out
+
+
 def normalize_trade_dates(trades):
     """Makes every trade dict's 'date' a real datetime.date object, whether it just
     came straight out of a live backtest run (already a date) or was reloaded from

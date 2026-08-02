@@ -131,6 +131,48 @@ def render_dollar_equity_chart(xs, equity, chronological, key, height=320, compa
                      config={"displayModeBar": False} if compact else None)
 
 
+def render_performance_calendar(trades, key, unit_label="R", unit_fmt="{:+.3f}R", height=230):
+    """GitHub-contribution-style calendar: one column per week, one row per weekday, colored by
+    that day's total return (diverging colorscale centered on zero - not activity intensity like
+    a real GitHub graph). Answers a question the equity curve can't: is the edge spread evenly
+    across time, or is it a few clustered days carrying the whole result? `trades` should already
+    be in whichever unit (R or %) the rest of the page is displaying, matching `unit_fmt`."""
+    daily = stats_mod.daily_pnl(trades)
+    if not daily:
+        st.caption("No dated trades to build a calendar from.")
+        return
+    dates = sorted(daily)
+    start, end = dates[0], dates[-1]
+    grid_start = start - datetime.timedelta(days=start.weekday())
+    grid_end = end + datetime.timedelta(days=6 - end.weekday())
+    all_days = [grid_start + datetime.timedelta(days=i) for i in range((grid_end - grid_start).days + 1)]
+    week_starts = sorted({d - datetime.timedelta(days=d.weekday()) for d in all_days})
+    week_index = {w: i for i, w in enumerate(week_starts)}
+    weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    z = [[None] * len(week_starts) for _ in range(7)]
+    hover = [[""] * len(week_starts) for _ in range(7)]
+    for d in all_days:
+        col = week_index[d - datetime.timedelta(days=d.weekday())]
+        row = d.weekday()
+        val = daily.get(d)
+        z[row][col] = val
+        hover[row][col] = f"{d.isoformat()}<br>{unit_fmt.format(val)}" if val is not None else f"{d.isoformat()}<br>no trades"
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z, y=weekday_labels, text=hover, hoverinfo="text",
+        colorscale=[[0.0, CRITICAL], [0.5, "#1c2333"], [1.0, GOOD]], zmid=0,
+        xgap=3, ygap=3, showscale=True, colorbar=dict(title=unit_label, thickness=12),
+    ))
+    layout_kwargs = dict(PLOTLY_LAYOUT_DEFAULTS)
+    layout_kwargs["xaxis"] = dict(visible=False)
+    layout_kwargs["margin"] = dict(l=10, r=10, t=10, b=10)
+    fig.update_layout(height=height, **layout_kwargs)
+    st.plotly_chart(fig, use_container_width=True, key=key, config={"displayModeBar": False})
+    st.caption("Each cell is one calendar day's total return across every instrument - green "
+               "net-positive, red net-negative, blank = no trade that day.")
+
+
 # --------------------------------------------------------------------------------------
 # shared results rendering - used for a fresh run AND for re-viewing a past run from
 # History, so the filter/stats/chart/table behavior is identical either way.
@@ -231,12 +273,14 @@ def render_filterable_results(trades, strategy, key_prefix):
     s_display = stats_mod.compute_stats(display_trades)
 
     result_tab_labels = ["Overview", "Breakdown", "Prop Firm Fit"]
+    if has_dates:
+        result_tab_labels.append("Calendar")
     chart_capable = bool(strategy and strategy.chart_fetcher)
     if chart_capable:
         result_tab_labels.append("Trade Chart")
-    result_tabs = st.tabs(result_tab_labels)
+    result_tabs = dict(zip(result_tab_labels, st.tabs(result_tab_labels)))
 
-    with result_tabs[0]:
+    with result_tabs["Overview"]:
         with st.container(border=True):
             metric_cols = st.columns(7)
             metric_cols[0].metric("Trades", s_display["n_trades"])
@@ -270,7 +314,7 @@ def render_filterable_results(trades, strategy, key_prefix):
                    f"for this chart only." + ("" if chronological else " Order shown is backtest sequence, "
                    "not calendar order (no date field upstream)."))
 
-    with result_tabs[1]:
+    with result_tabs["Breakdown"]:
         st.markdown(eyebrow("PER-INSTRUMENT BREAKDOWN"), unsafe_allow_html=True)
         rows = stats_mod.per_instrument_breakdown(display_trades)
         breakdown_df = pd.DataFrame(rows)
@@ -284,11 +328,17 @@ def render_filterable_results(trades, strategy, key_prefix):
         trade_df = pd.DataFrame(display_trades)
         st.dataframe(style_signed_columns(trade_df, ["r"]), use_container_width=True, hide_index=True)
 
-    with result_tabs[2]:
+    with result_tabs["Prop Firm Fit"]:
         render_prop_firm_fit_section(filtered, key_prefix)
 
+    if has_dates:
+        with result_tabs["Calendar"]:
+            calendar_fmt = "{:+.3f}%" if unit_label == "%" else "{:+.3f}R"
+            render_performance_calendar(display_trades, key=f"{key_prefix}_calendar",
+                                          unit_label=unit_label, unit_fmt=calendar_fmt)
+
     if chart_capable:
-        with result_tabs[3]:
+        with result_tabs["Trade Chart"]:
             render_trade_chart_section(strategy, filtered, key_prefix)
 
 
