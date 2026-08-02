@@ -732,6 +732,39 @@ def _build_registry():
         optimization_module=_find_optimization_module("research.support_resistance_zone_bounce_dukascopy_backtest"),
     ))
 
+    # ---------------------------------------------------------------------------
+    # parabolic_sar_dukascopy_backtest.py (Parabolic SAR, stop-and-reverse)
+    # Exposes: INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, INITIAL_AF, STEP_AF,
+    # END_AF, MIN_SL_PCT, fetch_daily_ohlc(instrument_const) -> df, backtest_instrument(label,
+    # df) -> trades (keys: side, outcome, r, date, stop_pct). Same shape as
+    # support_resistance_zone_bounce - single-arg daily fetch, bare trade-list return - so it
+    # reuses _run_sr_zone_bounce directly rather than needing its own runner.
+    # ---------------------------------------------------------------------------
+    _run_parabolic_sar = _run_sr_zone_bounce
+    psar_mod = _load_module("research.parabolic_sar_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="parabolic_sar",
+        name="Parabolic SAR (Stop-and-Reverse)",
+        module_name="research.parabolic_sar_dukascopy_backtest",
+        granularity="daily bars (swing/position - always in the market, alternating long/short)",
+        instruments=psar_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("INITIAL_AF", "Initial acceleration factor", "float", psar_mod.INITIAL_AF, 0.005, 0.1, 0.005),
+            ParamSpec("STEP_AF", "Acceleration factor step", "float", psar_mod.STEP_AF, 0.005, 0.1, 0.005),
+            ParamSpec("END_AF", "Acceleration factor cap", "float", psar_mod.END_AF, 0.05, 0.5, 0.05),
+            ParamSpec("MIN_SL_PCT", "Min stop distance floor (% of price)", "float", psar_mod.MIN_SL_PCT, 0.0, 1.0, 0.01),
+        ],
+        facets=[],
+        notes="Sourced from an open-source (Apache 2.0) Python port of Wilder's classic recursive SAR "
+              "formula - the trading layer on top (stop-and-reverse, always in the market) is this "
+              "project's own, since the source repo's own strategy is a simplified long-only demo with "
+              "no stop-loss or R-multiple accounting at all. Expect frequent small whipsaw losses punctuated "
+              "by occasional large trend-following wins - far fewer, much longer-held trades than this "
+              "catalog's intraday strategies.",
+        runner=_run_parabolic_sar,
+        optimization_module=_find_optimization_module("research.parabolic_sar_dukascopy_backtest"),
+    ))
+
     sb_mod = _load_module("research.ict_silver_bullet_forex_dukascopy_backtest")
     entries.append(StrategyDef(
         id="silver_bullet",

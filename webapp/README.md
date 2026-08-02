@@ -77,11 +77,21 @@ falls back to local-disk-only behavior exactly as before, so this is entirely op
 
 ## Strategies in the registry
 
-15 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+16 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
-Support/Resistance Zone Bounce, ICT Silver Bullet, London 3AM Range Reversal, ORB
-(indices), and EvenDyer VWAP ORB.
+Support/Resistance Zone Bounce, Parabolic SAR (Stop-and-Reverse), ICT Silver Bullet,
+London 3AM Range Reversal, ORB (indices), and EvenDyer VWAP ORB.
+
+Parabolic SAR is the first strategy in this catalog sourced from an actual open-source
+repository (je-suis-tm/quant-trading, Apache 2.0) rather than a Pine script or a video
+transcript - though even there, only the recursive SAR indicator formula itself (Wilder's
+original, decades-old, public-domain algorithm) was ported; the source repo's own trading
+layer is a simplified long-only demo with no stop-loss or R-multiple accounting, so the
+stop-and-reverse trading logic on top is this project's own, following the standard
+textbook description of "trading Parabolic SAR." Always in the market once started,
+alternating long/short on every SAR flip - expect frequent small whipsaw losses punctuated
+by occasional large trend-following wins, not a smooth equity curve.
 
 EvenDyer VWAP ORB is US index CFDs only (SP500/NASDAQ100/DOWJONES) - its opening-range and
 VWAP session windows are scoped to US equity trading hours, there's no forex reading of
