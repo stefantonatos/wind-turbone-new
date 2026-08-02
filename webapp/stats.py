@@ -150,6 +150,56 @@ def compute_stats(trades):
     }
 
 
+def compounded_return_pct(trades, risk_pct):
+    """The account's TRUE final return, compounding trade by trade (growth *= 1 + r*risk_pct/100),
+    not the naive sum-then-scale ("total_r * risk_pct") used elsewhere for the raw R-multiple
+    metric. That naive version implicitly assumes every trade risks a fixed DOLLAR amount off the
+    STARTING balance forever, which silently produces impossible numbers once losses accumulate
+    (a -10,000% "return", or a literally negative account balance) - risking risk_pct% of the
+    CURRENT balance (the whole point of quoting risk as a percentage) means a loss can approach
+    but never cross -100%, exactly what compounding naturally enforces here without an explicit
+    cap. Order matters for a REAL equity curve (see dollar_equity_curve) but not for this single
+    final number - multiplication commutes, so trades are compounded in whatever order they're
+    given. Returns a % (e.g. -97.3 for a 97.3% loss, always > -100)."""
+    growth = 1.0
+    for t in trades:
+        r = t.get("r", 0.0) or 0.0
+        growth *= max(1.0 + (r * risk_pct) / 100.0, 0.0)
+    return (growth - 1.0) * 100.0
+
+
+def compounded_return_ci(avg_r_ci_low, avg_r_ci_high, risk_pct, n):
+    """95% CI on the compounded total return, extending compute_stats' existing avg_r_ci_low/high
+    (a per-trade bound) out to n trades the same way total_r_ci_low/high already does for the
+    additive metric (treating every trade as if it earned exactly the bound's average R) - just
+    compounded instead of multiplied by n, for the same reason compounded_return_pct exists."""
+    def compound(avg_r_bound):
+        return (max(1.0 + (avg_r_bound * risk_pct) / 100.0, 0.0) ** n - 1.0) * 100.0
+    return compound(avg_r_ci_low), compound(avg_r_ci_high)
+
+
+def compounded_max_drawdown_pct(trades, risk_pct):
+    """Max peak-to-trough decline on the COMPOUNDED equity curve (see compounded_return_pct's
+    own docstring for why compounding, not addition, is used here) - a real account's drawdown
+    is bounded to [0, 100]% by construction (compounded equity can approach but never cross
+    zero), unlike max_drawdown()'s additive R-based version, which has no such bound once scaled
+    into a % context (confirmed showing e.g. "-3157%" right next to a correctly-capped
+    "-100.00%" total return on the same run - the same underlying bug, just a second call site).
+    Ordered the same way dollar_equity_curve is. Returns a % in [0, 100]."""
+    has_dates = all(t.get("date") for t in trades)
+    ordered = sorted(trades, key=lambda t: str(t.get("date"))) if has_dates else list(trades)
+    equity = 1.0
+    peak = 1.0
+    worst_dd_pct = 0.0
+    for t in ordered:
+        r = t.get("r", 0.0) or 0.0
+        equity = max(equity * (1 + (r * risk_pct) / 100.0), 0.0)
+        peak = max(peak, equity)
+        if peak > 0:
+            worst_dd_pct = max(worst_dd_pct, (peak - equity) / peak * 100.0)
+    return worst_dd_pct
+
+
 def per_instrument_breakdown(trades):
     buckets = defaultdict(list)
     for t in trades:
@@ -187,14 +237,26 @@ def equity_curve(trades):
 
 
 def dollar_equity_curve(trades, risk_pct, starting_balance=10000.0):
-    """Same ordering/x-axis convention as equity_curve(), but in account DOLLARS starting from
-    `starting_balance`. Takes RAW (unscaled) R-multiple trades - each trade's % account return
-    is r * risk_pct (same convention as scale_trades_r), so cumulative % return after the first
-    N trades is risk_pct * (cumulative R), added additively onto the starting balance. Returns
-    (x_labels, equity_dollars, chronological)."""
-    xs, cum_r, chronological = equity_curve(trades)
-    equity = [starting_balance * (1 + (r * risk_pct) / 100.0) for r in cum_r]
-    return xs, equity, chronological
+    """Same ordering convention as equity_curve() (chronological when every trade has a date,
+    else backtest-sequence order), but in account DOLLARS starting from `starting_balance`.
+    Takes RAW (unscaled) R-multiple trades - each trade's own % account return is r * risk_pct
+    (same convention as scale_trades_r), COMPOUNDED trade by trade (balance *= 1 + r*risk_pct/100)
+    rather than added additively onto the starting balance. The additive version this replaced
+    could show a literally negative dollar balance once losses accumulated past -100% of the
+    starting amount (confirmed happening on a real, cost-adjusted, large-sample run) - risking a
+    % of the CURRENT balance each trade (what "risk_pct% per trade" is supposed to mean) means
+    the curve can approach but never cross zero, which is what actually happens to a real account.
+    Returns (x_labels, equity_dollars, chronological)."""
+    has_dates = all(t.get("date") for t in trades)
+    ordered = sorted(trades, key=lambda t: str(t.get("date"))) if has_dates else list(trades)
+    xs, equity = [], []
+    balance = starting_balance
+    for i, t in enumerate(ordered):
+        r = t.get("r", 0.0) or 0.0
+        balance = max(balance * (1 + (r * risk_pct) / 100.0), 0.0)
+        xs.append(i + 1)
+        equity.append(balance)
+    return xs, equity, has_dates
 
 
 def daily_pnl(trades):

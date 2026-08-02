@@ -272,6 +272,22 @@ def render_filterable_results(trades, strategy, key_prefix):
     unit_fmt = "{:+.2f}%" if display_mode == "% of account" else "{:+.3f}R"
     s_display = stats_mod.compute_stats(display_trades)
 
+    # "Total" is COMPOUNDED for the "% of account" unit, not the naive sum compute_stats returns
+    # (which treats every trade as risking a fixed dollar amount off the STARTING balance
+    # forever - fine for R-multiples themselves, which are meant to sum, but it can show an
+    # impossible return past -100% once losses accumulate over enough trades). R-multiples stay
+    # additive (that IS what a raw R total means) - see stats.compounded_return_pct's own
+    # docstring for the full reasoning.
+    if unit_label == "%":
+        total_display = stats_mod.compounded_return_pct(filtered, risk_pct)
+        total_ci_low, total_ci_high = stats_mod.compounded_return_ci(
+            s["avg_r_ci_low"], s["avg_r_ci_high"], risk_pct, s["n_trades"])
+        max_dd_display = stats_mod.compounded_max_drawdown_pct(filtered, risk_pct)
+    else:
+        total_display = s_display["total_r"]
+        total_ci_low, total_ci_high = s_display["total_r_ci_low"], s_display["total_r_ci_high"]
+        max_dd_display = s_display["max_drawdown_r"]
+
     result_tab_labels = ["Overview", "Breakdown", "Prop Firm Fit"]
     if has_dates:
         result_tab_labels.append("Calendar")
@@ -284,19 +300,25 @@ def render_filterable_results(trades, strategy, key_prefix):
         with st.container(border=True):
             metric_cols = st.columns(7)
             metric_cols[0].metric("Trades", s_display["n_trades"])
-            metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]),
-                                   help=f"95% CI: {unit_fmt.format(s_display['total_r_ci_low'])} to "
-                                        f"{unit_fmt.format(s_display['total_r_ci_high'])} (normal "
-                                        f"approximation - wide on a small sample, not a guarantee).")
+            metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(total_display),
+                                   help=f"95% CI: {unit_fmt.format(total_ci_low)} to "
+                                        f"{unit_fmt.format(total_ci_high)} (normal "
+                                        f"approximation - wide on a small sample, not a guarantee)."
+                                        + (" Compounded (risking % of current balance each trade), "
+                                           "not a naive sum - can approach but never cross -100%."
+                                           if unit_label == "%" else ""))
             avg_fmt = unit_fmt if unit_label == "R" else "{:+.3f}%"
             metric_cols[2].metric(f"Avg {unit_label}/trade", avg_fmt.format(s_display["avg_r"]),
                                    help=f"95% CI: {avg_fmt.format(s_display['avg_r_ci_low'])} to "
                                         f"{avg_fmt.format(s_display['avg_r_ci_high'])}.")
             metric_cols[3].metric("Win rate", f"{s_display['tp_pct']:.1f}%")
             metric_cols[4].metric("Loss rate", f"{s_display['sl_pct']:.1f}%")
-            metric_cols[5].metric(f"Max drawdown", unit_fmt.format(-s_display["max_drawdown_r"]),
+            metric_cols[5].metric(f"Max drawdown", unit_fmt.format(-max_dd_display),
                                    help="Largest peak-to-trough decline in the cumulative equity curve "
-                                        "below, not the worst single losing trade.")
+                                        "below, not the worst single losing trade."
+                                        + (" Compounded, same reasoning as Total % above - bounded to "
+                                           "[0, 100]%, unlike a naive additive drawdown."
+                                           if unit_label == "%" else ""))
             metric_cols[6].metric("z-score", f"{s_display['z_score']:.2f}",
                                    help="Approximate significance vs. zero edge - scale-invariant (same in "
                                         "either unit). Not strong evidence in isolation: this project has "
@@ -867,15 +889,27 @@ def render_compare_all_section():
             except Exception as exc:
                 print(f"Compare All: failed to save {strategy.name} to history/gallery: {exc}")
 
+            # COMPOUNDED, not the naive "total_r * risk_pct" sum - that additive version treats
+            # every trade as risking a fixed dollar amount off the STARTING balance forever, which
+            # silently produces impossible "returns" (past -100%) once a strategy has enough
+            # trades and a genuinely thin/negative cost-adjusted edge (confirmed happening here:
+            # a real 41k-trade Compare All run showed a strategy at "-10,977%" total, which cannot
+            # happen to a real account - see stats.compounded_return_pct's own docstring).
+            total_pct = stats_mod.compounded_return_pct(cost_trades, risk_pct_compare)
+            total_pct_ci_low, total_pct_ci_high = stats_mod.compounded_return_ci(
+                s["avg_r_ci_low"], s["avg_r_ci_high"], risk_pct_compare, s["n_trades"])
+            # same compounding fix as total_pct above, same reason - additive drawdown scaled by
+            # risk_pct has no bound and can exceed 100%, which is impossible for a real account
+            max_drawdown_pct = stats_mod.compounded_max_drawdown_pct(cost_trades, risk_pct_compare)
             results.append({
                 "strategy": strategy.name,
                 "n_trades": s["n_trades"],
-                "total_pct": s["total_r"] * risk_pct_compare,
-                "total_pct_ci_low": s["total_r_ci_low"] * risk_pct_compare,
-                "total_pct_ci_high": s["total_r_ci_high"] * risk_pct_compare,
+                "total_pct": total_pct,
+                "total_pct_ci_low": total_pct_ci_low,
+                "total_pct_ci_high": total_pct_ci_high,
                 "avg_pct_per_trade": s["avg_r"] * risk_pct_compare,
                 "win_pct": s["tp_pct"],
-                "max_drawdown_pct": s["max_drawdown_r"] * risk_pct_compare,
+                "max_drawdown_pct": max_drawdown_pct,
                 "z_score": s["z_score"],
                 "error": None,
                 "run_id": run_id,
