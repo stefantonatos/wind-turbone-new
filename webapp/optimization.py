@@ -495,6 +495,98 @@ def run_lockbox(strategy_id, final_params):
         return LockboxOutcome(status="error", detail=f"unexpected error: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# GENERIC AUTOMATIC PARAMETER SEARCH - for every strategy that does NOT (yet) have a
+# bespoke research/<x>_optimization.py companion (see KNOWN_PIPELINES above). There are no
+# manual parameter sliders anywhere in this app - a plain "Run Backtest" always uses a
+# strategy's own hardcoded defaults, and finding a better combination is this automatic
+# search's job, using the exact same min/max bounds registry.py's ParamSpec entries already
+# define for each strategy (previously only used to draw sidebar number inputs).
+# ---------------------------------------------------------------------------
+
+GENERIC_SWEEP_N_COMBINATIONS = 20   # bounded random search, not a full grid - several strategies
+                                     # here have 5-8 tunable params, where a full grid would be
+                                     # thousands of real backtest runs
+GENERIC_SWEEP_MIN_TRADES = 5        # guards against a near-empty combination "winning" on a fluke
+
+
+@dataclass
+class GenericSweepResult:
+    available: bool
+    reason: str = ""
+    table: Optional[object] = None   # DataFrame, one row per combination tried, sorted best avg_r first
+    best: Optional[dict] = None      # winning row (among combinations with >= GENERIC_SWEEP_MIN_TRADES), as a dict
+    n_combinations: int = 0
+
+
+def run_generic_param_sweep(strategy, module, selected_labels, start_dt, end_dt,
+                              n_combinations=GENERIC_SWEEP_N_COMBINATIONS, seed=2026, progress_cb=None):
+    """Automatic parameter search for a strategy with no bespoke optimization script - bounded
+    random search over `strategy.params`' own min/max bounds (a registry.py ParamSpec list),
+    each combination a REAL run of `strategy.runner` over the SAME instruments/date range the
+    caller already picked. The underlying Dukascopy fetch is disk-cached by (instrument,
+    interval, offer_side, start, end) - see data_cache.py - so only the FIRST combination pays
+    the real fetch cost; every later combination reuses that same cached OHLC data and just
+    re-runs the (cheap, pure-Python) backtest loop with different parameter values.
+
+    Always includes the strategy's own hand-picked defaults as one of the combinations tried,
+    so this search can never look WORSE than a plain "Run Backtest" already did.
+
+    Deliberately lighter-weight than the bespoke 4-step methodology in KNOWN_PIPELINES (no
+    Monte Carlo resampling, no walk-forward validation, no cluster/plateau check) - the caller
+    is expected to say so plainly, not present this as equivalent rigor. Never raises - a
+    failed combination is just skipped, not fatal to the whole sweep."""
+    if not strategy.params:
+        return GenericSweepResult(available=False, reason="this strategy has no tunable parameters to search")
+
+    rng = np.random.default_rng(seed)
+    default_combo = tuple(p.default for p in strategy.params)
+    combos = [default_combo]
+    seen = {default_combo}
+    attempts = 0
+    while len(combos) < n_combinations and attempts < n_combinations * 10:
+        attempts += 1
+        combo = []
+        for p in strategy.params:
+            if p.kind == "int":
+                lo, hi = int(p.min_value), int(p.max_value)
+                combo.append(int(rng.integers(lo, hi + 1)) if hi > lo else lo)
+            else:
+                combo.append(round(float(rng.uniform(p.min_value, p.max_value)), 4))
+        combo = tuple(combo)
+        if combo not in seen:
+            seen.add(combo)
+            combos.append(combo)
+
+    rows = []
+    for i, combo in enumerate(combos):
+        if progress_cb:
+            progress_cb(i, len(combos), f"combination {i + 1}/{len(combos)}")
+        overrides = {p.attr: v for p, v in zip(strategy.params, combo)}
+        try:
+            trades = strategy.runner(module, selected_labels, start_dt, end_dt, overrides, lambda *a: None)
+        except Exception:
+            continue
+        n = len(trades)
+        total_r = sum(t.get("r", 0.0) or 0.0 for t in trades)
+        row = {p.attr: v for p, v in zip(strategy.params, combo)}
+        row.update({"n_trades": n, "total_r": total_r, "avg_r": (total_r / n) if n else float("nan"),
+                     "is_default": combo == default_combo})
+        rows.append(row)
+    if progress_cb:
+        progress_cb(len(combos), len(combos), "done")
+
+    if not rows:
+        return GenericSweepResult(available=False, reason="every combination failed to produce a result")
+
+    df = pd.DataFrame(rows).sort_values("avg_r", ascending=False, na_position="last").reset_index(drop=True)
+    qualifying = df[df["n_trades"] >= GENERIC_SWEEP_MIN_TRADES]
+    ranking = qualifying if not qualifying.empty else df
+    best = ranking.iloc[0].to_dict() if not ranking.empty else None
+
+    return GenericSweepResult(available=True, reason="ok", table=df, best=best, n_combinations=len(rows))
+
+
 def load_optimization_result(optimization_module_name):
     """optimization_module_name is either None (the registry found no companion file for
     the currently selected strategy) or a research.<x>_optimization dotted path that DOES

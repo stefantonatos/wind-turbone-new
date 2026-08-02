@@ -535,13 +535,93 @@ def render_lockbox_section(strategy_id):
                       disabled=True)
 
 
-def render_optimization_tab(strategy_id, opt_module_name):
+def _to_date(value):
+    """instruments/start_date/end_date arrive as real date objects straight off a live run's
+    session_state, but as ISO strings when reloaded from run_history's JSON storage - this
+    normalizes either into a date object."""
+    if isinstance(value, datetime.date):
+        return value
+    return datetime.date.fromisoformat(str(value)[:10])
+
+
+def render_generic_param_sweep(strategy, instruments, start_date, end_date):
+    """Automatic parameter search for any strategy that doesn't (yet) have a bespoke
+    research/<x>_optimization.py companion script - see optimization.run_generic_param_sweep.
+    This is what "Optimization & Robustness" shows INSTEAD of manual parameter sliders: no
+    raw number inputs anywhere in this app any more, just a button that searches this
+    strategy's own parameter ranges automatically against real data."""
+    if not strategy.params:
+        st.info("This strategy has no tunable parameters to search - its results already reflect "
+                 "its one fixed rule set.")
+        return
+
+    st.caption(f"No hand-built 4-step methodology script exists yet for this strategy (that's the heavier "
+               f"grid-search + Monte Carlo + walk-forward + cluster-check pipeline a couple of strategies "
+               f"have). Instead, this automatically searches {optimization.GENERIC_SWEEP_N_COMBINATIONS} "
+               f"random parameter combinations across this strategy's own tunable ranges, each one a real "
+               f"backtest over the same {len(instruments)} instrument(s) and {start_date} to {end_date} "
+               f"window you already ran - no manual sliders to guess at. Lighter-weight than the full "
+               f"methodology (no Monte Carlo resampling, no walk-forward validation, no cluster/plateau "
+               f"check) - treat this as a quick automatic scan, not full robustness proof.")
+
+    cache_key = f"generic_sweep_{strategy.id}"
+    if st.button("Run automatic parameter search", key=f"generic_sweep_run_{strategy.id}", type="primary"):
+        module = importlib.import_module(strategy.module_name)
+        start_dt = datetime.datetime.combine(_to_date(start_date), datetime.time.min)
+        end_dt = datetime.datetime.combine(_to_date(end_date) + datetime.timedelta(days=1), datetime.time.min)
+        progress_placeholder = st.empty()
+        progress_bar = progress_placeholder.progress(0, text="Starting...")
+
+        def progress_cb(done, total, label):
+            pct = 0.0 if total == 0 else min(done / total, 1.0)
+            progress_bar.progress(pct, text=f"{label}")
+
+        with st.spinner("Searching parameter combinations against real Dukascopy data - the first "
+                         "combination fetches fresh data, later ones reuse it from cache and are much "
+                         "faster..."):
+            st.session_state[cache_key] = optimization.run_generic_param_sweep(
+                strategy, module, instruments, start_dt, end_dt, progress_cb=progress_cb)
+        progress_placeholder.empty()
+
+    result = st.session_state.get(cache_key)
+    if result is None:
+        st.info("Not run yet this session - click the button above when you're ready to wait for it.")
+        return
+    if not result.available:
+        st.warning(f"Couldn't run the search: {result.reason}")
+        return
+
+    st.markdown(eyebrow(f"BEST COMBINATION FOUND ({result.n_combinations} tried)"), unsafe_allow_html=True)
+    if result.best is not None:
+        with st.container(border=True):
+            best_cols = st.columns(len(strategy.params) + 2)
+            for i, p in enumerate(strategy.params):
+                best_cols[i].metric(p.label, f"{result.best[p.attr]:g}")
+            best_cols[-2].metric("Trades", int(result.best["n_trades"]))
+            best_cols[-1].metric("Avg R / trade", f"{result.best['avg_r']:+.4f}")
+        if result.best.get("is_default"):
+            st.caption("This strategy's own hand-picked defaults came out on top of the combinations tried.")
+
+    st.markdown(eyebrow("EVERY COMBINATION TRIED"), unsafe_allow_html=True)
+    signed_cols = [c for c in result.table.columns if c in ("total_r", "avg_r")]
+    st.dataframe(style_signed_columns(result.table, signed_cols, fmt={"total_r": "{:+.3f}", "avg_r": "{:+.4f}"}),
+                 use_container_width=True, hide_index=True)
+    st.caption("Sorted best avg R/trade first. Combinations with too few trades to be meaningful "
+               f"(<{optimization.GENERIC_SWEEP_MIN_TRADES}) are still shown here but excluded from picking "
+               "the best combination above.")
+
+
+def render_optimization_tab(strategy, instruments, start_date, end_date):
+    strategy_id = strategy.id if strategy else None
+    opt_module_name = strategy.optimization_module if strategy else None
     known_module = optimization.known_pipeline_module_name(strategy_id)
 
     if known_module is None:
-        # generic fallback path - lightweight introspection only, safe to run immediately
-        result = optimization.load_optimization_result(opt_module_name)
-        _render_optimization_result(result, opt_module_name)
+        if strategy is not None:
+            render_generic_param_sweep(strategy, instruments, start_date, end_date)
+        else:
+            st.info("Optimization & robustness data isn't available for this strategy.")
+        render_lockbox_section(strategy_id)
         return
 
     st.caption(f"A real companion script ({known_module.rsplit('.', 1)[-1]}.py) exists for this strategy: a full "
@@ -565,7 +645,7 @@ def render_optimization_tab(strategy_id, opt_module_name):
     render_lockbox_section(strategy_id)
 
 
-def render_run_context(strategy_name, strategy_id, trades, key_prefix):
+def render_run_context(strategy_name, strategy_id, trades, instruments, start_date, end_date, key_prefix):
     st.markdown(f"## {strategy_name}")
     if not trades:
         st.info("No trades were generated for this selection. Try widening the date range, "
@@ -576,7 +656,7 @@ def render_run_context(strategy_name, strategy_id, trades, key_prefix):
     with tabs[0]:
         render_filterable_results(trades, strategy, key_prefix)
     with tabs[1]:
-        render_optimization_tab(strategy_id, strategy.optimization_module if strategy else None)
+        render_optimization_tab(strategy, instruments, start_date, end_date)
 
 
 # --------------------------------------------------------------------------------------
@@ -606,7 +686,7 @@ def browse_strategies_page():
                     st.markdown(eyebrow(" · ".join(badges) if badges else "CORE BACKTEST"),
                                 unsafe_allow_html=True)
                     st.caption(f"{len(strategy.instruments)} instruments - "
-                               f"{len(strategy.params)} tunable parameters (advanced)")
+                               f"{len(strategy.params)} parameters searched automatically when optimizing")
                     if st.button("Run this strategy", key=f"browse_run_{strategy.id}", use_container_width=True):
                         st.session_state.pending_strategy_id = strategy.id
                         # can't set st.session_state.page_nav directly here - the segmented_control
@@ -659,31 +739,21 @@ def run_backtest_page():
             date_range = st.date_input("Date range", value=(default_start, default_end),
                                           max_value=default_end, label_visibility="collapsed",
                                           key=f"{strategy.id}_daterange")
-            default_window_label = f"~{strategy.default_history_days / 365:.0f}-year" if strategy.default_history_days >= 365 else "6-month"
-            st.caption(f"Defaults to a short {default_window_label} window - widen deliberately, "
-                       f"first fetches of a wide range can take many minutes.")
+            # describes the CURRENTLY SELECTED range, not the strategy's static default - showing
+            # the default's own width here regardless of what's actually picked used to make a
+            # deliberately widened range look like it had been silently ignored
+            if isinstance(date_range, tuple) and len(date_range) == 2:
+                span_days = (date_range[1] - date_range[0]).days
+                span_label = f"~{span_days / 365:.1f} years" if span_days >= 365 else f"~{span_days} days"
+                st.caption(f"Currently set to {span_label} ({date_range[0]} to {date_range[1]}). Widen or "
+                           f"narrow freely - first fetches of a wide range can take many minutes.")
+            else:
+                st.caption("Pick both a start and end date.")
 
-        # Manual parameter tweaking is a power-user feature, not the default flow - most people
-        # don't know what STOP_BUFFER_PCT should be and shouldn't have to. This runs with the
-        # strategy's own defaults unless deliberately opened and changed; the "find the best
-        # combo automatically" path is the Optimization & Robustness tab after a run, not this.
+        # No manual parameter tweaking here any more - every plain Run Backtest uses this
+        # strategy's own fixed defaults. Finding a better combination automatically is what the
+        # Optimization & Robustness tab (after a run) is for, not hand-guessed sidebar sliders.
         param_values = {}
-        with st.expander("Advanced parameters (optional)", expanded=False):
-            st.caption("Leave these alone unless you know what they do. Prefer the Optimization & "
-                       "Robustness tab after running once - it searches many combinations "
-                       "automatically instead of you guessing values here.")
-            param_cols = st.columns(3) if strategy.params else []
-            for i, p in enumerate(strategy.params):
-                widget_key = f"{strategy.id}_{p.attr}"
-                target = param_cols[i % 3]
-                if p.kind == "int":
-                    param_values[p.attr] = target.number_input(p.label, value=int(p.default), min_value=int(p.min_value),
-                                                              max_value=int(p.max_value), step=int(p.step),
-                                                              key=widget_key, help=p.help or None)
-                else:
-                    param_values[p.attr] = target.number_input(p.label, value=float(p.default), min_value=float(p.min_value),
-                                                              max_value=float(p.max_value), step=float(p.step),
-                                                              key=widget_key, help=p.help or None)
 
         run_clicked = st.button("Run Backtest", type="primary", use_container_width=True)
         st.caption("Every run fetches real historical data live from Dukascopy - nothing here is mocked or "
@@ -740,6 +810,9 @@ def run_backtest_page():
             "strategy_name": strategy.name,
             "trades": trades,
             "run_id": run_id,
+            "instruments": selected_instruments,
+            "start_date": date_range[0],
+            "end_date": date_range[1],
         }
         st.rerun()
 
@@ -749,6 +822,9 @@ def run_backtest_page():
             st.session_state.last_run["strategy_name"],
             st.session_state.last_run["strategy_id"],
             st.session_state.last_run["trades"],
+            st.session_state.last_run["instruments"],
+            st.session_state.last_run["start_date"],
+            st.session_state.last_run["end_date"],
             key_prefix="live",
         )
 
@@ -798,7 +874,8 @@ def history_page():
     with tabs[0]:
         render_filterable_results(trades, strategy, key_prefix=f"hist_{run_id}")
     with tabs[1]:
-        render_optimization_tab(strategy.id if strategy else None, strategy.optimization_module if strategy else None)
+        render_optimization_tab(strategy, matching_row.get("instruments") or [],
+                                 matching_row["start_date"], matching_row["end_date"])
 
 
 # --------------------------------------------------------------------------------------

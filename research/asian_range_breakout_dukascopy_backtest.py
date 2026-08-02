@@ -115,6 +115,7 @@
 
 # !pip install --upgrade dukascopy-python -q   # uncomment in Colab
 
+import calendar
 import datetime
 import logging
 import os
@@ -192,10 +193,22 @@ def to_ny_time(index):
 
 
 def _month_chunks(start, end, months_per_chunk):
+    """Splits [start, end) into months_per_chunk-sized pieces, advancing by calendar month
+    while keeping the same day-of-month as `start` where possible. BUG FIX: a plain
+    `chunk_start.replace(month=...)` raises ValueError("day is out of range for month")
+    whenever start falls on the 29th-31st and the target month is shorter (e.g. start on
+    Jan 31 + 3 months -> April 31, which doesn't exist) - this silently broke ANY date range
+    whose start date landed on one of those days, which is a completely ordinary thing for a
+    user-picked "last N days" range to do. Clamps to the target month's actual last day
+    instead, the same convention date-arithmetic libraries like dateutil use for
+    add-N-months."""
     chunk_start = start
     while chunk_start < end:
         month_index = chunk_start.month - 1 + months_per_chunk
-        chunk_end = chunk_start.replace(year=chunk_start.year + month_index // 12, month=month_index % 12 + 1)
+        target_year = chunk_start.year + month_index // 12
+        target_month = month_index % 12 + 1
+        target_day = min(chunk_start.day, calendar.monthrange(target_year, target_month)[1])
+        chunk_end = chunk_start.replace(year=target_year, month=target_month, day=target_day)
         yield chunk_start, min(chunk_end, end)
         chunk_start = chunk_end
 
