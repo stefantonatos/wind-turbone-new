@@ -802,16 +802,41 @@ def render_run_context(strategy_name, strategy_id, trades, instruments, start_da
 # pages
 # --------------------------------------------------------------------------------------
 
+def _compare_all_pct_metrics(cost_trades, risk_pct):
+    """Compounded %-of-account metrics for one slice (full period, fit window, or holdout
+    window) of a Compare All run - shared so the three slices are computed identically. Returns
+    None for an empty slice (e.g. a strategy with zero holdout trades), which callers use as
+    their own "not enough data in this slice" signal."""
+    s = stats_mod.compute_stats(cost_trades)
+    if s is None:
+        return None
+    total_pct = stats_mod.compounded_return_pct(cost_trades, risk_pct)
+    total_pct_ci_low, total_pct_ci_high = stats_mod.compounded_return_ci(
+        s["avg_r_ci_low"], s["avg_r_ci_high"], risk_pct, s["n_trades"])
+    max_drawdown_pct = stats_mod.compounded_max_drawdown_pct(cost_trades, risk_pct)
+    return {
+        "n_trades": s["n_trades"], "total_pct": total_pct,
+        "total_pct_ci_low": total_pct_ci_low, "total_pct_ci_high": total_pct_ci_high,
+        "avg_pct_per_trade": s["avg_r"] * risk_pct, "win_pct": s["tp_pct"],
+        "max_drawdown_pct": max_drawdown_pct, "z_score": s["z_score"],
+    }
+
+
 def render_compare_all_section():
     st.markdown(eyebrow("COMPARE ALL STRATEGIES"), unsafe_allow_html=True)
     st.caption(f"Runs every one of the {len(STRATEGIES)} strategies in this catalog over the SAME date "
                f"range (each using its own usual instrument list and its own defaults - no manual "
-               f"parameters here either) and ranks them by total % return - a real, no-mocked-data "
-               f"answer to \"which of these actually works best\", not one strategy's numbers in "
-               f"isolation. Typical per-instrument trading costs are deducted from every trade before "
-               f"ranking (same as the Results page default - see stats.py for sourcing), and strategies "
-               f"under {stats_mod.MIN_TRADES_FOR_RANKING} trades on this range are excluded from ranking "
-               f"entirely, not just caveated.")
+               f"parameters here either). Comparing this many strategies on the exact same window and "
+               f"crowning whichever looks best is itself a form of data snooping - the \"winner\" might "
+               f"just be the luckiest strategy on that window, not the best one. So ranking uses only the "
+               f"LAST {stats_mod.HOLDOUT_FRACTION * 100:.0f}% of the selected range (never seen by the "
+               f"ranking decision itself) - the same in-sample/out-of-sample discipline every research/*.py "
+               f"script's own SPLIT_DATE convention already uses, applied one level up. The full-period "
+               f"and fit-window numbers are still shown for context, just not used to pick a \"best\". "
+               f"Typical per-instrument trading costs are deducted from every trade (same as the Results "
+               f"page default - see stats.py for sourcing), and strategies under "
+               f"{stats_mod.MIN_TRADES_FOR_RANKING} HOLDOUT trades are excluded from ranking entirely, not "
+               f"just caveated.")
 
     with st.container(border=True):
         today = datetime.date.today()
@@ -865,12 +890,17 @@ def render_compare_all_section():
                 labels = _instrument_labels(strategy)
                 raw_trades = strategy.runner(module, labels, start_dt, end_dt, {}, lambda *a: None)
                 raw_trades = stats_mod.normalize_trade_dates(raw_trades)
-                cost_trades, _n_unadjusted = stats_mod.apply_cost_adjustment(raw_trades)
-                s = stats_mod.compute_stats(cost_trades)
+                fit_trades, holdout_trades, split_is_date_based = stats_mod.split_trades_for_holdout(raw_trades)
+                full_cost_trades, _n_unadjusted = stats_mod.apply_cost_adjustment(raw_trades)
+                fit_cost_trades, _ = stats_mod.apply_cost_adjustment(fit_trades)
+                holdout_cost_trades, _ = stats_mod.apply_cost_adjustment(holdout_trades)
+                full_m = _compare_all_pct_metrics(full_cost_trades, risk_pct_compare)
+                fit_m = _compare_all_pct_metrics(fit_cost_trades, risk_pct_compare)
+                holdout_m = _compare_all_pct_metrics(holdout_cost_trades, risk_pct_compare)
             except Exception as exc:
                 results.append({"strategy": strategy.name, "n_trades": 0, "error": str(exc)})
                 continue
-            if s is None:
+            if full_m is None:
                 results.append({"strategy": strategy.name, "n_trades": 0, "error": "no trades produced"})
                 continue
 
@@ -894,31 +924,18 @@ def render_compare_all_section():
             except Exception as exc:
                 print(f"Compare All: failed to save {strategy.name} to history/gallery: {exc}")
 
-            # COMPOUNDED, not the naive "total_r * risk_pct" sum - that additive version treats
-            # every trade as risking a fixed dollar amount off the STARTING balance forever, which
-            # silently produces impossible "returns" (past -100%) once a strategy has enough
-            # trades and a genuinely thin/negative cost-adjusted edge (confirmed happening here:
-            # a real 41k-trade Compare All run showed a strategy at "-10,977%" total, which cannot
-            # happen to a real account - see stats.compounded_return_pct's own docstring).
-            total_pct = stats_mod.compounded_return_pct(cost_trades, risk_pct_compare)
-            total_pct_ci_low, total_pct_ci_high = stats_mod.compounded_return_ci(
-                s["avg_r_ci_low"], s["avg_r_ci_high"], risk_pct_compare, s["n_trades"])
-            # same compounding fix as total_pct above, same reason - additive drawdown scaled by
-            # risk_pct has no bound and can exceed 100%, which is impossible for a real account
-            max_drawdown_pct = stats_mod.compounded_max_drawdown_pct(cost_trades, risk_pct_compare)
-            results.append({
-                "strategy": strategy.name,
-                "n_trades": s["n_trades"],
-                "total_pct": total_pct,
-                "total_pct_ci_low": total_pct_ci_low,
-                "total_pct_ci_high": total_pct_ci_high,
-                "avg_pct_per_trade": s["avg_r"] * risk_pct_compare,
-                "win_pct": s["tp_pct"],
-                "max_drawdown_pct": max_drawdown_pct,
-                "z_score": s["z_score"],
-                "error": None,
-                "run_id": run_id,
-            })
+            row = {"strategy": strategy.name, "error": None, "run_id": run_id,
+                   "split_is_date_based": split_is_date_based}
+            row.update(full_m)   # n_trades, total_pct, total_pct_ci_low/high, avg_pct_per_trade, win_pct,
+                                  # max_drawdown_pct, z_score - full-period, shown for context only
+            row["fit_n_trades"] = fit_m["n_trades"] if fit_m else 0
+            row["fit_total_pct"] = fit_m["total_pct"] if fit_m else None
+            # HOLDOUT numbers are what ranking actually uses - prefixed so they can't be confused
+            # with the full-period fields above
+            for k, v in (holdout_m or {}).items():
+                row[f"holdout_{k}"] = v
+            row.setdefault("holdout_n_trades", 0)
+            results.append(row)
         progress_bar.progress(1.0, text="Done.")
         progress_placeholder.empty()
         st.session_state["compare_all_results"] = results
@@ -941,76 +958,97 @@ def render_compare_all_section():
 
     has_trades = [r for r in results if not r.get("error") and r.get("n_trades", 0) > 0]
     empty_or_failed = [r for r in results if r.get("error") or not r.get("n_trades")]
-    # A strategy under the trade-count floor CANNOT win the headline comparison, however good
-    # its return looks - that would just be crowning noise. It still gets fully SHOWN (below),
-    # just structurally excluded from ranking/highlighting - see stats.MIN_TRADES_FOR_RANKING.
-    qualifying = [r for r in has_trades if r["n_trades"] >= stats_mod.MIN_TRADES_FOR_RANKING]
-    thin_sample = [r for r in has_trades if r["n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING]
-    qualifying.sort(key=lambda r: -r["total_pct"])
-    thin_sample.sort(key=lambda r: -r["n_trades"])
+    # A strategy under the trade-count floor in the HOLDOUT window CANNOT win the headline
+    # comparison, however good its full-period or holdout return looks - that would just be
+    # crowning noise the ranking itself was never protected against. Ranked by HOLDOUT total %,
+    # not full-period - see this function's own top caption for why.
+    qualifying = [r for r in has_trades if r["holdout_n_trades"] >= stats_mod.MIN_TRADES_FOR_RANKING]
+    thin_sample = [r for r in has_trades if r["holdout_n_trades"] < stats_mod.MIN_TRADES_FOR_RANKING]
+    qualifying.sort(key=lambda r: -r["holdout_total_pct"])
+    thin_sample.sort(key=lambda r: -r["holdout_n_trades"])
 
     if qualifying:
         best = qualifying[0]
-        st.markdown(eyebrow(f"BEST OF {len(qualifying)} QUALIFYING (of {len(results)} total)"),
+        st.markdown(eyebrow(f"BEST OF {len(qualifying)} QUALIFYING ON HOLDOUT (of {len(results)} total)"),
                     unsafe_allow_html=True)
         with st.container(border=True):
             best_cols = st.columns(5)
-            best_cols[0].metric("Total %", f"{best['total_pct']:+.2f}%",
-                                 help=f"95% confidence interval: {best['total_pct_ci_low']:+.2f}% to "
-                                      f"{best['total_pct_ci_high']:+.2f}% (normal approximation).")
-            best_cols[1].metric("Avg % / trade", f"{best['avg_pct_per_trade']:+.3f}%")
-            best_cols[2].metric("Trades", best["n_trades"])
-            best_cols[3].metric("Win rate", f"{best['win_pct']:.1f}%")
-            best_cols[4].metric("Max drawdown", f"-{best['max_drawdown_pct']:.2f}%")
+            best_cols[0].metric("Holdout Total %", f"{best['holdout_total_pct']:+.2f}%",
+                                 help=f"95% CI: {best['holdout_total_pct_ci_low']:+.2f}% to "
+                                      f"{best['holdout_total_pct_ci_high']:+.2f}% (normal approximation). "
+                                      f"Computed ONLY on the last {stats_mod.HOLDOUT_FRACTION * 100:.0f}% of "
+                                      f"the selected range - see this section's top caption.")
+            best_cols[1].metric("Holdout avg % / trade", f"{best['holdout_avg_pct_per_trade']:+.3f}%")
+            best_cols[2].metric("Holdout trades", best["holdout_n_trades"])
+            best_cols[3].metric("Holdout win rate", f"{best['holdout_win_pct']:.1f}%")
+            best_cols[4].metric("Holdout max drawdown", f"-{best['holdout_max_drawdown_pct']:.2f}%")
+        fit_note = (f"Fit-window total was {best['fit_total_pct']:+.2f}% ({best['fit_n_trades']} trades) - "
+                    f"{'consistent direction, a good sign' if (best['fit_total_pct'] or 0) * best['holdout_total_pct'] > 0 else 'OPPOSITE direction from holdout - a real red flag, not just noise'}."
+                    if best.get("fit_total_pct") is not None else "No fit-window trades to compare against.")
         st.caption(f"**{best['strategy']}** - only strategies with at least "
-                   f"{stats_mod.MIN_TRADES_FOR_RANKING} trades on this range are eligible to be ranked "
-                   f"\"best\" at all; see \"too few trades to rank\" below for the rest.")
+                   f"{stats_mod.MIN_TRADES_FOR_RANKING} HOLDOUT trades are eligible to be ranked \"best\" "
+                   f"at all; see \"too few trades to rank\" below for the rest. {fit_note}")
     else:
         st.warning(f"None of the {len(results)} strategies produced at least "
-                   f"{stats_mod.MIN_TRADES_FOR_RANKING} trades on this date range, so there's no "
-                   f"meaningful \"best\" to highlight - widen the range and re-run.")
+                   f"{stats_mod.MIN_TRADES_FOR_RANKING} trades in the holdout window on this date range, "
+                   f"so there's no meaningful \"best\" to highlight - widen the range and re-run (a wider "
+                   f"range also means a wider holdout slice, not just a wider fit slice).")
 
-    st.markdown(eyebrow("LEADERBOARD (RANKED, ≥100 TRADES)"), unsafe_allow_html=True)
+    st.markdown(eyebrow(f"LEADERBOARD (RANKED BY HOLDOUT, ≥{stats_mod.MIN_TRADES_FOR_RANKING} HOLDOUT TRADES)"),
+                unsafe_allow_html=True)
     rows = [{
-        "strategy": r["strategy"], "trades": r["n_trades"], "total %": r["total_pct"],
-        "total % 95% CI": f"{r['total_pct_ci_low']:+.1f}% to {r['total_pct_ci_high']:+.1f}%",
-        "avg % / trade": r["avg_pct_per_trade"], "win %": r["win_pct"],
-        "max drawdown %": r["max_drawdown_pct"], "z-score": r["z_score"],
+        "strategy": r["strategy"], "holdout trades": r["holdout_n_trades"],
+        "holdout total %": r["holdout_total_pct"],
+        "holdout 95% CI": f"{r['holdout_total_pct_ci_low']:+.1f}% to {r['holdout_total_pct_ci_high']:+.1f}%",
+        "fit total %": r.get("fit_total_pct"), "fit trades": r["fit_n_trades"],
+        "full-period total %": r["total_pct"], "holdout win %": r["holdout_win_pct"],
+        "holdout max DD %": r["holdout_max_drawdown_pct"], "holdout z-score": r["holdout_z_score"],
     } for r in qualifying]
     if rows:
         leaderboard_df = pd.DataFrame(rows)
         st.dataframe(
-            style_signed_columns(leaderboard_df, ["total %", "avg % / trade"],
-                                  fmt={"total %": "{:+.2f}%", "avg % / trade": "{:+.3f}%"})
-            .format({"win %": "{:.1f}%", "max drawdown %": "-{:.2f}%", "z-score": "{:.2f}"}, na_rep="-"),
+            style_signed_columns(leaderboard_df, ["holdout total %", "fit total %", "full-period total %"],
+                                  fmt={"holdout total %": "{:+.2f}%", "fit total %": "{:+.2f}%",
+                                       "full-period total %": "{:+.2f}%"})
+            .format({"holdout win %": "{:.1f}%", "holdout max DD %": "-{:.2f}%",
+                     "holdout z-score": "{:.2f}"}, na_rep="-"),
             use_container_width=True, hide_index=True)
+        st.caption("\"fit total %\" and \"full-period total %\" are shown for context only - a strategy "
+                   "whose fit and holdout numbers point in opposite directions is a red flag even if the "
+                   "holdout number alone looks fine, since it suggests the edge isn't stable over time.")
     else:
-        st.caption("No strategy qualifies for ranking on this range yet.")
+        st.caption("No strategy qualifies for holdout-ranking on this range yet.")
 
     if thin_sample:
-        st.markdown(eyebrow(f"TOO FEW TRADES TO RANK (<{stats_mod.MIN_TRADES_FOR_RANKING})"),
+        st.markdown(eyebrow(f"TOO FEW HOLDOUT TRADES TO RANK (<{stats_mod.MIN_TRADES_FOR_RANKING})"),
                     unsafe_allow_html=True)
         st.caption("Shown for reference only - NOT sorted by return, NOT eligible for \"best of\" above. "
-                   "A strong-looking % here is not evidence of anything with this few trades.")
+                   "A strong-looking % here (holdout or full-period) is not evidence of anything with this "
+                   "few holdout trades. A wider date range gives the holdout slice more room to work with.")
         thin_rows = [{
-            "strategy": r["strategy"], "trades": r["n_trades"], "total %": r["total_pct"],
-            "win %": r["win_pct"],
+            "strategy": r["strategy"], "holdout trades": r["holdout_n_trades"],
+            "holdout total %": r.get("holdout_total_pct"), "full-period trades": r["n_trades"],
+            "full-period total %": r["total_pct"], "full-period win %": r["win_pct"],
         } for r in thin_sample]
         thin_df = pd.DataFrame(thin_rows)
         st.dataframe(
-            style_signed_columns(thin_df, ["total %"], fmt={"total %": "{:+.2f}%"})
-            .format({"win %": "{:.1f}%"}, na_rep="-"),
+            style_signed_columns(thin_df, ["holdout total %", "full-period total %"],
+                                  fmt={"holdout total %": "{:+.2f}%", "full-period total %": "{:+.2f}%"})
+            .format({"full-period win %": "{:.1f}%"}, na_rep="-"),
             use_container_width=True, hide_index=True)
 
     if empty_or_failed:
         with st.expander(f"{len(empty_or_failed)} strategies produced no trades or failed on this range"):
             for r in empty_or_failed:
                 st.caption(f"**{r['strategy']}**: {r.get('error') or 'no trades in this date range'}")
-    st.caption(f"Leaderboard ranked by total % return at "
+    st.caption(f"Leaderboard ranked by HOLDOUT total % return (the last {stats_mod.HOLDOUT_FRACTION * 100:.0f}% "
+               f"of the selected range, never used to pick the ranking) at "
                f"{st.session_state.get('compare_all_risk_pct_used', 1.0):.2f}% risk/trade, restricted to "
-               f"strategies with at least {stats_mod.MIN_TRADES_FOR_RANKING} trades on this range. Same "
-               f"caveats as everywhere else in this app: no commission/spread/slippage modeled, and this "
-               f"is in-sample performance over the exact period shown, not an out-of-sample test.")
+               f"strategies with at least {stats_mod.MIN_TRADES_FOR_RANKING} holdout trades. Same caveats "
+               f"as everywhere else in this app: no commission/spread/slippage modeled. This IS an "
+               f"out-of-sample check on which strategy to trust, one level up from the individual research "
+               f"scripts' own in-sample/out-of-sample splits - it is NOT a live/forward test, since the "
+               f"whole \"holdout\" window is still historical data that already happened.")
 
 
 def browse_strategies_page():

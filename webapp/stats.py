@@ -17,6 +17,45 @@ from collections import defaultdict
 # better than none.
 MIN_TRADES_FOR_RANKING = 100
 
+# Fraction of a Compare-All comparison period held out for out-of-sample ranking (see
+# split_trades_for_holdout). Compare All doesn't fit any parameters - it just runs each
+# strategy's own already-fixed rules - so this isn't guarding against classic parameter
+# overfitting. What it IS guarding against: comparing 16 strategies on the exact same window and
+# crowning whichever one happens to look best is itself a form of data snooping (strategy-
+# selection bias, not parameter-selection bias) - the "winner" might just be the luckiest
+# strategy on that specific window, not the best one. Ranking by a HELD-OUT slice the "winner"
+# was never chosen using is the same discipline every research/*.py script's own SPLIT_DATE
+# in-sample/out-of-sample convention already uses, applied one level up. A fixed, undebatable
+# constant, not a user-adjustable slider - making it tunable would reopen exactly the p-hacking
+# risk this feature exists to close.
+HOLDOUT_FRACTION = 0.25
+
+
+def split_trades_for_holdout(trades, holdout_fraction=HOLDOUT_FRACTION):
+    """Splits trades into (fit_trades, holdout_trades, split_is_date_based) - the LAST
+    `holdout_fraction` of the period is held out. Splits by calendar DATE when every trade has
+    one (the threshold is computed from the trades' own min/max date span, not the caller's
+    original fetch window, so it's exact regardless of how much of a warmup period actually
+    produced trades) - falls back to a POSITIONAL split (last fraction of the list, in whatever
+    order the caller passed them - typically a runner's own per-instrument-then-concatenated
+    sequence) for strategies whose trades don't carry dates at all (e.g. ORB indices). Neither
+    half is cost-adjusted here - that's the caller's job, same as every other trade list this
+    module hands back."""
+    if not trades:
+        return [], [], True
+    has_dates = all(t.get("date") for t in trades)
+    if has_dates:
+        dates = sorted(t["date"] for t in trades)
+        min_d, max_d = dates[0], dates[-1]
+        span_days = (max_d - min_d).days
+        threshold = min_d + datetime.timedelta(days=round(span_days * (1 - holdout_fraction)))
+        fit = [t for t in trades if t["date"] < threshold]
+        holdout = [t for t in trades if t["date"] >= threshold]
+        return fit, holdout, True
+    n = len(trades)
+    split_idx = round(n * (1 - holdout_fraction))
+    return trades[:split_idx], trades[split_idx:], False
+
 
 # --- typical retail trading cost, applied by DEFAULT everywhere this app shows results -----
 # Every backtest in this project runs with NO commission/spread/slippage modeled (see each
