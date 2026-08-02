@@ -734,21 +734,40 @@ def run_backtest_page():
                                                      label_visibility="collapsed", key=f"{strategy.id}_instruments")
         with c3:
             st.markdown('<div class="console-label">Date range</div>', unsafe_allow_html=True)
-            default_end = datetime.date.today() - datetime.timedelta(days=1)
+            today = datetime.date.today()
+            latest_available = today - datetime.timedelta(days=1)   # today's trading day isn't complete yet
+            default_end = latest_available
             default_start = default_end - datetime.timedelta(days=strategy.default_history_days)
+            # No max_value cap on the widget itself - a hard cap produces a confusing invalid/red-error
+            # state the moment someone picks "today" (a completely natural thing to try), and on that
+            # invalid state Streamlit was returning the OLD default range to Python instead of what was
+            # actually typed - silently running the wrong window while LOOKING like the app ignored the
+            # selection entirely. Instead: accept whatever's picked, then clamp/validate it in plain code
+            # below, so the caption and the actual run always agree on exactly the same range.
             date_range = st.date_input("Date range", value=(default_start, default_end),
-                                          max_value=default_end, label_visibility="collapsed",
-                                          key=f"{strategy.id}_daterange")
-            # describes the CURRENTLY SELECTED range, not the strategy's static default - showing
-            # the default's own width here regardless of what's actually picked used to make a
-            # deliberately widened range look like it had been silently ignored
-            if isinstance(date_range, tuple) and len(date_range) == 2:
+                                          label_visibility="collapsed", key=f"{strategy.id}_daterange")
+
+            date_range_error = None
+            if not (isinstance(date_range, tuple) and len(date_range) == 2):
+                date_range_error = "Pick both a start and end date."
+            else:
+                start_d, end_d = date_range
+                clamped_end = min(end_d, latest_available)
+                if start_d >= clamped_end:
+                    date_range_error = (f"Start date must be before {latest_available} (today's trading day "
+                                         f"isn't complete yet, so data only goes up to yesterday).")
+                else:
+                    date_range = (start_d, clamped_end)
+
+            if date_range_error:
+                st.caption(f"⚠ {date_range_error}")
+            else:
                 span_days = (date_range[1] - date_range[0]).days
                 span_label = f"~{span_days / 365:.1f} years" if span_days >= 365 else f"~{span_days} days"
-                st.caption(f"Currently set to {span_label} ({date_range[0]} to {date_range[1]}). Widen or "
-                           f"narrow freely - first fetches of a wide range can take many minutes.")
-            else:
-                st.caption("Pick both a start and end date.")
+                clamp_note = " (end date clamped to yesterday - today's trading day isn't complete yet)" \
+                    if date_range[1] != end_d else ""
+                st.caption(f"Currently set to {span_label} ({date_range[0]} to {date_range[1]}){clamp_note}. "
+                           f"Widen or narrow freely - first fetches of a wide range can take many minutes.")
 
         # No manual parameter tweaking here any more - every plain Run Backtest uses this
         # strategy's own fixed defaults. Finding a better combination automatically is what the
@@ -762,10 +781,10 @@ def run_backtest_page():
 
     if run_clicked:
         if not selected_instruments:
-            st.error("Select at least one instrument in the sidebar.")
+            st.error("Select at least one instrument above.")
             return
-        if not isinstance(date_range, tuple) or len(date_range) != 2:
-            st.error("Pick a full start and end date in the sidebar.")
+        if date_range_error:
+            st.error(f"Fix the date range above before running: {date_range_error}")
             return
 
         module = importlib.import_module(strategy.module_name)
