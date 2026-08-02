@@ -125,6 +125,18 @@ def compute_stats(trades):
         z = (avg_r / (std_r / math.sqrt(n))) if std_r > 0 else 0.0
     else:
         z = 0.0
+    # 95% confidence interval on avg/total R - normal approximation (z=1.96 * standard error),
+    # same construction as the z-score above, not a bootstrap (more correct for a skewed
+    # R-multiple distribution but heavier to recompute on every rerun/filter change - this is
+    # explicitly an approximation, same honesty standard as the z-score already carries). A
+    # point estimate alone overstates certainty, especially on the small samples common here -
+    # this interval is what actually widens or narrows with sample size, and callers should
+    # show it alongside the point estimate, not bury it.
+    if n >= 2 and std_r > 0:
+        se_avg = std_r / math.sqrt(n)
+        avg_r_ci_low, avg_r_ci_high = avg_r - 1.96 * se_avg, avg_r + 1.96 * se_avg
+    else:
+        avg_r_ci_low = avg_r_ci_high = avg_r
     return {
         "n_trades": n,
         "total_r": total_r,
@@ -133,6 +145,8 @@ def compute_stats(trades):
         "tp_pct": tp / n * 100, "sl_pct": sl / n * 100, "flat_pct": flat / n * 100,
         "z_score": z,
         "max_drawdown_r": max_drawdown(trades),
+        "avg_r_ci_low": avg_r_ci_low, "avg_r_ci_high": avg_r_ci_high,
+        "total_r_ci_low": avg_r_ci_low * n, "total_r_ci_high": avg_r_ci_high * n,
     }
 
 

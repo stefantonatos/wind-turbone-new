@@ -246,9 +246,15 @@ def render_filterable_results(trades, strategy, key_prefix):
     with st.container(border=True):
         metric_cols = st.columns(7)
         metric_cols[0].metric("Trades", s_display["n_trades"])
-        metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]))
-        metric_cols[2].metric(f"Avg {unit_label} / trade", (unit_fmt if unit_label == "R" else "{:+.3f}%")
-                               .format(s_display["avg_r"]))
+        metric_cols[1].metric(f"Total {unit_label}", unit_fmt.format(s_display["total_r"]),
+                               help=f"95% confidence interval: {unit_fmt.format(s_display['total_r_ci_low'])} "
+                                    f"to {unit_fmt.format(s_display['total_r_ci_high'])} (normal "
+                                    f"approximation - wide on a small sample, not a guarantee either way).")
+        avg_fmt = unit_fmt if unit_label == "R" else "{:+.3f}%"
+        metric_cols[2].metric(f"Avg {unit_label} / trade", avg_fmt.format(s_display["avg_r"]),
+                               help=f"95% confidence interval: {avg_fmt.format(s_display['avg_r_ci_low'])} to "
+                                    f"{avg_fmt.format(s_display['avg_r_ci_high'])} (normal approximation - "
+                                    f"wide on a small sample, not a guarantee either way).")
         metric_cols[3].metric("Win rate (TP)", f"{s_display['tp_pct']:.1f}%")
         metric_cols[4].metric("Loss rate (SL)", f"{s_display['sl_pct']:.1f}%")
         metric_cols[5].metric(f"Max drawdown ({unit_label})", unit_fmt.format(-s_display["max_drawdown_r"]))
@@ -801,6 +807,8 @@ def render_compare_all_section():
                 "strategy": strategy.name,
                 "n_trades": s["n_trades"],
                 "total_pct": s["total_r"] * risk_pct_compare,
+                "total_pct_ci_low": s["total_r_ci_low"] * risk_pct_compare,
+                "total_pct_ci_high": s["total_r_ci_high"] * risk_pct_compare,
                 "avg_pct_per_trade": s["avg_r"] * risk_pct_compare,
                 "win_pct": s["tp_pct"],
                 "max_drawdown_pct": s["max_drawdown_r"] * risk_pct_compare,
@@ -832,7 +840,9 @@ def render_compare_all_section():
                     unsafe_allow_html=True)
         with st.container(border=True):
             best_cols = st.columns(5)
-            best_cols[0].metric("Total %", f"{best['total_pct']:+.2f}%")
+            best_cols[0].metric("Total %", f"{best['total_pct']:+.2f}%",
+                                 help=f"95% confidence interval: {best['total_pct_ci_low']:+.2f}% to "
+                                      f"{best['total_pct_ci_high']:+.2f}% (normal approximation).")
             best_cols[1].metric("Avg % / trade", f"{best['avg_pct_per_trade']:+.3f}%")
             best_cols[2].metric("Trades", best["n_trades"])
             best_cols[3].metric("Win rate", f"{best['win_pct']:.1f}%")
@@ -848,6 +858,7 @@ def render_compare_all_section():
     st.markdown(eyebrow("LEADERBOARD (RANKED, ≥100 TRADES)"), unsafe_allow_html=True)
     rows = [{
         "strategy": r["strategy"], "trades": r["n_trades"], "total %": r["total_pct"],
+        "total % 95% CI": f"{r['total_pct_ci_low']:+.1f}% to {r['total_pct_ci_high']:+.1f}%",
         "avg % / trade": r["avg_pct_per_trade"], "win %": r["win_pct"],
         "max drawdown %": r["max_drawdown_pct"], "z-score": r["z_score"],
     } for r in qualifying]
