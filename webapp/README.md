@@ -77,10 +77,16 @@ falls back to local-disk-only behavior exactly as before, so this is entirely op
 
 ## Strategies in the registry
 
-13 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+14 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
-Support/Resistance Zone Bounce, ICT Silver Bullet, and ORB (indices).
+Support/Resistance Zone Bounce, ICT Silver Bullet, ORB (indices), and EvenDyer VWAP ORB.
+
+EvenDyer VWAP ORB is US index CFDs only (SP500/NASDAQ100/DOWJONES) - its opening-range and
+VWAP session windows are scoped to US equity trading hours, there's no forex reading of
+those defaults. It enters WITH an opening-range break's direction after a VWAP
+pullback-then-reclaim, with stop/target from confirmed swing pivots rather than a fixed
+R:R - the first strategy in this catalog to size trades that way.
 
 Three of these (Donchian, MA cross, Dow Theory) are multi-day SWING/POSITION systems on
 daily channels/pivots rather than intraday, so their date-range default is ~3

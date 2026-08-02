@@ -427,6 +427,40 @@ def _run_orb_indices(module, selected_labels, start_dt, end_dt, overrides, progr
     return all_trades
 
 
+# ---------------------------------------------------------------------------
+# evendyer_vwap_orb_dukascopy_backtest.py (EvenDyer VWAP ORB / "Scam Or Slam" VWAP)
+# US index CFDs ONLY (SP500/NASDAQ100/DOWJONES) - the 0930-1000 NY opening range and
+# VWAP session windows only make sense on US equity index hours, not forex. Exposes:
+# INSTRUMENTS [(label, const)], FETCH_START, FETCH_END, CACHE_DIR (own disk cache),
+# STOP_SWING_LEN, TARGET_SWING_LEN, BUFFER_AMOUNT, MAX_TRADES_PER_DAY,
+# fetch_instrument_data(label, instrument_const) -> df, backtest_instrument(label, df,
+# verbose=True, record_trace=False) -> (trades, used_real_volume, diagnostic_str) - a
+# 3-TUPLE, not a bare trade list like the _run_with_own_cache shape, so this needs its
+# own runner rather than aliasing that shared one. Trade keys: side, outcome, r, date,
+# stop_pct (no entry/stop/target/exit price+time yet, so no chart_fetcher wired).
+# ---------------------------------------------------------------------------
+def _run_vwap_orb(module, selected_labels, start_dt, end_dt, overrides, progress_cb):
+    import os
+    module.FETCH_START, module.FETCH_END = start_dt, end_dt
+    _apply_overrides(module, overrides)
+    module.CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache",
+                                      "evendyer_vwap_orb_dukascopy_cache")
+    chosen = [row for row in module.INSTRUMENTS if row[0] in selected_labels]
+    all_trades = []
+    with cached_dukascopy_fetch():
+        for done, (label, const) in enumerate(chosen):
+            progress_cb(done, len(chosen), label)
+            df = module.fetch_instrument_data(label, const)
+            if df is None or df.empty:
+                continue
+            trades, _used_real_volume, _diag = module.backtest_instrument(label, df, verbose=False)
+            for t in trades:
+                t["instrument"] = label
+                all_trades.append(t)
+        progress_cb(len(chosen), len(chosen), "done")
+    return all_trades
+
+
 def _load_module(module_name):
     return importlib.import_module(module_name)
 
@@ -736,14 +770,27 @@ def _build_registry():
         optimization_module=_find_optimization_module("research.orb_indices_dukascopy_backtest"),
     ))
 
-    # --- evendyer_vwap_orb_dukascopy_backtest.py: not present in research/ yet as of this
-    # build (checked at registry-build time below) - add its own StrategyDef here, following
-    # the same shape as the entries above, once it exists and follows the fetch+backtest
-    # function-based pattern.
-    import os
-    research_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "research")
-    if os.path.isfile(os.path.join(research_dir, "evendyer_vwap_orb_dukascopy_backtest.py")):
-        pass  # present but not wired in this pass - read it fully and add a StrategyDef before enabling
+    vwap_mod = _load_module("research.evendyer_vwap_orb_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="evendyer_vwap_orb",
+        name="EvenDyer VWAP ORB (Scam Or Slam)",
+        module_name="research.evendyer_vwap_orb_dukascopy_backtest",
+        granularity="5-min bars, US index CFDs only (SP500/NASDAQ100/DOWJONES)",
+        instruments=vwap_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("STOP_SWING_LEN", "Stop swing pivot lookback (bars)", "int", vwap_mod.STOP_SWING_LEN, 5, 60, 5),
+            ParamSpec("TARGET_SWING_LEN", "Target swing pivot lookback (bars)", "int", vwap_mod.TARGET_SWING_LEN, 2, 40, 1),
+            ParamSpec("BUFFER_AMOUNT", "Stop buffer beyond swing pivot (price units)", "float", vwap_mod.BUFFER_AMOUNT, 0.0, 10.0, 0.5),
+        ],
+        facets=[],
+        notes="US index CFDs only - its 0930-1000 NY opening range and VWAP session windows only make "
+              "sense on US equity index hours, there is no forex reading of these defaults. Enters WITH "
+              "an opening-range break's direction, confirmed by a VWAP pullback-then-reclaim (not a "
+              "candle pattern or FVG); stop/target come from confirmed swing pivots, not a fixed R:R. "
+              "One trade/day/instrument max.",
+        runner=_run_vwap_orb,
+        optimization_module=_find_optimization_module("research.evendyer_vwap_orb_dukascopy_backtest"),
+    ))
 
     # --- trend_following_momentum_dukascopy_backtest.py: deliberately NOT included.
     # It doesn't produce a list of R-multiple trade dicts at all - its unit of output is a
