@@ -861,6 +861,37 @@ def _build_registry():
         optimization_module=_find_optimization_module("research.evendyer_vwap_orb_dukascopy_backtest"),
     ))
 
+    # RANDOM ENTRY CONTROL - listed LAST on purpose so it reads as the yardstick at the bottom of
+    # the catalog rather than as strategy #17. It is the reference line every other row should be
+    # compared against: coin-flip entries, zero edge by construction, run through the identical
+    # instruments/date range/cost model/holdout split as everything else. If a real strategy can't
+    # beat this, it has not been shown to have an edge; if EVERYTHING lands near this line, the
+    # leaderboard is measuring the cost model rather than the strategies. See the script's own
+    # header for why that distinction is not otherwise recoverable from the results.
+    random_control_mod = _load_module("research.random_baseline_control_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="random_baseline_control",
+        name="⊘ Random Entry (control, not a strategy)",
+        module_name="research.random_baseline_control_dukascopy_backtest",
+        granularity="5-min bars - coin-flip entries, symmetric 1:1 ATR stop/target",
+        instruments=random_control_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("ATR_MULT", "Stop/target distance (ATR multiples)", "float",
+                      random_control_mod.ATR_MULT, 0.5, 6.0, 0.5),
+            ParamSpec("BARS_BETWEEN_ENTRIES", "Minimum bars between entries", "int",
+                      random_control_mod.BARS_BETWEEN_ENTRIES, 1, 96, 1),
+        ],
+        facets=[],
+        notes="NOT A STRATEGY - this is the control. It flips a coin on each eligible bar and takes a "
+              "symmetric 1:1 bet, so it has NO edge by construction and its result is a direct "
+              "readout of what trading costs alone do to an account over this date range. Use it as "
+              "the bar: a strategy that doesn't clearly beat this line hasn't demonstrated an edge, "
+              "and if every strategy clusters around it, the numbers are dominated by the cost "
+              "assumption rather than by the rules. Seeded and reproducible so it can't be re-rolled.",
+        runner=_run_with_own_cache,
+        default_history_days=3 * 365,
+    ))
+
     # --- trend_following_momentum_dukascopy_backtest.py: deliberately NOT included.
     # It doesn't produce a list of R-multiple trade dicts at all - its unit of output is a
     # monthly-rebalanced PORTFOLIO return series (NAV, Sharpe, max drawdown, % positive

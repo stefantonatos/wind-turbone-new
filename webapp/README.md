@@ -36,12 +36,47 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
   "Rauf" strategy additionally reuses its own existing pickle-based cache
   (`research/day_trading_rauf_dukascopy_backtest.py`'s `CACHE_DIR`, redirected into
   `webapp/cache/rauf_dukascopy_cache/` instead of the repo root).
-- **No commission, spread, or slippage is modeled** by any of the underlying strategies
-  - this matches the caveat every research script already carries at the bottom of its
-  own printed report. Real trading results would be worse than what you see here.
+- **The underlying research scripts model no commission, spread, or slippage at all.**
+  This app deducts it afterwards, by default, everywhere - see "How to read the
+  numbers" below, because that deduction is doing a lot of work.
 - Toggling a filter on the results page (outcome, instrument, side, date sub-range,
   session/range) never re-fetches data - it only recomputes stats over the trade list
   already produced by your last "Run Backtest" click.
+
+## How to read the numbers
+
+Three things will change how you interpret every result in this app.
+
+**1. Costs are deducted by default, and they dominate.** Each trade's R is reduced by
+`(cost_pct / 100) / stop_pct` using researched prop-firm round-trip costs (see
+`stats.py`'s `TYPICAL_COST_PCT_BY_INSTRUMENT` for the figures and their sourcing gaps).
+Because the divisor is the stop distance, a tight-stop strategy pays a *large* cost in R
+terms - often the same order of magnitude as its entire measured edge. When that's true,
+"this strategy has no edge" and "this cost estimate is too harsh" produce identical
+headline numbers. **The Cost Sensitivity tab exists to separate them**: it re-scores the
+same trades from 0x to 2x the modelled cost and tells you the multiplier at which the
+verdict flips. Those cost figures have never been validated against a real filled broker
+statement - doing that once is worth more than any further backtesting.
+
+**2. There is a random-entry control in the catalog, and it is the yardstick.**
+`⊘ Random Entry (control, not a strategy)` flips a coin on each eligible bar and takes a
+symmetric 1:1 bet, so it has no edge by construction. Run it over the same range as
+anything else. A strategy that doesn't clearly beat it hasn't demonstrated an edge; if
+*everything* clusters around it, the leaderboard is measuring costs rather than
+strategies. It's seeded, so it can't be quietly re-rolled.
+
+**3. High trade counts wreck compounded returns even at zero edge.** At 1% risk per
+trade, a system with a tiny negative expectancy compounds to near -100% over tens of
+thousands of trades regardless of how good the rules are. A "-98%" next to 10,000 trades
+and a "-98%" next to 300 trades are not the same claim. Check trade count and the
+per-trade average, not just the headline.
+
+Related: the Compare All leaderboard applies a **multiple-comparisons correction**. Running
+N strategies against the same data is N tests, so the significance bar is |z| > ~2.95 for
+16 strategies, not the familiar 1.96 - at 1.96 you'd expect ~1 in 20 to look "significant"
+by chance even if every strategy were worthless. The leaderboard also flags any strategy
+whose result is **not directly comparable** to the others (costs that couldn't be applied,
+or a holdout that couldn't be split by time).
 
 ## Persisting history across restarts (optional, recommended if deployed)
 

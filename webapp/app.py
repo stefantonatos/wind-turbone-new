@@ -52,9 +52,28 @@ def _signed_color(v):
     return f"color: {INK_MUTED}"
 
 
+# pandas' Styler hard-refuses to render more than this many cells, raising rather than degrading -
+# and in Streamlit that exception takes down the ENTIRE page, not just the offending table. This is
+# the real cause of a StreamlitAPIException that went unexplained for weeks: it only reproduces on
+# strategies with very high trade counts (Bollinger Band Mean-Reversion alone hits ~334k cells on a
+# 3-year run), so it never showed up on small synthetic test data.
+_STYLER_MAX_CELLS = 262_144
+
+# Cap on rows rendered in the raw TRADE LOG table. Nobody scrolls 40,000 rows, and shipping that
+# many to the browser is a multi-megabyte payload that visibly stalls the rest of the page (it was
+# slow enough that later tabs appeared blank while it streamed). Every statistic on the page is
+# still computed over the full trade list - only this one table is capped.
+TRADE_LOG_MAX_ROWS = 2_000
+
+
 def style_signed_columns(df, cols, fmt="{:+.4f}"):
+    """Colour + sign-format the given numeric columns. Falls back to the RAW DataFrame (unstyled,
+    but complete and rendering fine) when the frame is too big for pandas to style, because losing
+    the colours on a huge table is obviously preferable to losing the whole page."""
     cols = [c for c in cols if c in df.columns]
     if not cols:
+        return df
+    if df.size > _STYLER_MAX_CELLS:
         return df
     fmt_map = fmt if isinstance(fmt, dict) else {c: fmt for c in cols}
     styler = df.style
@@ -127,7 +146,7 @@ def render_dollar_equity_chart(xs, equity, chronological, key, height=320, compa
         showlegend=False,
         **layout_kwargs,
     )
-    st.plotly_chart(fig, use_container_width=True, key=key,
+    st.plotly_chart(fig, width="stretch", key=key,
                      config={"displayModeBar": False} if compact else None)
 
 
@@ -168,7 +187,7 @@ def render_performance_calendar(trades, key, unit_label="R", unit_fmt="{:+.3f}R"
     layout_kwargs["xaxis"] = dict(visible=False)
     layout_kwargs["margin"] = dict(l=10, r=10, t=10, b=10)
     fig.update_layout(height=height, **layout_kwargs)
-    st.plotly_chart(fig, use_container_width=True, key=key, config={"displayModeBar": False})
+    st.plotly_chart(fig, width="stretch", key=key, config={"displayModeBar": False})
     st.caption("Each cell is one calendar day's total return across every instrument - green "
                "net-positive, red net-negative, blank = no trade that day.")
 
@@ -256,6 +275,9 @@ def render_filterable_results(trades, strategy, key_prefix):
     if not filtered:
         st.warning("No trades match the current filters.")
         return
+    # keep the pre-cost trades: the Cost Sensitivity tab re-scores from raw, and running it off
+    # already-adjusted trades would deduct costs twice
+    raw_filtered = list(filtered)
     n_unadjusted = 0
     if apply_costs:
         filtered, n_unadjusted = stats_mod.apply_cost_adjustment(filtered)
@@ -289,7 +311,7 @@ def render_filterable_results(trades, strategy, key_prefix):
         total_ci_low, total_ci_high = s_display["total_r_ci_low"], s_display["total_r_ci_high"]
         max_dd_display = s_display["max_drawdown_r"]
 
-    result_tab_labels = ["Overview", "Breakdown", "Prop Firm Fit"]
+    result_tab_labels = ["Overview", "Breakdown", "Cost Sensitivity", "Prop Firm Fit"]
     if has_dates:
         result_tab_labels.append("Calendar")
     chart_capable = bool(strategy and strategy.chart_fetcher)
@@ -348,11 +370,28 @@ def render_filterable_results(trades, strategy, key_prefix):
                                                   fmt={"total_r": "{:+.3f}", "avg_r": "{:+.4f}"})
         if "win_pct" in breakdown_df.columns and hasattr(breakdown_styler, "format"):
             breakdown_styler = breakdown_styler.format({"win_pct": "{:.1f}%"})
-        st.dataframe(breakdown_styler, use_container_width=True, hide_index=True)
+        st.dataframe(breakdown_styler, width="stretch", hide_index=True)
 
         st.markdown(eyebrow("TRADE LOG"), unsafe_allow_html=True)
         trade_df = pd.DataFrame(display_trades)
-        st.dataframe(style_signed_columns(trade_df, ["r"]), use_container_width=True, hide_index=True)
+        # pandas' Styler refuses to render more than styler.render.max_elements cells (262,144 by
+        # default) and raises StreamlitAPIException rather than degrading - which took the WHOLE
+        # results page down, not just this table, for any high-trade-count strategy. That is not a
+        # rare edge case here: Bollinger Band Mean-Reversion alone produces ~41k trades on a 3-year
+        # run (~334k cells). Cap the STYLED slice and render the remainder unstyled, so a big run
+        # shows its numbers instead of an error, and say plainly that the table is truncated rather
+        # than silently showing a subset.
+        if len(trade_df) > TRADE_LOG_MAX_ROWS:
+            st.caption(f"⚠ Showing the first {TRADE_LOG_MAX_ROWS:,} of {len(trade_df):,} trades. Every "
+                       f"metric, chart and statistic on this page still uses ALL {len(trade_df):,} - "
+                       f"only this table is capped.")
+            st.dataframe(style_signed_columns(trade_df.head(TRADE_LOG_MAX_ROWS), ["r"]),
+                         width="stretch", hide_index=True)
+        else:
+            st.dataframe(style_signed_columns(trade_df, ["r"]), width="stretch", hide_index=True)
+
+    with result_tabs["Cost Sensitivity"]:
+        render_cost_sensitivity_section(raw_filtered, risk_pct)
 
     with result_tabs["Prop Firm Fit"]:
         render_prop_firm_fit_section(filtered, key_prefix)
@@ -444,7 +483,54 @@ def render_trade_chart_section(strategy, trades, key_prefix):
     fig.update_layout(height=440, xaxis_rangeslider_visible=False,
                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
                        **{k: v for k, v in PLOTLY_LAYOUT_DEFAULTS.items() if k != "legend"})
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart_fig")
+    st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_chart_fig")
+
+
+def render_cost_sensitivity_section(raw_trades, risk_pct):
+    """How much of this result is the strategy and how much is the cost assumption? `raw_trades`
+    must be PRE-cost-adjustment (see stats.cost_sensitivity for why this matters)."""
+    st.markdown(eyebrow("HOW MUCH OF THIS RESULT IS THE COST MODEL?"), unsafe_allow_html=True)
+    st.caption("Every number elsewhere in this app deducts a researched prop-firm round-trip cost "
+               "(spread + commission, averaged across FTMO / FundedNext / The5ers - see stats.py for "
+               "the sourcing and its gaps). Those figures have never been checked against a real "
+               "filled broker statement, and cost in R-terms is (cost % / stop %), which gets LARGE "
+               "for tight-stop strategies. This tab re-scores the same trades with that whole cost "
+               "model dialled up and down, so you can see whether a verdict is coming from the "
+               "strategy or from the assumption.")
+
+    rows = stats_mod.cost_sensitivity(raw_trades, risk_pct)
+    df = pd.DataFrame([{
+        "cost model": ("costs OFF" if r["multiplier"] == 0 else
+                        "AS MODELLED" if r["multiplier"] == 1.0 else f"{r['multiplier']:g}x modelled"),
+        "total %": r["total_pct"], "avg R / trade": r["avg_r"],
+    } for r in rows])
+    st.dataframe(style_signed_columns(df, ["total %", "avg R / trade"],
+                                       fmt={"total %": "{:+.2f}%", "avg R / trade": "{:+.4f}"}),
+                 width="stretch", hide_index=True)
+
+    gross = rows[0]["total_pct"]
+    modelled = next(r["total_pct"] for r in rows if r["multiplier"] == 1.0)
+    breakeven = stats_mod.breakeven_cost_multiplier(raw_trades, risk_pct)
+
+    if gross <= 0:
+        st.error(f"**The rules themselves lose money.** Even with costs switched off entirely this "
+                 f"returns {gross:+.2f}%. No cost assumption is responsible for that verdict - "
+                 f"correcting the cost model cannot rescue this strategy.")
+    elif breakeven is None:
+        st.success(f"**Survives every cost level tested.** Still positive at 2x the modelled cost, so "
+                   f"this result is not an artifact of the cost assumption being too generous.")
+    else:
+        st.warning(f"**This verdict depends on the cost model.** Gross of costs it returns "
+                   f"{gross:+.2f}%; as modelled it returns {modelled:+.2f}%. It breaks even at "
+                   f"**{breakeven:.2f}x** the modelled cost - i.e. if the real cost of trading this is "
+                   f"more than {abs(1 - breakeven) * 100:.0f}% "
+                   f"{'lower' if breakeven < 1 else 'higher'} than assumed, the sign flips. Worth "
+                   f"pricing against your actual broker's fills before concluding anything.")
+
+    st.caption("Reality check this against a real statement: place (or paper-trade) a handful of fills "
+               "on the instrument you care about, compute your own actual round-trip cost as a % of "
+               "entry price, and compare it to stats.py's TYPICAL_COST_PCT_BY_INSTRUMENT. That single "
+               "measurement is worth more than any amount of further backtesting on assumed numbers.")
 
 
 def render_prop_firm_fit_section(trades, key_prefix):
@@ -472,7 +558,7 @@ def render_prop_firm_fit_section(trades, key_prefix):
                                           format_func=lambda pid: preset_labels[pid],
                                           key=f"{key_prefix}_propfirm_preset")
     run_sweep = cols[1].button("Run Prop Firm Simulation", key=f"{key_prefix}_propfirm_run",
-                                use_container_width=True)
+                                width="stretch")
     st.caption("Uses each firm's REAL, sourced evaluation rules (phases, profit targets, drawdown limits) - "
                "not a generic made-up account. Bootstrap-resamples this run's actual R-multiples across "
                "thousands of simulated attempts at each risk level, chained through every real evaluation "
@@ -536,7 +622,7 @@ def render_prop_firm_fit_section(trades, key_prefix):
     st.dataframe(sweep_df.style.format({"pass %": "{:.1f}%", "fail %": "{:.1f}%",
                                           "median days to pass": "{:.0f}", "median trades to pass": "{:.0f}"},
                                          na_rep="n/a"),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
 
     with st.expander("Sourcing & caveats for this preset"):
         st.caption(f"Source: {', '.join(preset['source_urls'])}")
@@ -560,7 +646,7 @@ def _render_optimization_result(result, opt_module_name):
 
     if result.heatmap is not None:
         st.markdown(eyebrow("PARAMETER STABILITY HEATMAP (AVG R/TRADE)"), unsafe_allow_html=True)
-        st.dataframe(style_diverging_heatmap(result.heatmap), use_container_width=True)
+        st.dataframe(style_diverging_heatmap(result.heatmap), width="stretch")
     if result.monte_carlo is not None and not result.monte_carlo.empty:
         st.markdown(eyebrow("MONTE CARLO PER CELL"), unsafe_allow_html=True)
         # signed color+sign applies to R-multiple/P&L columns only - a probability column
@@ -573,7 +659,7 @@ def _render_optimization_result(result, opt_module_name):
         mc_styler = style_signed_columns(result.monte_carlo, signed_cols, fmt="{:+.4f}")
         if prob_cols and hasattr(mc_styler, "format"):
             mc_styler = mc_styler.format({c: "{:.1%}" for c in prob_cols})
-        st.dataframe(mc_styler, use_container_width=True, hide_index=True)
+        st.dataframe(mc_styler, width="stretch", hide_index=True)
     if result.cluster_verdict is not None:
         st.markdown(eyebrow("CLUSTER / PLATEAU-VS-SPIKE VERDICT"), unsafe_allow_html=True)
         st.write(result.cluster_verdict)
@@ -581,7 +667,7 @@ def _render_optimization_result(result, opt_module_name):
         st.markdown(eyebrow("ROLLING WALK-FORWARD VALIDATION"), unsafe_allow_html=True)
         wf_signed = [c for c in result.walk_forward.columns if "total_r" in c or "avg_r" in c]
         st.dataframe(style_signed_columns(result.walk_forward, wf_signed, fmt="{:+.4f}"),
-                     use_container_width=True, hide_index=True)
+                     width="stretch", hide_index=True)
     if result.decay is not None:
         st.markdown(eyebrow("SIGNAL-DECAY DIAGNOSTIC"), unsafe_allow_html=True)
         d = result.decay
@@ -748,7 +834,7 @@ def render_generic_param_sweep(strategy, instruments, start_date, end_date):
     st.markdown(eyebrow("EVERY COMBINATION TRIED"), unsafe_allow_html=True)
     signed_cols = [c for c in result.table.columns if c in ("total_r", "avg_r")]
     st.dataframe(style_signed_columns(result.table, signed_cols, fmt={"total_r": "{:+.3f}", "avg_r": "{:+.4f}"}),
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
     st.caption("Sorted best avg R/trade first. Combinations with too few trades to be meaningful "
                f"(<{optimization.GENERIC_SWEEP_MIN_TRADES}) are still shown here but excluded from picking "
                "the best combination above.")
@@ -893,7 +979,7 @@ def render_compare_all_section():
         risk_pct_compare = st.number_input("Risk per trade (%) - for the % column below", min_value=0.05,
                                              max_value=10.0, value=1.0, step=0.25, key="compare_all_risk_pct")
 
-        run_all_clicked = st.button("Run All Strategies", type="primary", use_container_width=True,
+        run_all_clicked = st.button("Run All Strategies", type="primary", width="stretch",
                                       disabled=bool(date_range_error))
         st.caption("Real fetches against Dukascopy for every strategy, one at a time - with this many "
                    "strategies this can take a long time, especially on a wide date range or first-time "
@@ -915,9 +1001,9 @@ def render_compare_all_section():
                 raw_trades = strategy.runner(module, labels, start_dt, end_dt, {}, lambda *a: None)
                 raw_trades = stats_mod.normalize_trade_dates(raw_trades)
                 fit_trades, holdout_trades, split_is_date_based = stats_mod.split_trades_for_holdout(raw_trades)
-                full_cost_trades, _n_unadjusted = stats_mod.apply_cost_adjustment(raw_trades)
+                full_cost_trades, n_unadjusted = stats_mod.apply_cost_adjustment(raw_trades)
                 fit_cost_trades, _ = stats_mod.apply_cost_adjustment(fit_trades)
-                holdout_cost_trades, _ = stats_mod.apply_cost_adjustment(holdout_trades)
+                holdout_cost_trades, holdout_n_unadjusted = stats_mod.apply_cost_adjustment(holdout_trades)
                 full_m = _compare_all_pct_metrics(full_cost_trades, risk_pct_compare)
                 fit_m = _compare_all_pct_metrics(fit_cost_trades, risk_pct_compare)
                 holdout_m = _compare_all_pct_metrics(holdout_cost_trades, risk_pct_compare)
@@ -948,8 +1034,16 @@ def render_compare_all_section():
             except Exception as exc:
                 print(f"Compare All: failed to save {strategy.name} to history/gallery: {exc}")
 
+            # COMPARABILITY FLAGS. Both of these were previously computed and then thrown away here,
+            # which is how two strategies ended up silently being scored on a different basis from
+            # the other fourteen while sitting in the same ranked table (see the "COMPARABILITY"
+            # section rendered below, and webapp/test_strategy_contract.py for the full story).
+            # Keeping them on the row means a future strategy that regresses the contract is
+            # visible in the UI rather than quietly mis-ranked.
             row = {"strategy": strategy.name, "error": None, "run_id": run_id,
-                   "split_is_date_based": split_is_date_based}
+                   "split_is_date_based": split_is_date_based,
+                   "n_unadjusted": n_unadjusted,
+                   "holdout_n_unadjusted": holdout_n_unadjusted}
             row.update(full_m)   # n_trades, total_pct, total_pct_ci_low/high, avg_pct_per_trade, win_pct,
                                   # max_drawdown_pct, z_score - full-period, shown for context only
             row["fit_n_trades"] = fit_m["n_trades"] if fit_m else 0
@@ -976,7 +1070,7 @@ def render_compare_all_section():
         saved_cols[0].caption(f"Saved {n_saved} of {len(results)} runs to History/Gallery (search "
                                f"\"Compare All\" in the Gallery to find just these) - each with its own "
                                f"equity curve, exactly like a normal single Run Backtest.")
-        if saved_cols[1].button("Open Gallery", key="compare_all_open_gallery", use_container_width=True):
+        if saved_cols[1].button("Open Gallery", key="compare_all_open_gallery", width="stretch"):
             st.session_state.pending_page_nav = "Gallery"
             st.rerun()
 
@@ -1020,6 +1114,11 @@ def render_compare_all_section():
 
     st.markdown(eyebrow(f"LEADERBOARD (RANKED BY HOLDOUT, ≥{stats_mod.MIN_TRADES_FOR_RANKING} HOLDOUT TRADES)"),
                 unsafe_allow_html=True)
+    # MULTIPLE-COMPARISONS BAR. Every row below is a separate test against the same underlying
+    # data, so reading each row's z against the textbook 1.96 is exactly the error that
+    # manufactures false winners out of a big enough catalog. The bar scales with how many
+    # strategies actually ran, not a hardcoded 16, so it stays correct as the catalog grows.
+    z_bar = stats_mod.multiple_comparison_z_threshold(len(results))
     rows = [{
         "strategy": r["strategy"], "holdout trades": r["holdout_n_trades"],
         "holdout total %": r["holdout_total_pct"],
@@ -1027,6 +1126,7 @@ def render_compare_all_section():
         "fit total %": r.get("fit_total_pct"), "fit trades": r["fit_n_trades"],
         "full-period total %": r["total_pct"], "holdout win %": r["holdout_win_pct"],
         "holdout max DD %": r["holdout_max_drawdown_pct"], "holdout z-score": r["holdout_z_score"],
+        "clears corrected bar?": "yes" if abs(r["holdout_z_score"]) > z_bar else "no",
     } for r in qualifying]
     if rows:
         leaderboard_df = pd.DataFrame(rows)
@@ -1036,12 +1136,39 @@ def render_compare_all_section():
                                        "full-period total %": "{:+.2f}%"})
             .format({"holdout win %": "{:.1f}%", "holdout max DD %": "-{:.2f}%",
                      "holdout z-score": "{:.2f}"}, na_rep="-"),
-            use_container_width=True, hide_index=True)
+            width="stretch", hide_index=True)
         st.caption("\"fit total %\" and \"full-period total %\" are shown for context only - a strategy "
                    "whose fit and holdout numbers point in opposite directions is a red flag even if the "
                    "holdout number alone looks fine, since it suggests the edge isn't stable over time.")
+        st.caption(f"**\"clears corrected bar?\"** compares |z| against **{z_bar:.2f}**, not the familiar "
+                   f"1.96. Running {len(results)} strategies against the same data is "
+                   f"{len(results)} separate tests, and at 1.96 you'd expect roughly "
+                   f"{0.05 * len(results):.1f} of them to look \"significant\" by chance alone even if "
+                   f"every single strategy were worthless. A **\"no\" means inconclusive, not proven "
+                   f"worthless** - and a \"yes\" on a NEGATIVE return means the losing is real, which is "
+                   f"genuinely useful information. Caveat in the other direction: this bar assumes the "
+                   f"strategies are independent tests and they are not (most of this catalog trades the "
+                   f"same few FX pairs over the same window), so it is deliberately conservative.")
     else:
         st.caption("No strategy qualifies for holdout-ranking on this range yet.")
+
+    # COMPARABILITY. Both flags below were previously computed and discarded, which let two
+    # strategies sit in the ranked table above on a different basis from everyone else with no
+    # visible indication. Anything listed here is NOT directly comparable to the other rows.
+    uncosted = [r for r in has_trades if r.get("holdout_n_unadjusted")]
+    positional = [r for r in has_trades if r.get("split_is_date_based") is False]
+    if uncosted or positional:
+        st.markdown(eyebrow("⚠ COMPARABILITY WARNINGS"), unsafe_allow_html=True)
+        for r in uncosted:
+            st.caption(f"**{r['strategy']}**: {r['holdout_n_unadjusted']} of {r['holdout_n_trades']} holdout "
+                       f"trades carry no stop distance, so trading costs could NOT be deducted from them. "
+                       f"Its number above is (partly or wholly) GROSS of costs while every other row is net "
+                       f"- it is flattered relative to the rest of this table, not directly comparable.")
+        for r in positional:
+            st.caption(f"**{r['strategy']}**: its trades carry no dates, so the holdout could not be split "
+                       f"by TIME - it was split positionally over a per-instrument-concatenated list, which "
+                       f"makes its \"holdout\" closer to *a subset of instruments over the whole period* "
+                       f"than to a genuine out-of-sample window. Not comparable to the time-split rows.")
 
     if thin_sample:
         st.markdown(eyebrow(f"TOO FEW HOLDOUT TRADES TO RANK (<{stats_mod.MIN_TRADES_FOR_RANKING})"),
@@ -1059,7 +1186,7 @@ def render_compare_all_section():
             style_signed_columns(thin_df, ["holdout total %", "full-period total %"],
                                   fmt={"holdout total %": "{:+.2f}%", "full-period total %": "{:+.2f}%"})
             .format({"full-period win %": "{:.1f}%"}, na_rep="-"),
-            use_container_width=True, hide_index=True)
+            width="stretch", hide_index=True)
 
     if empty_or_failed:
         with st.expander(f"{len(empty_or_failed)} strategies produced no trades or failed on this range"):
@@ -1109,7 +1236,7 @@ def _render_strategy_catalog():
                                 unsafe_allow_html=True)
                     st.caption(f"{len(strategy.instruments)} instruments - "
                                f"{len(strategy.params)} parameters searched automatically when optimizing")
-                    if st.button("Run this strategy", key=f"catalog_run_{strategy.id}", use_container_width=True):
+                    if st.button("Run this strategy", key=f"catalog_run_{strategy.id}", width="stretch"):
                         # Plain session_state we fully own (not a widget's own key), so it's safe to
                         # set and immediately rerun on - this is what actually transitions the SAME
                         # "Backtest" page from the catalog into the run-config view below, no separate
@@ -1132,10 +1259,16 @@ def gallery_page():
         st.info("No runs yet - go run a backtest first.")
         return
 
+    # Reports whether persistence is actually WORKING, not merely whether a token is present -
+    # those are different claims, and the gap between them is where a fully-broken sync hid.
+    storage_ok, storage_detail = github_storage.health()
     if not github_storage.is_configured():
         st.caption("⚠ GitHub-backed history isn't configured yet - runs are saved locally only and "
                    "will be lost if this app restarts (Streamlit Cloud wipes local disk on redeploys "
                    "and sleep/wake cycles). See webapp/github_storage.py's header for one-time setup.")
+    elif not storage_ok:
+        st.warning(f"⚠ GitHub storage is configured but a write FAILED this session, so some data is "
+                   f"saved locally only and will not survive a restart: {storage_detail}")
 
     strategies_present = sorted({r["strategy"] for r in runs})
     filter_cols = st.columns([2, 1.6, 1.4])
@@ -1183,7 +1316,7 @@ def gallery_page():
                                                           key=f"gallery_name_input_{run_id}",
                                                           label_visibility="collapsed", help=current_name)
                     if name_cols[1].button("💾", key=f"gallery_name_save_{run_id}", help="Save name",
-                                             use_container_width=True):
+                                             width="stretch"):
                         if new_name.strip() and new_name.strip() != current_name:
                             run_history.rename_run(run_id, new_name.strip())
                             st.rerun()
@@ -1212,7 +1345,7 @@ def gallery_page():
                     else:
                         st.caption("Trade-level detail not found for this run.")
 
-                    if st.button("View full results", key=f"gallery_view_{run_id}", use_container_width=True):
+                    if st.button("View full results", key=f"gallery_view_{run_id}", width="stretch"):
                         st.session_state.pending_history_run_id = run_id
                         st.session_state.pending_page_nav = "History"
                         st.rerun()
@@ -1223,7 +1356,7 @@ def _render_run_config(strategy):
 
     back_l, back_r = st.columns([1, 4])
     with back_l:
-        if st.button("← Back to catalog", key="backtest_back_to_catalog", use_container_width=True):
+        if st.button("← Back to catalog", key="backtest_back_to_catalog", width="stretch"):
             st.session_state.selected_strategy_id = None
             st.rerun()
     with back_r:
@@ -1283,7 +1416,7 @@ def _render_run_config(strategy):
         # Optimization & Robustness tab (after a run) is for, not hand-guessed sidebar sliders.
         param_values = {}
 
-        run_clicked = st.button("Run Backtest", type="primary", use_container_width=True,
+        run_clicked = st.button("Run Backtest", type="primary", width="stretch",
                                  help="Fetches real historical data live from Dukascopy - nothing here is "
                                       "mocked or precomputed.")
 
@@ -1413,7 +1546,7 @@ def history_page():
             "run_id": r["run_id"],
         })
     df = pd.DataFrame(table_rows)
-    st.dataframe(df.drop(columns=["run_id"]), use_container_width=True, hide_index=True)
+    st.dataframe(df.drop(columns=["run_id"]), width="stretch", hide_index=True)
 
     st.markdown("### Re-view a past run")
     # jump here from a "View full results" click on the Gallery page - pre-selects that run

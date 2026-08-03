@@ -1,5 +1,43 @@
 # wind-turbone-new
 
+**The main thing in this repo is `webapp/` — a Streamlit strategy-backtesting
+app.** It runs 16 trading strategies (plus a random-entry control) against real
+historical Dukascopy data, deducts realistic prop-firm trading costs, ranks
+them on an out-of-sample holdout, and shows how much of each result is the
+strategy versus the cost assumption.
+
+```bash
+pip install -r webapp/requirements.txt
+streamlit run webapp/app.py
+```
+
+See **[`webapp/README.md`](webapp/README.md)** for how it works, what the
+numbers mean, and the one-time setup that makes run history survive restarts.
+
+Read this first if you are looking at the output: most strategies in the
+catalog lose money once realistic costs are applied. That is the expected
+result for simple technical rules, not a bug — and the app now ships a
+random-entry control specifically so you can tell "this strategy has no edge"
+apart from "the cost model is too harsh", which produce identical-looking
+tables and are not otherwise distinguishable.
+
+### Layout
+
+| path | what it is | status |
+|---|---|---|
+| `webapp/` | the Streamlit backtesting app | **active — this is the product** |
+| `research/` | the strategy backtests + optimization pipelines the app runs | **active** |
+| `telegram-relay/`, `pine/` | the earlier Telegram/TradingView alert bot (documented below) | legacy |
+| `backtester/`, `quantconnect/`, `copier/` | earlier experiments — a JS backtester, QuantConnect ports, and an MT5 trade copier | legacy, not wired to anything |
+
+Everything below this line documents the **legacy alert bot**, which was this
+repo's original purpose and is kept for reference. It is independent of the
+backtesting app and neither one imports the other.
+
+---
+
+## Legacy: Telegram forex alert bot
+
 Forex trade-setup alerts — fully free, no TradingView paid plan required.
 A Cloudflare Worker polls real forex price data on a schedule, recomputes
 your setup itself, and messages you on Telegram when it fires. You still

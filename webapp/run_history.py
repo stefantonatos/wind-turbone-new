@@ -58,7 +58,10 @@ def _push_to_github(path, local_path, message):
             github_storage.write_file(path, f.read(), message)
     except Exception as exc:
         # the run itself already succeeded and is saved locally for this session - a GitHub
-        # sync failure (bad token, rate limit, network) must never take that away
+        # sync failure (bad token, rate limit, network) must never take that away. It must,
+        # however, be VISIBLE: printing to stdout only is how a completely broken sync spent
+        # weeks looking identical to a working one from inside the app.
+        github_storage.note_write_failure(f"history push failed: {exc}")
         print(f"GitHub history push failed (run is still saved locally): {exc}")
 
 

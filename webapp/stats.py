@@ -31,6 +31,39 @@ MIN_TRADES_FOR_RANKING = 100
 HOLDOUT_FRACTION = 0.25
 
 
+def multiple_comparison_z_threshold(n_tests, family_wise_alpha=0.05):
+    """The two-sided |z| bar ONE strategy must clear for a family of `n_tests` comparisons to hold
+    an overall false-positive rate of `family_wise_alpha`.
+
+    DELIBERATELY THE SAME FORMULA as research/optimization_engine.py's
+    bonferroni_adjusted_z_threshold - Šidák (per_test_alpha = 1 - (1 - alpha) ** (1 / n_tests)),
+    not the union-bound Bonferroni alpha/n. Restated here rather than imported so the webapp layer
+    doesn't take a package dependency on research/ for one scalar, but the values agree exactly
+    (pinned by a test) - the project must not end up with two different numeric definitions of
+    "the corrected bar", which is precisely the sort of quiet divergence that makes two parts of
+    the same tool disagree about whether a result is significant.
+
+    WHY THE WEBAPP NEEDS THIS AT ALL: Compare All runs every strategy in the catalog against the
+    same data and prints a z-score per row. Reading each of those against the textbook |z| > 1.96
+    rule is exactly the multiple-comparisons error that manufactures false winners. With 16
+    strategies the honest bar is |z| > 2.95, and the difference is not cosmetic: on a real run of
+    this app, two strategies (z = -2.90 and z = -2.22) read as "significant" against 1.96 and are
+    NOT significant once corrected.
+
+    HONEST LIMITATION, stated rather than buried: this correction assumes the tests are
+    independent. They are not - 14 of the 16 strategies in this catalog trade the SAME four FX
+    series over the SAME window, so their outcomes are heavily correlated and the true effective
+    number of independent tests is smaller than n_tests. That makes this bar CONSERVATIVE (it asks
+    for more evidence than a correlation-aware correction would). Erring conservative is the right
+    direction for a tool someone might trade real money on, but it is an approximation, not the
+    exact bar - which is why the UI says "does not clear the corrected bar" rather than "proven to
+    be noise"."""
+    if n_tests < 1:
+        raise ValueError(f"multiple_comparison_z_threshold: n_tests must be >= 1, got {n_tests!r}")
+    per_test_alpha = 1.0 - (1.0 - family_wise_alpha) ** (1.0 / n_tests)
+    return statistics.NormalDist().inv_cdf(1.0 - per_test_alpha / 2.0)
+
+
 def split_trades_for_holdout(trades, holdout_fraction=HOLDOUT_FRACTION):
     """Splits trades into (fit_trades, holdout_trades, split_is_date_based) - the LAST
     `holdout_fraction` of the period is held out. Splits by calendar DATE when every trade has
@@ -133,6 +166,92 @@ def apply_cost_adjustment(trades):
             n_unadjusted += 1
         out.append(t)
     return out, n_unadjusted
+
+
+COST_MULTIPLIER_SCENARIOS = [0.0, 0.5, 1.0, 1.5, 2.0]
+
+
+def cost_sensitivity(trades, risk_pct, multipliers=COST_MULTIPLIER_SCENARIOS):
+    """How much of this strategy's result is the STRATEGY, and how much is the COST MODEL?
+
+    Re-scores the same trades with each instrument's cost multiplied by each factor in
+    `multipliers` (0.0 = costs switched off entirely, 1.0 = exactly the model in
+    TYPICAL_COST_PCT_BY_INSTRUMENT, 2.0 = the model being twice as expensive as assumed). Returns
+    a list of {multiplier, total_pct, avg_r} dicts.
+
+    WHY THIS IS NOT OPTIONAL POLISH: the cost figures this app deducts are a researched average
+    across three prop firms, with real gaps (per-instrument commissions for two of the three firms
+    were never confirmed), applied uniformly to every trade. They have never been checked against
+    an actual filled broker statement. Meanwhile the per-trade cost in R terms is
+    (cost_pct / 100) / stop_pct - so for a strategy with tight stops it is LARGE, and can easily
+    exceed the entire measured edge. On a real run of this catalog, several strategies' implied
+    loss per trade (-0.02R to -0.18R) sat in the same range as their own cost per trade
+    (0.011R to 0.22R depending on stop width). In that regime "this strategy loses money" and "my
+    cost estimate is too harsh" produce an identical headline number, and showing only the 1.0x
+    column silently picks one of those interpretations for the reader.
+
+    A multiplier is used rather than absolute cost_pct scenarios (the convention the research
+    scripts print) specifically so per-instrument differences are preserved - scaling all of them
+    together answers the question actually being asked, "how wrong would my cost model have to be
+    for this verdict to change?", which a single flat cost applied to gold and EURUSD alike does
+    not."""
+    base_r, cost_r = _split_r_and_cost(trades)
+    return [_score_at_multiplier(base_r, cost_r, m, risk_pct) for m in multipliers]
+
+
+def _split_r_and_cost(trades):
+    """Precomputes, per trade, its raw R and its cost-in-R. The cost term
+    (cost_pct / 100) / stop_pct does not depend on the multiplier, so pulling it out once turns
+    every subsequent what-if into plain arithmetic over two flat lists - no dict copying, no
+    per-instrument lookups. That matters: the strategies most in need of this analysis are the
+    high-frequency ones, and re-copying 41,000 trade dicts on every bisection step made the tab
+    take long enough to look hung."""
+    base_r, cost_r = [], []
+    for t in trades:
+        r = t.get("r")
+        stop_pct = t.get("stop_pct")
+        base_r.append(r if r is not None else 0.0)
+        cost_r.append((cost_pct_for_instrument(t.get("instrument")) / 100.0) / stop_pct
+                      if (r is not None and stop_pct) else 0.0)
+    return base_r, cost_r
+
+
+def _score_at_multiplier(base_r, cost_r, m, risk_pct):
+    growth = 1.0
+    total = 0.0
+    for r, c in zip(base_r, cost_r):
+        adj = r - m * c
+        total += adj
+        growth *= max(1.0 + (adj * risk_pct) / 100.0, 0.0)
+    n = len(base_r)
+    return {"multiplier": m, "total_pct": (growth - 1.0) * 100.0,
+            "avg_r": (total / n) if n else 0.0}
+
+
+def breakeven_cost_multiplier(trades, risk_pct, lo=0.0, hi=8.0, tol=1e-4):
+    """The cost multiplier at which this strategy's compounded return crosses zero - i.e. "my cost
+    model would have to be off by THIS factor for the verdict to flip". Returns None when the
+    strategy is negative even with costs switched off entirely (nothing to flip - the rules
+    themselves lose money, not the cost assumption), or when it stays positive even at `hi`.
+
+    Bisection rather than a closed form because compounded_return_pct is a product over trades,
+    not a linear function of the multiplier. Monotone in the multiplier (every trade's r is
+    non-increasing in it), so bisection is well-behaved."""
+    base_r, cost_r = _split_r_and_cost(trades)
+
+    def total_at(m):
+        return _score_at_multiplier(base_r, cost_r, m, risk_pct)["total_pct"]
+    if total_at(lo) <= 0:
+        return None      # loses even for free - not a cost-model artifact
+    if total_at(hi) > 0:
+        return None      # survives even at hi x assumed cost
+    while hi - lo > tol:
+        mid = (lo + hi) / 2.0
+        if total_at(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
 
 
 def scale_trades_r(trades, factor):

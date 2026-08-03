@@ -24,6 +24,7 @@
 # dedicated history branch/paths below.
 
 import base64
+import gzip
 import os
 
 import requests
@@ -81,6 +82,35 @@ def _ensure_branch_exists():
         create.raise_for_status()
 
 
+# GitHub's Contents API (the create/update-a-file endpoint used below) is documented for files up
+# to 1 MB; above that the docs direct you to the Git Data blobs API instead. Exceeding it does NOT
+# fail loudly in an obvious way - it comes back as a bare "422 Unprocessable Entity", which is easy
+# to mistake for an auth or branch problem.
+#
+# THIS WAS A REAL, SILENT PRODUCTION FAILURE: with the price cache pushing one ~1.25 MB pickle per
+# fetched chunk, EVERY push 422'd, forever. The app's own guard was set at 8 MB - eight times the
+# real ceiling - so nothing ever tripped it, the failures only ever reached stdout, and the Gallery
+# banner (which checks that a token EXISTS, not that writes SUCCEED) stayed silent. The user had
+# done the token setup correctly and been told it was working while nothing was being cached at
+# all, which is exactly why every restart still re-downloaded everything from scratch.
+#
+# Payload here is base64, which inflates raw bytes by 4/3, so the raw ceiling is ~750 KB. Held a
+# little under that for the JSON envelope around it.
+MAX_CONTENT_BYTES = 700 * 1024
+
+# Content is gzipped before upload. This is close to free for the case that matters most - run
+# history and trade JSON are extremely repetitive and compress by ~290x, taking a 41k-trade run
+# from ~4.6 MB (hopeless) to ~16 KB (trivial). It does NOT rescue pickled float64 OHLC frames,
+# which are near-incompressible (~1.2x); see data_cache.py for how that case is handled instead.
+_GZIP_MAGIC = b"\x1f\x8b"
+
+
+class ContentTooLargeError(ValueError):
+    """Raised when content cannot fit through the Contents API even after compression. A distinct
+    type so callers can tell 'this will never work, stop retrying it' apart from a transient
+    network/auth failure that is worth trying again."""
+
+
 def _read_content_b64(path):
     """Returns the file's raw base64 content string from the Contents API, or None if it
     doesn't exist on the history branch yet. Raises on any other failure (auth, network, etc.)
@@ -95,10 +125,20 @@ def _read_content_b64(path):
     return r.json()["content"]
 
 
+def _maybe_gunzip(raw):
+    """Transparently decompresses content written by the current code, while still reading
+    anything written BEFORE compression was introduced - the small history files that were
+    already uploading successfully must keep loading after this change, so the magic-byte sniff
+    is a compatibility requirement, not defensive padding."""
+    if raw[:2] == _GZIP_MAGIC:
+        return gzip.decompress(raw)
+    return raw
+
+
 def read_file(path):
     """Returns the file's text content, or None if it doesn't exist on the history branch yet."""
     b64 = _read_content_b64(path)
-    return None if b64 is None else base64.b64decode(b64).decode("utf-8")
+    return None if b64 is None else _maybe_gunzip(base64.b64decode(b64)).decode("utf-8")
 
 
 def read_file_bytes(path):
@@ -106,7 +146,24 @@ def read_file_bytes(path):
     pickled price-data cache blob - see data_cache.py). Returns raw bytes, or None if the file
     doesn't exist on the history branch yet."""
     b64 = _read_content_b64(path)
-    return None if b64 is None else base64.b64decode(b64)
+    return None if b64 is None else _maybe_gunzip(base64.b64decode(b64))
+
+
+def _write_raw(path, content_bytes, message):
+    """Compresses, size-checks, then creates/updates `path` on the dedicated history branch.
+
+    The size check happens AFTER compression and BEFORE any network call, so content that cannot
+    possibly fit fails immediately with a clear, actionable error instead of costing a doomed
+    round-trip per attempt - which, at one attempt per fetched chunk, was adding real latency to
+    every single backtest run."""
+    payload_bytes = gzip.compress(content_bytes, 6)
+    if len(payload_bytes) > MAX_CONTENT_BYTES:
+        raise ContentTooLargeError(
+            f"{path}: {len(payload_bytes) / 1024:.0f} KB after compression exceeds the "
+            f"{MAX_CONTENT_BYTES / 1024:.0f} KB the GitHub Contents API can accept "
+            f"(raw {len(content_bytes) / 1024:.0f} KB). Not retryable - this content needs the "
+            f"Git Data blobs API or a smaller payload, not another attempt.")
+    _write_content_b64(path, base64.b64encode(payload_bytes).decode("ascii"), message)
 
 
 def _write_content_b64(path, b64_content, message):
@@ -131,10 +188,36 @@ def _write_content_b64(path, b64_content, message):
 
 def write_file(path, content, message):
     """Creates or updates `path` on the dedicated history branch with `content` (text)."""
-    _write_content_b64(path, base64.b64encode(content.encode("utf-8")).decode("ascii"), message)
+    _write_raw(path, content.encode("utf-8"), message)
 
 
 def write_file_bytes(path, content_bytes, message):
     """Binary-safe variant of write_file, for content that isn't UTF-8 text (e.g. a pickled
     price-data cache blob - see data_cache.py)."""
-    _write_content_b64(path, base64.b64encode(content_bytes).decode("ascii"), message)
+    _write_raw(path, content_bytes, message)
+
+
+# Last write failure seen this session, surfaced in the UI so a silently-broken sync stops looking
+# identical to a working one. is_configured() only ever answered "is a token present", which is a
+# strictly weaker claim than "persistence is working" - and the gap between those two is exactly
+# where the production failure lived.
+_last_write_error = None
+
+
+def note_write_failure(exc):
+    global _last_write_error
+    _last_write_error = str(exc)
+
+
+def last_write_error():
+    return _last_write_error
+
+
+def health():
+    """(ok, detail) for display. ok=False means saved data is NOT actually reaching GitHub, whether
+    or not a token is configured."""
+    if not is_configured():
+        return False, "not configured"
+    if _last_write_error:
+        return False, _last_write_error
+    return True, "ok"
