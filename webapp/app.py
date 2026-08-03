@@ -25,6 +25,7 @@ import optimization
 import run_history
 import stats as stats_mod
 import style
+from data_cache import cached_dukascopy_fetch
 from registry import STRATEGIES, STRATEGIES_BY_ID, _instrument_labels
 from style import ACCENT, CRITICAL, GOOD, WARNING, INK_MUTED, CSS, PLOTLY_LAYOUT_DEFAULTS, eyebrow
 
@@ -1522,6 +1523,181 @@ def compare_all_page():
     render_compare_all_section()
 
 
+def momentum_page():
+    """research/trend_following_momentum_dukascopy_backtest.py, which until now had no way to be
+    run from this app at all.
+
+    WHY IT NEEDED ITS OWN PAGE: every other strategy here emits a list of {side, outcome, r, date}
+    trades, and the whole Results UI (R-multiples, win rate, equity curve, holdout split) is built
+    on that shape. This one's unit of output is a monthly PORTFOLIO return series across 27
+    instruments - there is no per-trade R to speak of. It was excluded from the registry for that
+    reason and, as a result, was the one strategy in the repo that had never been evaluated.
+
+    That exclusion is worth undoing specifically because this is the only strategy here whose
+    premise survives the cost analysis. Every other one is an intraday pattern on liquid FX paying
+    the spread hundreds or thousands of times; across a real Compare-All run, the correlation
+    between how often a strategy traded and how badly it did was -0.88. This trades monthly."""
+    st.markdown(eyebrow("TIME-SERIES MOMENTUM (PORTFOLIO)"), unsafe_allow_html=True)
+    st.caption("Monthly-rebalanced trend-following across 27 instruments in 6 asset classes (FX, "
+               "equity indices, bonds, metals, energy, ags), on DAILY bars. Signal is the sign of "
+               "the trailing 12-month return; position size scales inversely with trailing 3-month "
+               "volatility. No parameter search - the textbook 12-month/1-month combination is used "
+               "unchanged across every instrument, deliberately, because tuning a lookback per "
+               "market is exactly the overfitting the rest of this app exists to catch.")
+    st.caption("**Why this one is different from everything else in the catalog:** it's the only "
+               "strategy here with a multi-decade published track record outside this project "
+               "(Moskowitz, Ooi & Pedersen 2012; the CTA industry) rather than a chart pattern from "
+               "a video. It also trades ~12 times a year per instrument instead of thousands, so "
+               "trading costs are a rounding error rather than the dominant term.")
+
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 1])
+        lookback = c1.number_input("Signal lookback (months)", min_value=1, max_value=24, value=12, step=1,
+                                    help="12 is the published default. Changing it is a parameter search - "
+                                         "if you do, judge it on the out-of-sample half, not the whole run.")
+        target_vol = c2.number_input("Target annual volatility (%)", min_value=2.0, max_value=40.0,
+                                      value=10.0, step=1.0,
+                                      help="Scales position sizes. Does not change the signal or the "
+                                           "Sharpe - only how big the swings are.")
+        run = st.button("Run Momentum Backtest", type="primary", width="stretch",
+                        help="27 instruments of DAILY bars - far less data than a 5-min strategy, so this "
+                             "is usually quicker than a Compare All run.")
+
+    if run:
+        mom = importlib.import_module("research.trend_following_momentum_dukascopy_backtest")
+        progress = st.empty()
+        bar = progress.progress(0.0, text="Starting...")
+        frames = {}
+        asset_class_of = {}
+        failures = []
+        try:
+            with cached_dukascopy_fetch():
+                # INSTRUMENTS entries are (label, dukascopy_const, asset_class) 3-tuples - the asset
+                # class is kept because cross-asset diversification is the entire premise here, so
+                # "did it work everywhere or only in one bucket" is the first question to ask of it.
+                for i, (label, const, asset_class) in enumerate(mom.INSTRUMENTS):
+                    bar.progress(i / len(mom.INSTRUMENTS), text=f"{label} ({i + 1}/{len(mom.INSTRUMENTS)})")
+                    try:
+                        closes = mom.fetch_daily_closes(const)
+                        if closes is None or len(closes) == 0:
+                            failures.append(f"{label}: no data")
+                            continue
+                        frames[label] = mom.build_instrument_frame(closes, lookback,
+                                                                     target_vol=target_vol / 100.0)
+                        asset_class_of[label] = asset_class
+                    except Exception as exc:
+                        failures.append(f"{label}: {exc}")
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Momentum run failed: {exc}")
+            return
+        progress.empty()
+        if not frames:
+            st.error("No instruments returned usable data - nothing to compute.")
+            return
+        monthly, per_instrument = mom.portfolio_return_series(frames)
+        st.session_state["momentum_result"] = {
+            "monthly": monthly, "per_instrument": per_instrument,
+            "stats": mom.portfolio_stats(monthly), "failures": failures,
+            "n_instruments": len(frames), "lookback": lookback, "target_vol": target_vol,
+            "asset_class_of": asset_class_of,
+        }
+
+    res = st.session_state.get("momentum_result")
+    if not res:
+        st.info("Not run yet this session - click the button above.")
+        return
+    stats = res["stats"]
+    if stats is None:
+        st.warning("Fewer than 12 months of portfolio returns - not enough to report anything.")
+        return
+
+    cols = st.columns(6)
+    cols[0].metric("Ann. return", f"{stats['ann_return_pct']:+.2f}%")
+    cols[1].metric("Ann. volatility", f"{stats['ann_vol_pct']:.2f}%")
+    cols[2].metric("Sharpe", f"{stats['sharpe']:.2f}",
+                    help="Return per unit of volatility. Unlike the R-multiple stats elsewhere in this "
+                         "app, this is the standard measure for a portfolio strategy. Published "
+                         "long-run trend-following Sharpes sit roughly in the 0.3-0.8 range - anything "
+                         "far above that on 20 years of data deserves suspicion, not celebration.")
+    cols[3].metric("Max drawdown", f"{stats['max_dd_pct']:.2f}%")
+    cols[4].metric("Positive months", f"{stats['pct_positive_months']:.0f}%")
+    cols[5].metric("Months", stats["n_months"])
+
+    monthly = res["monthly"].dropna()
+    nav = (1 + monthly).cumprod()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=list(nav.index), y=[float(v) for v in nav.values], mode="lines",
+                              line=dict(color=GOOD, width=2), name="NAV"))
+    fig.add_hline(y=1.0, line=dict(color=INK_MUTED, width=1, dash="dot"))
+    layout = dict(PLOTLY_LAYOUT_DEFAULTS)
+    layout["margin"] = dict(l=10, r=10, t=10, b=10)
+    fig.update_layout(height=320, showlegend=False, **layout)
+    fig.update_yaxes(title_text="Growth of 1.0")
+    st.markdown(eyebrow("PORTFOLIO NAV"), unsafe_allow_html=True)
+    st.plotly_chart(fig, width="stretch")
+
+    # SPLIT-HALF CHECK. There is no parameter search here to overfit, but a 20-year backtest of
+    # anything still deserves the question "did it only work in the first half". Same honesty check
+    # the research scripts apply to their own trade lists, in the unit this strategy reports in.
+    half = len(monthly) // 2
+    st.markdown(eyebrow("SPLIT-HALF CHECK"), unsafe_allow_html=True)
+    mom = importlib.import_module("research.trend_following_momentum_dukascopy_backtest")
+    rows = []
+    for label, series in (("First half", monthly.iloc[:half]), ("Second half", monthly.iloc[half:])):
+        s = mom.portfolio_stats(series)
+        if s:
+            rows.append({"period": f"{label} ({series.index[0]:%Y-%m} to {series.index[-1]:%Y-%m})",
+                          "months": s["n_months"], "ann return %": s["ann_return_pct"],
+                          "sharpe": s["sharpe"], "max DD %": s["max_dd_pct"]})
+    if rows:
+        st.dataframe(style_signed_columns(pd.DataFrame(rows), ["ann return %", "sharpe"],
+                                           fmt={"ann return %": "{:+.2f}%", "sharpe": "{:+.2f}"})
+                     .format({"max DD %": "{:.2f}%"}, na_rep="-"), width="stretch", hide_index=True)
+        st.caption("A strategy that works in the first half and not the second is the single most "
+                   "common way a long backtest lies. Both halves pointing the same way is the "
+                   "minimum bar, not proof.")
+
+    # BY ASSET CLASS. The published case for time-series momentum rests on it showing up in many
+    # unrelated markets at once, not on one big winner - so a headline Sharpe that turns out to be
+    # entirely bonds, or entirely 2008 in energy, is a different (and much weaker) claim than the
+    # same number spread across six buckets. Equal-weight within each bucket, matching how the
+    # portfolio itself is built.
+    asset_class_of = res.get("asset_class_of") or {}
+    per_instrument = res["per_instrument"]
+    if asset_class_of:
+        bucket_rows = []
+        for asset_class in sorted(set(asset_class_of.values())):
+            members = [c for c in per_instrument.columns if asset_class_of.get(c) == asset_class]
+            if not members:
+                continue
+            s = mom.portfolio_stats(per_instrument[members].mean(axis=1, skipna=True))
+            if s:
+                bucket_rows.append({"asset class": asset_class.replace("_", " ").title(),
+                                     "instruments": len(members), "months": s["n_months"],
+                                     "ann return %": s["ann_return_pct"], "sharpe": s["sharpe"],
+                                     "max DD %": s["max_dd_pct"]})
+        if bucket_rows:
+            st.markdown(eyebrow("BY ASSET CLASS"), unsafe_allow_html=True)
+            st.dataframe(style_signed_columns(pd.DataFrame(bucket_rows), ["ann return %", "sharpe"],
+                                               fmt={"ann return %": "{:+.2f}%", "sharpe": "{:+.2f}"})
+                         .format({"max DD %": "{:.2f}%"}, na_rep="-"), width="stretch", hide_index=True)
+            st.caption("Each row is an equal-weight sub-portfolio of just that bucket. The premise of "
+                       "this strategy is that the effect shows up in unrelated markets - most buckets "
+                       "positive is the supporting evidence; one bucket carrying everything is not.")
+
+    st.caption(f"{res['n_instruments']} instruments contributed, {res['lookback']}-month lookback, "
+               f"{res['target_vol']:.0f}% target volatility."
+               + (f" {len(res['failures'])} instrument(s) failed to load." if res["failures"] else ""))
+    if res["failures"]:
+        with st.expander("Instruments that failed to load"):
+            for f in res["failures"]:
+                st.caption(f)
+    st.caption("⚠ Trading costs are NOT deducted here. At roughly 12 rebalances a year per "
+               "instrument they are far smaller than for the intraday strategies elsewhere in this "
+               "app, but they are not zero - treat these figures as a ceiling.")
+
+
 def history_page():
     st.markdown(eyebrow("RUN HISTORY"), unsafe_allow_html=True)
     st.caption("Every completed backtest run from this tool, newest first.")
@@ -1595,7 +1771,7 @@ header_l, header_r = st.columns([2, 1])
 with header_l:
     st.markdown('<div class="brand">&#9889; STRATEGY BACKTESTS</div>', unsafe_allow_html=True)
 with header_r:
-    page = st.segmented_control("Page", ["Backtest", "Compare All", "Gallery", "History"],
+    page = st.segmented_control("Page", ["Backtest", "Compare All", "Momentum", "Gallery", "History"],
                                  default="Backtest", label_visibility="collapsed", key="page_nav")
 st.markdown('<hr class="brand-rule"/>', unsafe_allow_html=True)
 
@@ -1603,6 +1779,8 @@ if page == "History":
     history_page()
 elif page == "Compare All":
     compare_all_page()
+elif page == "Momentum":
+    momentum_page()
 elif page == "Gallery":
     gallery_page()
 else:
