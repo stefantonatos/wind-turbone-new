@@ -185,7 +185,15 @@ def backtest_instrument(label, df):
             if open_trade["outcome"] is not None:
                 trades.append({"side": side, "outcome": open_trade["outcome"], "r": open_trade["exit_r"],
                                 "date": times[i].date(), "entry": open_trade["entry"],
-                                "sl_distance": open_trade["sl_distance"]})
+                                "sl_distance": open_trade["sl_distance"],
+                                # stop_pct is what every downstream cost model keys off (the webapp's
+                                # stats.apply_cost_adjustment, and every other script's own COST
+                                # SENSITIVITY section) - it was the ONLY strategy in this project not
+                                # recording it, so its trades silently fell through the webapp's
+                                # `if r is not None and stop_pct:` guard and were scored GROSS of costs
+                                # while every other strategy was scored net. That made it rank 2nd of 11
+                                # on a real Compare-All leaderboard purely by not paying the toll.
+                                "stop_pct": open_trade["sl_distance"] / open_trade["entry"]})
                 for z in active_zones:
                     if z is open_trade["zone"]:
                         z["in_trade"] = False

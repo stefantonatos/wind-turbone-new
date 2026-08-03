@@ -35,10 +35,17 @@
 # don't need their own separate GitHub sync: even though THAT top-level file is empty after a
 # restart, every chunk it re-fetches underneath hits this GitHub-backed cache instead of real
 # Dukascopy, so the net effect is the same fast warm-start without touching research/*.py at
-# all. _MAX_GITHUB_BLOB_BYTES caps what gets pushed - a wide-range single-shot fetch (the
-# non-chunked strategies, on a manually widened date range) can produce a genuinely large
-# blob; rather than fail or silently skip it, that one entry just stays local-only for this
-# process and gets re-fetched for real next cold start, same as before this feature existed.
+# all.
+#
+# HONEST LIMIT ON THAT LAST PARAGRAPH: GitHub's Contents API tops out around 1MB per file, and a
+# pickled float64 OHLC frame is near-incompressible (gzip buys ~1.2x, versus ~290x on the JSON that
+# run history stores). A 3-month chunk of 5-min bars is ~1.25MB raw, i.e. genuinely too big. So on
+# narrow ranges the price cache does persist across restarts, and on wide ones it does not - the
+# chunks simply exceed what this storage backend can hold. That is a real, bounded limitation of
+# using a git host as a blob store, not a bug to be tuned away, and the app now says so in the UI
+# (github_storage.health()) instead of reporting "configured" and appearing to work. If durable
+# wide-range caching becomes worth it, the fix is a real object store (S3/R2/GCS) or GitHub's Git
+# Data blobs API, NOT a larger cap here.
 
 import functools
 import hashlib
@@ -76,11 +83,13 @@ requests.get = _requests_get_with_default_timeout
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "dukascopy_raw")
 _GITHUB_CACHE_PREFIX = "webapp_price_cache"
-_MAX_GITHUB_BLOB_BYTES = 8 * 1024 * 1024   # ~8MB raw pickle - comfortably under the Contents
-                                             # API's practical single-PUT size before base64
-                                             # inflation (~33%) pushes it toward GitHub's own
-                                             # limits; a 3-month 5-min chunk for one instrument
-                                             # (the common case) is a small fraction of this.
+_MAX_GITHUB_BLOB_BYTES = 700 * 1024   # must track github_storage.MAX_CONTENT_BYTES - the previous
+                                       # 8MB value was 8x GitHub's real Contents-API ceiling, so it
+                                       # never rejected anything and every push silently 422'd
+
+# Set once per session if GitHub rejects a price-cache blob as unfittable, to stop re-attempting a
+# write that provably cannot succeed (see the push site below for why this matters for latency).
+_github_push_disabled_reason = None
 
 
 def _cache_key(instrument, interval, offer_side, start, end):
@@ -141,12 +150,29 @@ def _make_caching_fetch(original_fetch):
         except OSError:
             pass  # cache write failure shouldn't break the backtest itself
 
-        if github_storage.is_configured() and len(blob) <= _MAX_GITHUB_BLOB_BYTES:
+        # Push to GitHub only while it's still plausibly working. A pickled float64 OHLC frame is
+        # near-incompressible, so a wide chunk genuinely cannot fit through the Contents API - and
+        # when that's the case it will be the case for EVERY chunk in the run. Previously each one
+        # still paid a GET + a doomed PUT (2 round-trips x ~144 chunks for a 4-instrument strategy)
+        # and printed an identical error, which is both pure latency and pure noise. One
+        # ContentTooLargeError now disables price-cache pushes for the rest of the session with a
+        # single clear message; genuinely transient failures (network, auth) are NOT latched, since
+        # those are worth retrying.
+        global _github_push_disabled_reason
+        if (github_storage.is_configured() and _github_push_disabled_reason is None
+                and len(blob) <= _MAX_GITHUB_BLOB_BYTES):
             try:
                 github_storage.write_file_bytes(github_path, blob,
                                                   f"Cache {instrument} {interval} "
                                                   f"{start.date()}-{end.date()}")
+            except github_storage.ContentTooLargeError as exc:
+                _github_push_disabled_reason = str(exc)
+                github_storage.note_write_failure(
+                    f"price cache too large for GitHub storage - price data will NOT persist across "
+                    f"restarts (run history still will). {exc}")
+                print(f"Price-cache GitHub push disabled for this session: {exc}")
             except Exception as exc:
+                github_storage.note_write_failure(f"price cache push failed: {exc}")
                 print(f"Price-cache GitHub push failed (still cached locally this session): {exc}")
 
         return df

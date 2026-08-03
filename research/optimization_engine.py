@@ -1237,3 +1237,222 @@ def lockbox_confirm(strategy_id, final_params, backtest_fn, lockbox_start, lockb
 
     return {"passed": passed, "total_r": total_r_value, "avg_r": avg_r_value, "n_trades": n_trades,
             "consistency": consistency}
+
+
+# =============================================================================================
+# WALK-FORWARD FOLDS, MONTE CARLO, AND N-DIMENSIONAL CLUSTER/PLATEAU CHECK
+#
+# WHY THIS SECTION EXISTS: day_trading_rauf_dukascopy_optimization.py and
+# ict_po3_forex_dukascopy_optimization.py each independently define walk_forward_folds() and the
+# Monte Carlo bootstrap/shuffle pair - genuinely strategy-agnostic (they operate on plain dates and
+# raw R-multiple arrays, nothing PO3- or Rauf-specific) but duplicated rather than centralized when
+# this module was first split out. As more companion scripts get built (this project's catalog has
+# grown well past those first two), copy-pasting that same ~90 lines into every new one is exactly
+# the kind of duplication this module exists to avoid - see the module header's own "WHY THIS
+# EXISTS" section. Centralized here VERBATIM (unchanged behavior) rather than retrofitted into the
+# two existing scripts, which keep their own working copies untouched - this section is additive
+# only, new companion scripts import from here instead of re-defining their own.
+#
+# Cluster analysis and the neighbor-plateau check, in contrast, were NOT simply copied: both
+# companion scripts' versions hardcode exactly 2 named parameters (stop_buffer_pct,
+# confirmation_candles) into the feature vector and the up/down/left/right neighbor search. That
+# doesn't generalize to a 1-parameter strategy (a single axis has no "up/down" to check, only
+# left/right) or a 3+-parameter one (more than 4 possible single-step neighbors). The versions below
+# work directly off grid_search()/bayesian_search()/genetic_search()'s own generic result shape
+# (each entry's `params` is already a plain {name: value} dict of ANY size - see grid_search()'s
+# docstring above) instead of two hardcoded named fields, so the exact same functions cover a
+# 1-parameter grid (this generalization's first real use case), the existing 2-parameter grids, and
+# any future wider one, without a per-arity rewrite each time.
+# =============================================================================================
+
+def walk_forward_folds(fetch_start, fetch_end, is_years, oos_years, step_years):
+    """Rolling (not anchored) walk-forward windows: is_years in-sample, immediately followed by
+    oos_years out-of-sample, stepping forward step_years at a time, until the out-of-sample window
+    would run past fetch_end. Yields (is_start, is_end, oos_start, oos_end) as datetime.date."""
+    fetch_start_d = fetch_start.date() if hasattr(fetch_start, "date") else fetch_start
+    fetch_end_d = fetch_end.date() if hasattr(fetch_end, "date") else fetch_end
+
+    fold_start = fetch_start_d
+    while True:
+        is_start = fold_start
+        is_end = datetime.date(is_start.year + is_years, is_start.month, is_start.day)
+        oos_start = is_end
+        oos_end = datetime.date(oos_start.year + oos_years, oos_start.month, oos_start.day)
+        if oos_end > fetch_end_d:
+            break
+        yield (is_start, is_end, oos_start, oos_end)
+        fold_start = datetime.date(fold_start.year + step_years, fold_start.month, fold_start.day)
+
+
+def _cumsum_drawdown(samples):
+    """samples: (n_iter, n_trades) array of R-multiples per simulated path. Returns
+    (total_r per path, max_drawdown per path) where max_drawdown = largest peak-to-trough drop
+    in the cumulative R sum along that path (0 if the path never dips below its running peak)."""
+    cumsum = np.cumsum(samples, axis=1)
+    total_r_per_path = cumsum[:, -1]
+    running_max = np.maximum.accumulate(cumsum, axis=1)
+    drawdown = running_max - cumsum
+    max_dd = drawdown.max(axis=1)
+    return total_r_per_path, max_dd
+
+
+def _summarize_mc(total_r_per_path, max_dd):
+    if len(total_r_per_path) == 0:
+        return {
+            "total_r_p05": float("nan"), "total_r_p50": float("nan"), "total_r_p95": float("nan"),
+            "max_dd_p05": float("nan"), "max_dd_p50": float("nan"), "max_dd_p95": float("nan"),
+            "p_total_r_leq_0": float("nan"),
+        }
+    return {
+        "total_r_p05": float(np.percentile(total_r_per_path, 5)),
+        "total_r_p50": float(np.percentile(total_r_per_path, 50)),
+        "total_r_p95": float(np.percentile(total_r_per_path, 95)),
+        "max_dd_p05": float(np.percentile(max_dd, 5)),
+        "max_dd_p50": float(np.percentile(max_dd, 50)),
+        "max_dd_p95": float(np.percentile(max_dd, 95)),
+        "p_total_r_leq_0": float(np.mean(total_r_per_path <= 0)),
+    }
+
+
+def monte_carlo_bootstrap(r_values, n_iter=2000, seed=None):
+    """Resample WITH replacement, same N as the original trade count, n_iter times - vectorized
+    via a single np.random.choice batch draw (no python-level loop over iterations)."""
+    r_values = np.asarray(r_values, dtype=float)
+    n = len(r_values)
+    if n == 0:
+        empty = np.array([])
+        return _summarize_mc(empty, empty)
+    rng = np.random.default_rng(seed)
+    samples = rng.choice(r_values, size=(n_iter, n), replace=True)
+    total_r_per_path, max_dd = _cumsum_drawdown(samples)
+    return _summarize_mc(total_r_per_path, max_dd)
+
+
+def monte_carlo_shuffle(r_values, n_iter=2000, seed=None):
+    """Pure reordering WITHOUT replacement (same trades, same count, just shuffled) - isolates
+    path/sequence risk from the drawdown number. Total R is mathematically identical to the
+    original sum(r_values) on every single path (a permutation can't change the sum) - that
+    distribution is reported anyway for symmetry/completeness with the bootstrap case, but the
+    real information here is in the max-drawdown distribution, not the (degenerate) total-R one.
+    Vectorized via argsort-of-random-keys to get n_iter independent permutations without a
+    python-level loop."""
+    r_values = np.asarray(r_values, dtype=float)
+    n = len(r_values)
+    if n == 0:
+        empty = np.array([])
+        return _summarize_mc(empty, empty)
+    rng = np.random.default_rng(seed)
+    idx = np.argsort(rng.random((n_iter, n)), axis=1)
+    samples = r_values[idx]
+    total_r_per_path, max_dd = _cumsum_drawdown(samples)
+    return _summarize_mc(total_r_per_path, max_dd)
+
+
+def _entry_metric(entry, metric):
+    """avg R/trade for one grid_search()/bayesian_search()/genetic_search() result entry - the
+    entry's own `trades` list, not its `score` (score depends on whatever OBJECTIVE the search
+    used, e.g. Sharpe or Calmar; the cluster/plateau check below is deliberately always in avg-R/
+    total-R terms regardless of what the search itself optimized for, so it means the same thing
+    across every companion script)."""
+    trades = entry["trades"]
+    if metric == "avg_r":
+        return avg_r(trades)
+    if metric == "total_r":
+        return total_r(trades)
+    raise ValueError(f"_entry_metric: unknown metric {metric!r} (expected 'avg_r' or 'total_r')")
+
+
+def build_cluster_features(all_results, param_grid, metric="avg_r"):
+    """Feature vector per grid cell = (normalized position of each param in its own grid, in
+    param_grid's own key order, ..., the chosen metric). Generalizes to any number of parameters -
+    a 1-parameter grid produces 2-column features (position, metric), a 2-parameter grid produces
+    3 columns, etc. `all_results` is the `all` list from grid_search()/bayesian_search()/
+    genetic_search() (each entry's `params` dict must use the exact same keys as `param_grid`)."""
+    names = list(param_grid.keys())
+    grid_sizes = {name: (len(param_grid[name]) - 1 or 1) for name in names}
+    features = []
+    for entry in all_results:
+        row = [param_grid[name].index(entry["params"][name]) / grid_sizes[name] for name in names]
+        row.append(_entry_metric(entry, metric))
+        features.append(row)
+    return np.array(features)
+
+
+def run_cluster_analysis(all_results, param_grid, k=3, random_state=42, rank_by="total_r"):
+    """sklearn KMeans over every grid cell's feature vector (see build_cluster_features). Returns
+    None (with a printed skip message, no crash) if scikit-learn isn't installed - matching this
+    project's existing sklearn-missing handling elsewhere. `rank_by` picks which metric identifies
+    the "best" cell whose cluster gets reported ("total_r" matches both existing companion scripts'
+    convention of picking the grid winner by total R, not avg R/trade, since total R also reflects
+    how many trades that cell actually produced)."""
+    try:
+        from sklearn.cluster import KMeans
+    except ImportError:
+        print("scikit-learn not installed - run '!pip install scikit-learn -q' and re-run. "
+              "Skipping cluster analysis (the always-available neighbor check below still runs).")
+        return None
+
+    features = build_cluster_features(all_results, param_grid, metric="avg_r")
+    n_clusters = min(k, len(all_results))
+    model = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    labels = model.fit_predict(features)
+
+    best_idx = max(range(len(all_results)), key=lambda idx: _entry_metric(all_results[idx], rank_by))
+    best_label = labels[best_idx]
+    members = [all_results[idx] for idx in range(len(all_results)) if labels[idx] == best_label]
+    member_avg_rs = [_entry_metric(m, "avg_r") for m in members]
+
+    return {
+        "labels": labels,
+        "best_cluster_label": int(best_label),
+        "best_cluster_size": len(members),
+        "best_cluster_members": members,
+        "best_cluster_min_avg_r": min(member_avg_rs),
+        "best_cluster_mean_avg_r": float(np.mean(member_avg_rs)),
+    }
+
+
+def neighbor_plateau_check(all_results, param_grid, decent_ratio=0.5, rank_by="total_r"):
+    """Always-available (no sklearn) check: look at the best cell's immediate grid neighbors - one
+    step in either direction along EACH parameter axis in turn, holding every other parameter fixed
+    at the best cell's own value (a 1-parameter grid has up to 2 such neighbors, a 2-parameter grid
+    up to 4 matching both companion scripts' original up/down/left/right check, a 3-parameter grid
+    up to 6, and so on - fewer at any grid edge). A neighbor is "decent" if it has the same sign of
+    avg R/trade as the peak AND its magnitude is at least decent_ratio of the peak's magnitude.
+    PLATEAU if at least half the neighbors that actually exist in-grid are decent; otherwise
+    ISOLATED SPIKE / overfit warning. Returns a dict with the verdict and the neighbor details."""
+    names = list(param_grid.keys())
+    cell_by_key = {tuple(entry["params"][name] for name in names): entry for entry in all_results}
+    best_entry = max(all_results, key=lambda e: _entry_metric(e, rank_by))
+    best_key = tuple(best_entry["params"][name] for name in names)
+    best_indices = [param_grid[name].index(best_entry["params"][name]) for name in names]
+
+    neighbor_keys = []
+    for axis in range(len(names)):
+        for delta in (-1, 1):
+            candidate_indices = list(best_indices)
+            candidate_indices[axis] += delta
+            if not (0 <= candidate_indices[axis] < len(param_grid[names[axis]])):
+                continue
+            neighbor_keys.append(tuple(param_grid[names[i]][candidate_indices[i]] for i in range(len(names))))
+
+    peak_avg_r = _entry_metric(best_entry, "avg_r")
+    neighbors = []
+    decent_count = 0
+    for key in neighbor_keys:
+        entry = cell_by_key.get(key)
+        if entry is None:
+            continue
+        neighbor_avg_r = _entry_metric(entry, "avg_r")
+        same_sign = (neighbor_avg_r >= 0) == (peak_avg_r >= 0)
+        magnitude_ok = abs(peak_avg_r) == 0 or abs(neighbor_avg_r) >= decent_ratio * abs(peak_avg_r)
+        decent = same_sign and magnitude_ok
+        decent_count += int(decent)
+        neighbors.append({"params": dict(zip(names, key)), "avg_r": neighbor_avg_r, "decent": decent})
+
+    verdict = "PLATEAU" if neighbors and decent_count >= len(neighbors) / 2.0 else "ISOLATED SPIKE / overfit warning"
+    if not neighbors:
+        verdict = "ISOLATED SPIKE / overfit warning (no in-grid neighbors to compare - degenerate grid)"
+
+    return {"best_params": best_entry["params"], "best_avg_r": peak_avg_r, "neighbors": neighbors,
+            "verdict": verdict}

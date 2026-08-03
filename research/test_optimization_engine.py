@@ -1030,5 +1030,153 @@ class TestLockboxConfirm(unittest.TestCase):
         self.assertFalse(result["passed"])   # avg_r is 0.0, not > 0.0
 
 
+# ============================= WALK-FORWARD FOLDS =============================
+
+class TestWalkForwardFolds(unittest.TestCase):
+    def test_rolling_folds_step_forward_and_stop_before_overrunning_fetch_end(self):
+        folds = list(engine.walk_forward_folds(datetime.date(2016, 1, 1), datetime.date(2020, 1, 1),
+                                                 is_years=1, oos_years=1, step_years=1))
+        self.assertEqual(folds, [
+            (datetime.date(2016, 1, 1), datetime.date(2017, 1, 1), datetime.date(2017, 1, 1), datetime.date(2018, 1, 1)),
+            (datetime.date(2017, 1, 1), datetime.date(2018, 1, 1), datetime.date(2018, 1, 1), datetime.date(2019, 1, 1)),
+            (datetime.date(2018, 1, 1), datetime.date(2019, 1, 1), datetime.date(2019, 1, 1), datetime.date(2020, 1, 1)),
+        ])
+
+    def test_accepts_datetime_not_just_date(self):
+        folds = list(engine.walk_forward_folds(datetime.datetime(2016, 1, 1), datetime.datetime(2019, 1, 1),
+                                                 is_years=2, oos_years=1, step_years=1))
+        self.assertEqual(len(folds), 1)
+        self.assertEqual(folds[0], (datetime.date(2016, 1, 1), datetime.date(2018, 1, 1),
+                                     datetime.date(2018, 1, 1), datetime.date(2019, 1, 1)))
+
+    def test_no_folds_when_range_too_short(self):
+        folds = list(engine.walk_forward_folds(datetime.date(2016, 1, 1), datetime.date(2017, 1, 1),
+                                                 is_years=1, oos_years=1, step_years=1))
+        self.assertEqual(folds, [])
+
+
+# ============================= MONTE CARLO =============================
+
+class TestMonteCarloBootstrap(unittest.TestCase):
+    def test_all_winners_never_shows_a_negative_path(self):
+        result = engine.monte_carlo_bootstrap([1.0, 2.0, 1.5] * 20, n_iter=500, seed=1)
+        self.assertGreater(result["total_r_p05"], 0)
+        self.assertEqual(result["p_total_r_leq_0"], 0.0)
+
+    def test_all_losers_never_shows_a_positive_path(self):
+        result = engine.monte_carlo_bootstrap([-1.0, -2.0, -0.5] * 20, n_iter=500, seed=1)
+        self.assertLess(result["total_r_p95"], 0)
+        self.assertEqual(result["p_total_r_leq_0"], 1.0)
+
+    def test_empty_input_returns_nans_not_a_crash(self):
+        result = engine.monte_carlo_bootstrap([], n_iter=100)
+        self.assertTrue(math.isnan(result["total_r_p50"]))
+
+    def test_deterministic_with_a_seed(self):
+        r1 = engine.monte_carlo_bootstrap([0.5, -1.0, 2.0, -0.3], n_iter=200, seed=7)
+        r2 = engine.monte_carlo_bootstrap([0.5, -1.0, 2.0, -0.3], n_iter=200, seed=7)
+        self.assertEqual(r1, r2)
+
+
+class TestMonteCarloShuffle(unittest.TestCase):
+    def test_total_r_is_identical_across_every_path_a_permutation_cant_change_the_sum(self):
+        result = engine.monte_carlo_shuffle([0.5, -1.0, 2.0, -0.3], n_iter=300, seed=3)
+        expected_total = sum([0.5, -1.0, 2.0, -0.3])
+        self.assertAlmostEqual(result["total_r_p05"], expected_total, places=6)
+        self.assertAlmostEqual(result["total_r_p95"], expected_total, places=6)
+
+    def test_empty_input_returns_nans_not_a_crash(self):
+        result = engine.monte_carlo_shuffle([], n_iter=100)
+        self.assertTrue(math.isnan(result["max_dd_p50"]))
+
+
+# ============================= N-DIMENSIONAL CLUSTER / PLATEAU CHECK =============================
+
+def _grid_result_entry(params, rs):
+    return {"params": params, "trades": _trades(rs), "score": engine.total_r(_trades(rs))}
+
+
+class TestBuildClusterFeatures(unittest.TestCase):
+    def test_one_parameter_grid_produces_two_columns(self):
+        param_grid = {"x": [5, 10, 15]}
+        all_results = [_grid_result_entry({"x": v}, [0.1 * i]) for i, v in enumerate([5, 10, 15], start=1)]
+        features = engine.build_cluster_features(all_results, param_grid)
+        self.assertEqual(features.shape, (3, 2))
+        # x=5 is the first grid point -> normalized position 0.0; x=15 is the last -> 1.0
+        self.assertAlmostEqual(features[0][0], 0.0)
+        self.assertAlmostEqual(features[2][0], 1.0)
+
+    def test_two_parameter_grid_produces_three_columns(self):
+        param_grid = {"a": [1, 2], "b": [10, 20, 30]}
+        all_results = [_grid_result_entry({"a": a, "b": b}, [1.0]) for a in [1, 2] for b in [10, 20, 30]]
+        features = engine.build_cluster_features(all_results, param_grid)
+        self.assertEqual(features.shape, (6, 3))
+
+
+class TestNeighborPlateauCheck(unittest.TestCase):
+    def test_one_parameter_plateau_when_neighbors_are_decent(self):
+        # avg R/trade: 0.05, 0.10 (peak), 0.09 - both neighbors of the peak are the same sign and
+        # within decent_ratio of the peak, so this is a plateau, not an isolated spike.
+        param_grid = {"x": [5, 10, 15, 20]}
+        all_results = [
+            _grid_result_entry({"x": 5}, [0.05]),
+            _grid_result_entry({"x": 10}, [0.10]),
+            _grid_result_entry({"x": 15}, [0.09]),
+            _grid_result_entry({"x": 20}, [-0.5]),
+        ]
+        result = engine.neighbor_plateau_check(all_results, param_grid, rank_by="avg_r")
+        self.assertEqual(result["best_params"], {"x": 10})
+        self.assertEqual(len(result["neighbors"]), 2)   # x=10's only in-grid neighbors are x=5 and x=15
+        self.assertEqual(result["verdict"], "PLATEAU")
+
+    def test_one_parameter_isolated_spike_when_neighbors_are_weak(self):
+        param_grid = {"x": [5, 10, 15]}
+        all_results = [
+            _grid_result_entry({"x": 5}, [0.001]),
+            _grid_result_entry({"x": 10}, [1.0]),
+            _grid_result_entry({"x": 15}, [-0.5]),
+        ]
+        result = engine.neighbor_plateau_check(all_results, param_grid, rank_by="avg_r")
+        self.assertEqual(result["verdict"], "ISOLATED SPIKE / overfit warning")
+
+    def test_single_cell_grid_has_no_neighbors(self):
+        param_grid = {"x": [10]}
+        all_results = [_grid_result_entry({"x": 10}, [1.0])]
+        result = engine.neighbor_plateau_check(all_results, param_grid)
+        self.assertEqual(result["neighbors"], [])
+        self.assertIn("no in-grid neighbors", result["verdict"])
+
+    def test_two_parameter_grid_checks_up_to_four_neighbors(self):
+        # matches both existing companion scripts' original up/down/left/right convention - the
+        # center of a 3x3 grid has exactly 4 immediate neighbors (one step per axis, per direction).
+        param_grid = {"a": [1, 2, 3], "b": [10, 20, 30]}
+        all_results = [_grid_result_entry({"a": a, "b": b}, [0.1]) for a in [1, 2, 3] for b in [10, 20, 30]]
+        result = engine.neighbor_plateau_check(all_results, param_grid, rank_by="avg_r")
+        self.assertEqual(result["best_params"], {"a": 1, "b": 10})   # first max() match, all tied at 0.1
+        self.assertLessEqual(len(result["neighbors"]), 4)
+
+
+class TestRunClusterAnalysis(unittest.TestCase):
+    def test_returns_none_without_crashing_when_sklearn_missing(self):
+        param_grid = {"x": [5, 10, 15]}
+        all_results = [_grid_result_entry({"x": v}, [0.1]) for v in [5, 10, 15]]
+        with mock.patch.dict("sys.modules", {"sklearn": None, "sklearn.cluster": None}):
+            result = engine.run_cluster_analysis(all_results, param_grid)
+        self.assertIsNone(result)
+
+    def test_finds_a_cluster_containing_the_best_cell_when_sklearn_available(self):
+        try:
+            import sklearn  # noqa: F401
+        except ImportError:
+            self.skipTest("scikit-learn not installed")
+        param_grid = {"x": [5, 10, 15, 20, 25]}
+        all_results = [_grid_result_entry({"x": v}, [r])
+                        for v, r in zip([5, 10, 15, 20, 25], [0.1, 0.2, 0.8, 0.2, 0.1])]
+        result = engine.run_cluster_analysis(all_results, param_grid, k=2)
+        self.assertIsNotNone(result)
+        best_entry = max(all_results, key=lambda e: engine.total_r(e["trades"]))
+        self.assertIn(best_entry, result["best_cluster_members"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

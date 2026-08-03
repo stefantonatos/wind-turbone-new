@@ -287,7 +287,15 @@ def backtest_index(label, instrument_const, tz_name, session_start):
             pnl = (last_close - entry) if side == "LONG" else (entry - last_close)
             outcome, exit_r = "FLAT", pnl / sl_distance
 
+        # "date" is the ENTRY date (same convention as every other script in this project). It was
+        # the only strategy here not recording one, which silently changed the meaning of its
+        # out-of-sample number in the webapp: stats.split_trades_for_holdout falls back to a
+        # POSITIONAL split when any trade lacks a date, and because trades are concatenated
+        # per-instrument, "the last 25% of the list" was really "the last ~1.5 of 6 indices over the
+        # whole period" - a cross-INSTRUMENT split masquerading as a cross-TIME holdout, shown in the
+        # same leaderboard column as ten genuine time-based ones.
         trades.append({"index": label, "side": side, "outcome": outcome, "r": exit_r,
+                       "date": times[i].date(),
                        "stop_pct": sl_distance / entry})
         i = j + 1
 

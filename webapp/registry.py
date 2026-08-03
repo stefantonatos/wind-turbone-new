@@ -834,9 +834,69 @@ def _build_registry():
             ParamSpec("MIN_RANGE_PCT", "Min range floor (% of price)", "float", orb_mod.MIN_RANGE_PCT, 0.0, 1.0, 0.01),
         ],
         facets=[],
-        notes="Per-index local session opens (own timezone each). Trade dicts carry no date field upstream, so the equity curve here is sequence order, not calendar order.",
+        notes="Per-index local session opens (own timezone each). One trade per index per day, "
+              "close-confirmed breakout with a filter stack (range-vs-ATR, impulsive candle, "
+              "relative volume, volatility regime) on top of the bare breakout rule.",
         runner=_run_orb_indices,
         optimization_module=_find_optimization_module("research.orb_indices_dukascopy_backtest"),
+    ))
+
+    # ---------------------------------------------------------------------------
+    # bdm_orb_reversal_indices_dukascopy_backtest.py ("Big Daddy Max ORB")
+    # Same INDICES [(label, const, tz, session_open)] shape and the same
+    # backtest_index(label, const, tz, session_start) signature as orb_indices above, so it reuses
+    # _run_orb_indices unchanged. Trade keys: side, outcome, r, date, entry, sl_distance, stop_pct,
+    # trade_type. Deliberately kept as a SEPARATE entry rather than folded into the ORB entry
+    # above as another parameter set - the failed-breakout reversal is a different bet with the
+    # opposite directional premise, and averaging the two into one row would hide whichever leg is
+    # carrying (or sinking) the result.
+    # ---------------------------------------------------------------------------
+    bdm_mod = _load_module("research.bdm_orb_reversal_indices_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="bdm_orb_reversal_indices",
+        name="Big Daddy Max ORB + Failed-Breakout Reversal - Indices",
+        module_name="research.bdm_orb_reversal_indices_dukascopy_backtest",
+        granularity="5-min bars - opening-range breakout with a reversal leg when it fails",
+        instruments=[(row[0],) for row in bdm_mod.INDICES],
+        params=[
+            ParamSpec("ORB_MINUTES", "Opening range length (min)", "int", bdm_mod.ORB_MINUTES, 5, 120, 5),
+            ParamSpec("SESSION_MINUTES", "Trade window from the open (min)", "int",
+                      bdm_mod.SESSION_MINUTES, 30, 720, 15),
+            ParamSpec("REWARD_RISK", "Reward:risk", "float", bdm_mod.REWARD_RISK, 0.5, 5.0, 0.5),
+            ParamSpec("CONTINUATION_STOP_AT_MID", "Continuation stop: 1 = ORB midpoint, 0 = opposite side",
+                      "int", bdm_mod.CONTINUATION_STOP_AT_MID, 0, 1, 1,
+                      help="The source strategy's default is the midpoint, which halves the stop "
+                           "distance versus the opposite side - so it doubles the R-multiple on the "
+                           "same price move AND doubles how often it is hit. Not a free improvement."),
+            ParamSpec("ENABLE_CONTINUATION", "Take the breakout trade (1/0)", "int",
+                      bdm_mod.ENABLE_CONTINUATION, 0, 1, 1,
+                      help="Turn off to test the reversal leg on its own. The breakout is still "
+                           "detected either way - it is what defines the reversal setup."),
+            ParamSpec("ENABLE_REVERSALS", "Take the failed-breakout reversal (1/0)", "int",
+                      bdm_mod.ENABLE_REVERSALS, 0, 1, 1),
+            ParamSpec("ALLOW_REVERSAL_AFTER_CLOSE", "Reverse even after the breakout trade closed (1/0)",
+                      "int", bdm_mod.ALLOW_REVERSAL_AFTER_CLOSE, 0, 1, 1,
+                      help="OFF (the source default) means the reversal only fires while the "
+                           "breakout trade is STILL OPEN, which with a midpoint stop restricts it to "
+                           "closes back inside the range but above the midpoint. ON makes any close "
+                           "back inside the range a trade. This single flag changes the strategy's "
+                           "character more than any other input here - compare both, don't assume."),
+            ParamSpec("MIN_STOP_PCT", "Minimum stop distance (% of price)", "float",
+                      bdm_mod.MIN_STOP_PCT, 0.0, 1.0, 0.01,
+                      help="Trades with a thinner stop than this are skipped rather than scored. A "
+                           "hairline stop produces an enormous R-multiple off a single bar and would "
+                           "dominate the average - the source strategy scores in dollars and never "
+                           "has to confront this."),
+        ],
+        facets=["trade_type"],
+        notes="Ported from a public TradingView Pine strategy whose own report showed +6.63% on a "
+              "FIXED ONE-CONTRACT size while the stop distance varies with each morning's range - "
+              "so that result is a sum of unequal bets and cannot say whether the average trade "
+              "was profitable per unit of risk. This port scores it in R, applies the same cost "
+              "model and out-of-sample split as everything else, and tags each trade as "
+              "'continuation' or 'reversal' so the two legs can be read apart with the Trade type "
+              "filter. Read those separately first: they are opposite bets sharing one script.",
+        runner=_run_orb_indices,
     ))
 
     vwap_mod = _load_module("research.evendyer_vwap_orb_dukascopy_backtest")
@@ -861,7 +921,162 @@ def _build_registry():
         optimization_module=_find_optimization_module("research.evendyer_vwap_orb_dukascopy_backtest"),
     ))
 
-    # --- trend_following_momentum_dukascopy_backtest.py: deliberately NOT included.
+    # ---------------------------------------------------------------------------
+    # tma_trend_scalper_forex_dukascopy_backtest.py ("TMA Trend Scalper")
+    # Follows the _run_with_own_cache shape exactly (own pickle cache, FETCH_START/FETCH_END,
+    # fetch_instrument_data(label, const) -> df, backtest_instrument(label, df) -> trades).
+    # Trade keys: side, outcome, r, date, entry, sl_distance, stop_pct, pattern. Ported from both
+    # the Pine v6 script AND a separate plain-English strategy writeup describing the same system -
+    # they disagreed on entry timing and on a daily trade cap, and the writeup (the stated intent)
+    # is what this port follows; see the module's own header for the full reasoning.
+    # ---------------------------------------------------------------------------
+    tma_mod = _load_module("research.tma_trend_scalper_forex_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="tma_trend_scalper",
+        name="TMA Trend Scalper (triple SMMA + pattern + RSI)",
+        module_name="research.tma_trend_scalper_forex_dukascopy_backtest",
+        granularity="5-min bars, London session only",
+        instruments=tma_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("SESSION_START_HOUR", "Session start hour (UTC)", "int",
+                      tma_mod.SESSION_START_HOUR, 0, 23, 1),
+            ParamSpec("SESSION_END_HOUR", "Session end hour (UTC, exclusive)", "int",
+                      tma_mod.SESSION_END_HOUR, 1, 24, 1),
+            ParamSpec("WEEKDAY_FILTER_MODE", "Weekdays: 1 = Mon-Fri, 0 = source (Sun-Thu)", "int",
+                      tma_mod.WEEKDAY_FILTER_MODE, 0, 1, 1,
+                      help="Defaults to 1 - real Monday-to-Friday London trading, which both the "
+                           "Pine's evident intent and the writeup ('Weekdays Only') agree on. The "
+                           "Pine's `dayofweek >= 1 and <= 5` reads like Monday-Friday, but Pine "
+                           "numbers Sunday as 1 - so as literally written it trades Sunday to "
+                           "THURSDAY and never trades Friday. Set to 0 to reproduce that exactly, "
+                           "e.g. to reconcile a result against the source's own TradingView report."),
+            ParamSpec("MAX_TRADES_PER_DAY_PER_INSTRUMENT", "Max new trades per instrument per day (0 = unlimited)",
+                      "int", tma_mod.MAX_TRADES_PER_DAY_PER_INSTRUMENT, 0, 5, 1,
+                      help="Defaults to 1, matching the writeup's explicit, repeated rule ('One "
+                           "Trade Per Day (Maximum)... NOT 50 trades, NOT 10 trades, just ONE'). "
+                           "The Pine code itself doesn't enforce this - it only blocks a second "
+                           "trade while the first is still OPEN, so a fresh signal later the same "
+                           "day after the first trade already closed is free to fire again as "
+                           "literally coded. Set to 0 to test that Pine-literal, uncapped version."),
+            ParamSpec("ADX_MIN", "Minimum ADX", "float", tma_mod.ADX_MIN, 0.0, 60.0, 1.0),
+            ParamSpec("ATR_MIN_MULT", "ATR vs its 50-bar average (multiple)", "float",
+                      tma_mod.ATR_MIN_MULT, 0.0, 3.0, 0.1),
+            ParamSpec("SMMA_FAST_LEN", "Fast SMMA length", "int", tma_mod.SMMA_FAST_LEN, 5, 100, 1),
+            ParamSpec("SMMA_MED_LEN", "Medium SMMA length", "int", tma_mod.SMMA_MED_LEN, 10, 200, 5),
+            ParamSpec("SMMA_SLOW_LEN", "Slow SMMA length", "int", tma_mod.SMMA_SLOW_LEN, 50, 400, 10),
+            ParamSpec("STOP_CANDLE_MULT", "Stop = signal candle range x", "float",
+                      tma_mod.STOP_CANDLE_MULT, 0.5, 6.0, 0.5),
+            ParamSpec("TARGET_CANDLE_MULT", "Target = signal candle range x", "float",
+                      tma_mod.TARGET_CANDLE_MULT, 0.5, 12.0, 0.5),
+            ParamSpec("FILL_AT_NEXT_OPEN", "Fill at next bar's open (1) or signal close (0)", "int",
+                      tma_mod.FILL_AT_NEXT_OPEN, 0, 1, 1,
+                      help="Defaults to 1 - enter at the OPEN of the candle after the signal candle "
+                           "CLOSES, exactly as the writeup describes ('wait for the candle to "
+                           "close... enter at open of next candle'). The stop/target are still "
+                           "computed from the signal bar's close and range, so the realised R:R "
+                           "isn't a clean 2:1 as a result (0.30R-4.62R on test data) - that's a real "
+                           "property of the strategy as designed, not a bug. Set to 0 to fill at the "
+                           "signal close instead and isolate what the next-bar-open timing is worth."),
+            ParamSpec("MIN_STOP_PCT", "Minimum stop distance (% of price)", "float",
+                      tma_mod.MIN_STOP_PCT, 0.0, 0.5, 0.001),
+        ],
+        facets=["pattern"],
+        notes="Ported from a TradingView Pine script AND a separate plain-English writeup of the "
+              "same strategy - they disagreed in two places, and the writeup (the stated intent) "
+              "wins both times. It documents entering at the OPEN of the candle AFTER the signal "
+              "candle closes (default here); the Pine code produces exactly that by never setting "
+              "process_orders_on_close, which the Pine alone looked like an accidental mismatch "
+              "before the writeup confirmed it's deliberate. It also states 'One Trade Per Day "
+              "(Maximum)' as a hard rule the Pine code itself never enforces - capped here by "
+              "default, switchable to unlimited same-day re-entries to test the Pine literally. "
+              "Trades EURUSD/GBPUSD/AUDUSD/USDJPY - AUD/USD is the writeup's own recommended pair - "
+              "using its own per-pair minimum-SMMA-separation table (0.001 for the first three, "
+              "0.10 for USDJPY) rather than one value calibrated for EURUSD alone. There is also NO "
+              "time-based exit beyond the daily cap - a position can still be open well into a "
+              "later session. Trades are tagged by pattern (3-line strike / engulfing / both) for "
+              "the Pattern filter. See 'TMA Trend Scalper - REVERSED' below for the same rules "
+              "traded in the opposite direction.",
+        runner=_run_with_own_cache,
+        default_history_days=2 * 365,
+    ))
+
+    # ---------------------------------------------------------------------------
+    # tma_trend_scalper_reversed_forex_dukascopy_backtest.py - a thin wrapper that delegates every
+    # real computation to the module above with REVERSE_SIGNALS forced True, in a genuinely
+    # SEPARATE Python module namespace (see that file's own header for exactly why: neither a plain
+    # Run Backtest nor Compare All applies a ParamSpec's default to a strategy's module before
+    # running it, so a second registry entry pointing at the SAME already-imported module would
+    # run identically regardless of what its ParamSpec claimed - only a real second module makes
+    # the reversal actually take effect, including automatically inside Compare All).
+    #
+    # Registered as a real catalog entry, not a sidebar toggle, specifically to get this variant
+    # through the exact pipeline every other strategy goes through - the out-of-sample holdout
+    # split, the Šidák-corrected significance bar, and ranking against the random-entry control -
+    # rather than reading one flattering full-period number and trusting it. This project already
+    # ran this exact experiment once, on the legacy ORB strategy: a reversed variant that looked
+    # profitable on a 17-day sample lost money too once tested on a full year of real data (see
+    # quantconnect/main.py's own header).
+    # ---------------------------------------------------------------------------
+    tma_reversed_mod = _load_module("research.tma_trend_scalper_reversed_forex_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="tma_trend_scalper_reversed",
+        name="TMA Trend Scalper - REVERSED (fade the setup)",
+        module_name="research.tma_trend_scalper_reversed_forex_dukascopy_backtest",
+        granularity="5-min bars, London session only - same rules as TMA Trend Scalper, opposite side",
+        instruments=tma_reversed_mod.INSTRUMENTS,
+        params=[],   # not independently tunable - it mirrors the entry above's own live config
+                     # exactly except for direction, which isn't something a plain run's overrides
+                     # apply to either entry anyway (see the module header)
+        facets=["pattern"],
+        notes="THE SAME STRATEGY AS 'TMA Trend Scalper' ABOVE, with every signal flipped to the "
+              "opposite side - identical entry prices and stop distances, only LONG/SHORT swaps. "
+              "Exists because 'this loses money, so trade the opposite' is a tempting conclusion "
+              "that deserves the SAME scrutiny as a real strategy, not a shortcut around it. This "
+              "project already ran that exact experiment once, on the legacy ORB strategy: a "
+              "reversed variant that looked profitable on a 17-day sample lost money too once "
+              "tested on a full year of real QuantConnect/OANDA data (see quantconnect/main.py's "
+              "own header). Read this row's HOLDOUT result against the corrected significance bar "
+              "on the Compare All leaderboard, not its full-period total - a single flattering "
+              "number is exactly what burned the earlier attempt.",
+        runner=_run_with_own_cache,
+        default_history_days=2 * 365,
+    ))
+
+    # RANDOM ENTRY CONTROL - listed LAST on purpose so it reads as the yardstick at the bottom of
+    # the catalog rather than as strategy #17. It is the reference line every other row should be
+    # compared against: coin-flip entries, zero edge by construction, run through the identical
+    # instruments/date range/cost model/holdout split as everything else. If a real strategy can't
+    # beat this, it has not been shown to have an edge; if EVERYTHING lands near this line, the
+    # leaderboard is measuring the cost model rather than the strategies. See the script's own
+    # header for why that distinction is not otherwise recoverable from the results.
+    random_control_mod = _load_module("research.random_baseline_control_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="random_baseline_control",
+        name="⊘ Random Entry (control, not a strategy)",
+        module_name="research.random_baseline_control_dukascopy_backtest",
+        granularity="5-min bars - coin-flip entries, symmetric 1:1 ATR stop/target",
+        instruments=random_control_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("ATR_MULT", "Stop/target distance (ATR multiples)", "float",
+                      random_control_mod.ATR_MULT, 0.5, 6.0, 0.5),
+            ParamSpec("BARS_BETWEEN_ENTRIES", "Minimum bars between entries", "int",
+                      random_control_mod.BARS_BETWEEN_ENTRIES, 1, 96, 1),
+        ],
+        facets=[],
+        notes="NOT A STRATEGY - this is the control. It flips a coin on each eligible bar and takes a "
+              "symmetric 1:1 bet, so it has NO edge by construction and its result is a direct "
+              "readout of what trading costs alone do to an account over this date range. Use it as "
+              "the bar: a strategy that doesn't clearly beat this line hasn't demonstrated an edge, "
+              "and if every strategy clusters around it, the numbers are dominated by the cost "
+              "assumption rather than by the rules. Seeded and reproducible so it can't be re-rolled.",
+        runner=_run_with_own_cache,
+        default_history_days=3 * 365,
+    ))
+
+    # --- trend_following_momentum_dukascopy_backtest.py: deliberately NOT included HERE, but it is
+    # no longer unreachable - it now has its own "Momentum" page in app.py (momentum_page()), which
+    # renders it in the unit it actually reports in. The reasoning below is why it can't live in
+    # this registry, not a reason it goes unevaluated.
     # It doesn't produce a list of R-multiple trade dicts at all - its unit of output is a
     # monthly-rebalanced PORTFOLIO return series (NAV, Sharpe, max drawdown, % positive
     # months), built from build_instrument_frame()/portfolio_return_series()/portfolio_stats().

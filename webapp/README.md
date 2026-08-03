@@ -36,12 +36,47 @@ Then open the local URL Streamlit prints (usually `http://localhost:8501`).
   "Rauf" strategy additionally reuses its own existing pickle-based cache
   (`research/day_trading_rauf_dukascopy_backtest.py`'s `CACHE_DIR`, redirected into
   `webapp/cache/rauf_dukascopy_cache/` instead of the repo root).
-- **No commission, spread, or slippage is modeled** by any of the underlying strategies
-  - this matches the caveat every research script already carries at the bottom of its
-  own printed report. Real trading results would be worse than what you see here.
+- **The underlying research scripts model no commission, spread, or slippage at all.**
+  This app deducts it afterwards, by default, everywhere - see "How to read the
+  numbers" below, because that deduction is doing a lot of work.
 - Toggling a filter on the results page (outcome, instrument, side, date sub-range,
   session/range) never re-fetches data - it only recomputes stats over the trade list
   already produced by your last "Run Backtest" click.
+
+## How to read the numbers
+
+Three things will change how you interpret every result in this app.
+
+**1. Costs are deducted by default, and they dominate.** Each trade's R is reduced by
+`(cost_pct / 100) / stop_pct` using researched prop-firm round-trip costs (see
+`stats.py`'s `TYPICAL_COST_PCT_BY_INSTRUMENT` for the figures and their sourcing gaps).
+Because the divisor is the stop distance, a tight-stop strategy pays a *large* cost in R
+terms - often the same order of magnitude as its entire measured edge. When that's true,
+"this strategy has no edge" and "this cost estimate is too harsh" produce identical
+headline numbers. **The Cost Sensitivity tab exists to separate them**: it re-scores the
+same trades from 0x to 2x the modelled cost and tells you the multiplier at which the
+verdict flips. Those cost figures have never been validated against a real filled broker
+statement - doing that once is worth more than any further backtesting.
+
+**2. There is a random-entry control in the catalog, and it is the yardstick.**
+`⊘ Random Entry (control, not a strategy)` flips a coin on each eligible bar and takes a
+symmetric 1:1 bet, so it has no edge by construction. Run it over the same range as
+anything else. A strategy that doesn't clearly beat it hasn't demonstrated an edge; if
+*everything* clusters around it, the leaderboard is measuring costs rather than
+strategies. It's seeded, so it can't be quietly re-rolled.
+
+**3. High trade counts wreck compounded returns even at zero edge.** At 1% risk per
+trade, a system with a tiny negative expectancy compounds to near -100% over tens of
+thousands of trades regardless of how good the rules are. A "-98%" next to 10,000 trades
+and a "-98%" next to 300 trades are not the same claim. Check trade count and the
+per-trade average, not just the headline.
+
+Related: the Compare All leaderboard applies a **multiple-comparisons correction**. Running
+N strategies against the same data is N tests, so the significance bar is |z| > ~2.9-3.0 for
+a catalog this size, not the familiar 1.96 - at 1.96 you'd expect ~1 in 20 to look "significant"
+by chance even if every strategy were worthless. The leaderboard also flags any strategy
+whose result is **not directly comparable** to the others (costs that couldn't be applied,
+or a holdout that couldn't be split by time).
 
 ## Persisting history across restarts (optional, recommended if deployed)
 
@@ -83,19 +118,78 @@ minutes again after sitting idle. `data_cache.py` now pushes each fetched chunk 
 same dedicated GitHub branch (binary-safe, since a pickled price DataFrame isn't UTF-8
 text - see `github_storage.read_file_bytes`/`write_file_bytes`) and pulls it back
 before ever hitting Dukascopy again on a cold start. No separate setup - the same
-`GITHUB_TOKEN`/`GITHUB_REPO` secrets above cover both. One cap worth knowing: a single
-cached chunk over ~8MB (`data_cache._MAX_GITHUB_BLOB_BYTES`) just stays local-only for
-that process instead of syncing - only realistic on a manually widened, non-default
-date range - and gets re-fetched for real on the next cold start, same as before this
-existed.
+`GITHUB_TOKEN`/`GITHUB_REPO` secrets above cover both.
+
+**The real cap here is smaller than it looks, and it is a genuine limit rather than a
+tuning knob.** GitHub's Contents API rejects anything much over ~1MB, and base64 inflates
+the payload by a third on top of that, so `data_cache._MAX_GITHUB_BLOB_BYTES` sits at
+700KB. Run-history JSON compresses roughly 290x and fits comfortably. Pickled float64 OHLC
+frames compress about 1.2x - they are near-incompressible - so a wide date range's price
+cache genuinely does not fit this backend and stays local-only, getting re-fetched on the
+next cold start. Oversized content now fails fast with a distinct error before any network
+call rather than burning a doomed request per chunk. Fixing this properly needs an object
+store or the Git Data blobs API, not a larger constant.
 
 ## Strategies in the registry
 
-16 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+19 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
 Support/Resistance Zone Bounce, Parabolic SAR (Stop-and-Reverse), ICT Silver Bullet,
-London 3AM Range Reversal, ORB (indices), and EvenDyer VWAP ORB.
+London 3AM Range Reversal, ORB (indices), Big Daddy Max ORB + Failed-Breakout Reversal
+(indices), EvenDyer VWAP ORB, TMA Trend Scalper, and TMA Trend Scalper - REVERSED. Plus
+the random-entry control, and a **Momentum** page outside the registry (see the top-level
+README).
+
+Big Daddy Max ORB is a port of a public TradingView Pine strategy. Two things about it are
+worth knowing before reading its numbers. First, the source's own published result
+(+6.63%) was produced at a **fixed one-contract size while the stop distance varies with
+each morning's opening range** - so it is a sum of unequal bets and cannot answer whether
+the average trade made money per unit of risk. Scoring it in R, as this app does, is the
+whole reason to port it rather than trust the screenshot. Second, it is really *two*
+strategies sharing one script: a breakout leg and a failed-breakout reversal leg that bets
+the opposite way. Every trade is tagged `continuation` or `reversal`, and the **Trade type**
+filter separates them - read them apart before reading the total, or a profitable leg and a
+losing one will average into a meaningless middle.
+
+TMA Trend Scalper is also a Pine port, built against two sources rather than one: the Pine
+v6 script itself, and a separate plain-English writeup (from the same creator) describing
+what the strategy is meant to do. They disagreed in two places, and the writeup - the
+stated intent - wins both times.
+
+The writeup is explicit that entry happens at the **open of the candle after the signal
+candle closes**; read from the Pine alone, that looked like an accidental mismatch between
+the entry price and the prices the stop/target were computed from (it isn't - it's the
+design, and this app's default reflects that). The realised risk:reward still isn't a
+clean 2:1 as a result (0.30R-4.62R on test data); set the fill-timing parameter to fill at
+the signal close instead and isolate what that convention is worth. The writeup also
+states **"One Trade Per Day (Maximum)"** as a hard, repeatedly-emphasized rule the Pine
+code itself never enforces (it only blocks a second trade while the first is still open) -
+capped here by default, switchable to unlimited same-day re-entries to test the Pine
+literally.
+
+Two more things, both corrected rather than left as options: its weekday filter
+(`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but Pine numbers **Sunday** as day 1
+- so as literally written it trades Sunday through Thursday and **never trades Friday**;
+both sources agree the intent is Monday-Friday, which is the default (set the Weekdays
+parameter to 0 to reproduce the Pine's literal Sun-Thu/no-Friday behaviour, e.g. to
+reconcile against its TradingView report). And its "minimum SMMA separation" is an
+absolute price number the Pine hardcodes to one value (0.001) with a comment to adjust it
+per pair - the writeup actually gives that table, so this app trades EURUSD/GBPUSD/AUDUSD
+(0.001) and USDJPY (0.10) using the writeup's own per-pair values, led by AUD/USD since
+that's the writeup's own recommended pair (gold, this project's usual fourth instrument
+here, is never mentioned in either source). There is also no time-based exit beyond the
+daily cap, so a position opened near the end of one session can still be open well into a
+later one.
+
+**TMA Trend Scalper - REVERSED** is a separate catalog entry, not a sidebar toggle: it
+delegates to the exact same code above with every signal flipped to the opposite side, and
+exists so "this loses money, so trade the opposite" gets tested through the same holdout
+split + corrected significance bar as everything else instead of trusted on sight. This
+project already ran that exact experiment once, on the legacy Telegram-bot ORB strategy -
+`quantconnect/main.py`'s own header records that a reversed variant which looked profitable
+on a 17-day sample lost money too once tested on a full year of real data. Read this row's
+result against the Compare All leaderboard's corrected bar, not its full-period total.
 
 Parabolic SAR is the first strategy in this catalog sourced from an actual open-source
 repository (je-suis-tm/quant-trading, Apache 2.0) rather than a Pine script or a video

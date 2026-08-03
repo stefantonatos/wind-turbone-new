@@ -73,14 +73,64 @@ PROP_FIRM_PRESETS = {
             "the 6% max drawdown is static or trailing was not clearly confirmed - modeled here as "
             "TRAILING, the stricter/more conservative assumption, so real pass probability may be "
             "somewhat HIGHER than this simulation shows if it's actually static; (2) a minimum-trading-"
-            "days figure was not found in the sources checked - modeled as 0 (no minimum), which may "
-            "OVERSTATE pass probability slightly if a real minimum exists. Re-verify both against "
+            "days figure was not found in the sources checked - modeled as 0 (no minimum). RESOLVED: "
+            "The5ers' own challenge-comparison table lists 'Minimum Profitable Days: -' for Hyper "
+            "Growth, confirming there is no minimum, so the 0 modeled here is correct rather than an "
+            "assumption. The static-vs-trailing question (1) remains open. Re-verify against "
             "The5ers' current rules page before relying on this preset for a real decision."
         ),
         "initial_balance": 10000.0,
         "phases": [
             {"name": "Single Step", "profit_target_pct": 10.0, "max_daily_loss_pct": 3.0,
              "max_overall_loss_pct": 6.0, "min_trading_days": 0, "drawdown_mode": "trailing"},
+        ],
+    },
+    "the5ers_highstakes_2step": {
+        "display_name": "The5ers High Stakes (2-Step)",
+        "source_urls": ["https://the5ers.com/"],
+        "source_note": (
+            "From The5ers' own challenge-comparison table: profit targets 8% then 5%, daily loss "
+            "('Daily Pause Limit') 5% in both phases, max drawdown 10% in both phases, and a minimum "
+            "of 3 PROFITABLE days per phase. Two caveats stated rather than hidden: (1) the table "
+            "says 'Minimum Profitable Days', which is a stricter condition than the 'minimum trading "
+            "days' this simulator models - a day with a small loss counts toward a trading-day "
+            "requirement but NOT toward a profitable-day one, so pass probability here may be "
+            "somewhat OVERSTATED; (2) static-vs-trailing drawdown is not stated in that table and is "
+            "modeled as TRAILING (the stricter reading), same convention as the Hyper Growth preset "
+            "above. Note this program disallows news trading, which this simulator does not model at "
+            "all - a strategy that trades through releases would face a rule this simulation ignores."
+        ),
+        "initial_balance": 10000.0,
+        "phases": [
+            {"name": "Phase 1", "profit_target_pct": 8.0, "max_daily_loss_pct": 5.0,
+             "max_overall_loss_pct": 10.0, "min_trading_days": 3, "drawdown_mode": "trailing"},
+            {"name": "Phase 2", "profit_target_pct": 5.0, "max_daily_loss_pct": 5.0,
+             "max_overall_loss_pct": 10.0, "min_trading_days": 3, "drawdown_mode": "trailing"},
+        ],
+    },
+    "the5ers_bootcamp_3step": {
+        "display_name": "The5ers Bootcamp (3-Step)",
+        "source_urls": ["https://the5ers.com/"],
+        "source_note": (
+            "From The5ers' own challenge-comparison table: 6% profit target in each of three phases, "
+            "5% max drawdown in each, and no minimum profitable-days requirement. THE DAILY LIMIT IS "
+            "THE UNCERTAIN FIELD: the table shows a dash for 'Daily Pause Limit' across all three "
+            "phases, which most plausibly means this program has none - modeled here as effectively "
+            "unlimited (set equal to the 5% max drawdown, so the overall limit binds first and the "
+            "daily one never independently fails a path). If a daily limit does in fact exist, this "
+            "preset OVERSTATES pass probability. Verify before relying on it. Structurally this is "
+            "the most demanding of the three programs despite the lowest per-phase target: three "
+            "sequential phases each with only 5% of drawdown room means three independent chances to "
+            "be knocked out, and pass probabilities multiply."
+        ),
+        "initial_balance": 10000.0,
+        "phases": [
+            {"name": "Phase 1", "profit_target_pct": 6.0, "max_daily_loss_pct": 5.0,
+             "max_overall_loss_pct": 5.0, "min_trading_days": 0, "drawdown_mode": "trailing"},
+            {"name": "Phase 2", "profit_target_pct": 6.0, "max_daily_loss_pct": 5.0,
+             "max_overall_loss_pct": 5.0, "min_trading_days": 0, "drawdown_mode": "trailing"},
+            {"name": "Phase 3", "profit_target_pct": 6.0, "max_daily_loss_pct": 5.0,
+             "max_overall_loss_pct": 5.0, "min_trading_days": 0, "drawdown_mode": "trailing"},
         ],
     },
 }

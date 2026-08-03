@@ -58,7 +58,10 @@ def _push_to_github(path, local_path, message):
             github_storage.write_file(path, f.read(), message)
     except Exception as exc:
         # the run itself already succeeded and is saved locally for this session - a GitHub
-        # sync failure (bad token, rate limit, network) must never take that away
+        # sync failure (bad token, rate limit, network) must never take that away. It must,
+        # however, be VISIBLE: printing to stdout only is how a completely broken sync spent
+        # weeks looking identical to a working one from inside the app.
+        github_storage.note_write_failure(f"history push failed: {exc}")
         print(f"GitHub history push failed (run is still saved locally): {exc}")
 
 
@@ -66,7 +69,15 @@ def append_run(strategy_name, instruments, start_date, end_date, params, trades,
     os.makedirs(HISTORY_DIR, exist_ok=True)
     run_id = uuid.uuid4().hex[:12]
     n = len(trades)
-    total_r = sum(t.get("r", 0.0) for t in trades)
+    # Summary stats (what History/Gallery cards show) are computed from COST-ADJUSTED trades,
+    # matching what "View full results" shows by DEFAULT (its own "Apply typical trading costs"
+    # checkbox defaults to checked) - a raw/uncosted total here would show a rosier headline
+    # number on the card than clicking into the very same run reveals, which is exactly the
+    # "sign flips when you open it" surprise the project's own cost-modeling feature exists to
+    # prevent, not a second, differently-scoped number. The raw trades themselves are still
+    # stored as-is below, so the Results page's own toggle can still show the uncosted view too.
+    cost_adjusted_trades, _n_unadjusted = stats_mod.apply_cost_adjustment(trades)
+    total_r = sum(t.get("r", 0.0) for t in cost_adjusted_trades)
     row = {
         "run_id": run_id,
         "timestamp": time.time(),
@@ -79,7 +90,7 @@ def append_run(strategy_name, instruments, start_date, end_date, params, trades,
         "n_trades": n,
         "total_r": total_r,
         "avg_r": (total_r / n) if n else 0.0,
-        "max_drawdown_r": stats_mod.max_drawdown(trades),
+        "max_drawdown_r": stats_mod.max_drawdown(cost_adjusted_trades),
     }
     with open(HISTORY_FILE, "a") as f:
         f.write(json.dumps(row) + "\n")

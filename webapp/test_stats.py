@@ -188,6 +188,51 @@ class TestDollarEquityCurve(unittest.TestCase):
         self.assertEqual(len(equity), 2)
 
 
+class TestFixedFractionDollarEquityCurve(unittest.TestCase):
+    """The non-compounding counterpart to dollar_equity_curve - every trade risks risk_pct% of the
+    STARTING balance, not the current one, so this is the volatility-drag-free view: a symmetric
+    50/50 R=1 sequence should net to (near) zero here even over thousands of trades, unlike the
+    compounded version which drifts to a loss purely from compounding a fixed % of a moving
+    balance (see TestDollarEquityCurve's sibling test for that contrast)."""
+
+    def test_matches_hand_computed_addition_for_two_trades(self):
+        trades = [{"r": 2.0, "date": datetime.date(2020, 1, 1)},
+                  {"r": -1.0, "date": datetime.date(2020, 1, 2)}]
+        xs, equity, chronological = stats_mod.fixed_fraction_dollar_equity_curve(
+            trades, risk_pct=1.0, starting_balance=10000.0)
+        self.assertTrue(chronological)
+        # +2R then -1R at 1% risk of the ORIGINAL balance: +$200, then -$100 - additive, not
+        # compounded off the new $10,200 balance (which the sibling compounding test IS off of).
+        self.assertAlmostEqual(equity[0], 10200.0, places=6)
+        self.assertAlmostEqual(equity[1], 10100.0, places=6)
+
+    def test_a_perfectly_symmetric_coin_flip_sequence_nets_to_zero(self):
+        # The exact effect this function exists to isolate: dollar_equity_curve's compounding
+        # would drag this same sequence toward a loss (volatility drag); the additive version
+        # must not, because a fixed-dollar bet has zero expected value on a symmetric bet.
+        trades = ([{"r": 1.0} for _ in range(2500)] + [{"r": -1.0} for _ in range(2500)])
+        xs, equity, chronological = stats_mod.fixed_fraction_dollar_equity_curve(
+            trades, risk_pct=1.0, starting_balance=10000.0)
+        self.assertAlmostEqual(equity[-1], 10000.0, places=6)
+
+    def test_can_go_negative_unlike_the_compounding_version(self):
+        # The whole documented tradeoff: no floor at zero. A long enough losing streak at a fixed
+        # dollar risk drives the account negative - unrealistic, but an honest consequence of
+        # never resizing risk down, shown rather than silently clipped.
+        trades = [{"r": -1.0} for _ in range(150)]
+        xs, equity, chronological = stats_mod.fixed_fraction_dollar_equity_curve(
+            trades, risk_pct=1.0, starting_balance=10000.0)
+        self.assertLess(equity[-1], 0.0)
+        self.assertAlmostEqual(equity[-1], 10000.0 * (1.0 - 150 * 0.01), places=6)
+
+    def test_falls_back_to_sequence_order_when_trades_have_no_dates(self):
+        trades = [{"r": 1.0}, {"r": -0.5}]
+        xs, equity, chronological = stats_mod.fixed_fraction_dollar_equity_curve(
+            trades, risk_pct=1.0, starting_balance=10000.0)
+        self.assertFalse(chronological)
+        self.assertEqual(len(equity), 2)
+
+
 class TestComputeStats(unittest.TestCase):
     def test_empty_trades_returns_none(self):
         self.assertIsNone(stats_mod.compute_stats([]))
@@ -202,6 +247,32 @@ class TestComputeStats(unittest.TestCase):
         self.assertEqual(s["sl"], 1)
         self.assertEqual(s["flat"], 1)
         self.assertAlmostEqual(s["tp_pct"], 100 / 3, places=6)
+        # win_pct/loss_pct are BY R (r > 0), not by outcome label - here they happen to match
+        # tp_pct/sl_pct exactly (1 winner, 2 non-winners) because this fixture's outcome labels
+        # happen to line up with sign of r, but see TestWinLossPctIsByRNotOutcomeLabel below for
+        # a fixture where they genuinely diverge (the whole point of these fields existing).
+        self.assertAlmostEqual(s["win_pct"], 100 / 3, places=6)
+        self.assertAlmostEqual(s["loss_pct"], 200 / 3, places=6)
+
+    def test_win_loss_pct_is_by_r_not_outcome_label(self):
+        # A trailing-stop strategy (Donchian/Dow Theory/Parabolic SAR convention) never produces a
+        # "TP" or "SL" label - only "STOP"/"FLAT" - so tp_pct/sl_pct show 0% regardless of how
+        # profitable the strategy actually is. win_pct/loss_pct must not have this blind spot:
+        # caught live on a real deployed leaderboard (Parabolic SAR: +1.8% holdout return, 0%
+        # "win rate" from the old tp_pct-based metric).
+        trades = [{"r": 2.0, "outcome": "STOP"}, {"r": 1.0, "outcome": "STOP"}, {"r": -1.0, "outcome": "STOP"},
+                  {"r": 0.0, "outcome": "FLAT"}]
+        s = stats_mod.compute_stats(trades)
+        self.assertEqual(s["tp"], 0)   # the old, blind-spotted metric - confirms the bug is real
+        self.assertEqual(s["tp_pct"], 0.0)
+        self.assertAlmostEqual(s["win_pct"], 50.0, places=6)    # 2 of 4 trades have r > 0
+        self.assertAlmostEqual(s["loss_pct"], 50.0, places=6)   # r <= 0: the -1.0 and the 0.0 (breakeven)
+
+    def test_breakeven_trade_does_not_count_as_a_win(self):
+        trades = [{"r": 0.0}, {"r": 0.0}, {"r": 1.0}]
+        s = stats_mod.compute_stats(trades)
+        self.assertAlmostEqual(s["win_pct"], 100 / 3, places=6)
+        self.assertAlmostEqual(s["loss_pct"], 200 / 3, places=6)
 
     def test_single_trade_has_zero_z_score_and_a_degenerate_ci(self):
         # stdev is undefined for n=1 - z-score and CI must not crash, and should collapse to the
