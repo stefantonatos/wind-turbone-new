@@ -751,14 +751,23 @@ def render_generic_param_sweep(strategy, instruments, start_date, end_date):
                "the best combination above.")
 
 
-def _render_known_pipeline_section(strategy, known_module):
+def _render_known_pipeline_section(strategy, known_module, key_suffix):
     """The heavy, real 4-step optimization/robustness pipeline for the couple of strategies with
     a hand-wired research/<x>_optimization.py companion script (optimization.KNOWN_PIPELINES).
     Shared between the Optimization & Robustness tab (reachable only after a plain "Run Backtest"
     has already produced trades) and a standalone button on the run-config page - the companion
     script has its own fixed instrument list and date range baked in (see its own "THE 4 STEPS"
     header), so running it never actually depended on anything picked in the config console or on
-    a plain backtest having run first; this just removes that artificial requirement."""
+    a plain backtest having run first; this just removes that artificial requirement.
+
+    Both call sites render on the SAME page at once once a backtest has actually run (the
+    standalone section above the config console never goes away, and render_run_context's
+    Optimization & Robustness tab appears below it right after) - `key_suffix` keeps the two
+    buttons' keys distinct (a real StreamlitDuplicateElementKey crash otherwise, confirmed live:
+    running a plain backtest for a strategy with a known pipeline crashed the whole page). The
+    RESULT cache_key is deliberately NOT suffixed - the two call sites should share one cached
+    result (running it once from either place shouldn't require running the heavy pipeline
+    again just to see it from the other)."""
     strategy_id = strategy.id
     st.caption(f"A real companion script ({known_module.rsplit('.', 1)[-1]}.py) exists for this strategy: a full "
                f"parameter-stability grid, Monte Carlo resampling per cell, a cluster/plateau-vs-spike check, and "
@@ -768,7 +777,7 @@ def _render_known_pipeline_section(strategy, known_module):
                f"you explicitly ask for it below.")
 
     cache_key = f"opt_result_{strategy_id}"
-    if st.button("Run Deep Optimization (4-Step)", key=f"deep_opt_run_{strategy_id}"):
+    if st.button("Run Deep Optimization (4-Step)", key=f"deep_opt_run_{strategy_id}_{key_suffix}"):
         with st.spinner("Running the full 4-step optimization & robustness pass against real Dukascopy data - "
                          "this can take a long time..."):
             st.session_state[cache_key] = optimization.run_known_pipeline(strategy_id)
@@ -792,7 +801,7 @@ def render_optimization_tab(strategy, instruments, start_date, end_date):
         render_lockbox_section(strategy_id)
         return
 
-    _render_known_pipeline_section(strategy, known_module)
+    _render_known_pipeline_section(strategy, known_module, key_suffix="tab")
     render_lockbox_section(strategy_id)
 
 
@@ -1285,7 +1294,7 @@ def _render_run_config(strategy):
     if known_module is not None:
         st.markdown("---")
         st.markdown(eyebrow("DEEP OPTIMIZATION (4-STEP)"), unsafe_allow_html=True)
-        _render_known_pipeline_section(strategy, known_module)
+        _render_known_pipeline_section(strategy, known_module, key_suffix="standalone")
 
     if run_clicked:
         if not selected_instruments:
