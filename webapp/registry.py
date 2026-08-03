@@ -994,7 +994,50 @@ def _build_registry():
               "0.10 for USDJPY) rather than one value calibrated for EURUSD alone. There is also NO "
               "time-based exit beyond the daily cap - a position can still be open well into a "
               "later session. Trades are tagged by pattern (3-line strike / engulfing / both) for "
-              "the Pattern filter.",
+              "the Pattern filter. See 'TMA Trend Scalper - REVERSED' below for the same rules "
+              "traded in the opposite direction.",
+        runner=_run_with_own_cache,
+        default_history_days=2 * 365,
+    ))
+
+    # ---------------------------------------------------------------------------
+    # tma_trend_scalper_reversed_forex_dukascopy_backtest.py - a thin wrapper that delegates every
+    # real computation to the module above with REVERSE_SIGNALS forced True, in a genuinely
+    # SEPARATE Python module namespace (see that file's own header for exactly why: neither a plain
+    # Run Backtest nor Compare All applies a ParamSpec's default to a strategy's module before
+    # running it, so a second registry entry pointing at the SAME already-imported module would
+    # run identically regardless of what its ParamSpec claimed - only a real second module makes
+    # the reversal actually take effect, including automatically inside Compare All).
+    #
+    # Registered as a real catalog entry, not a sidebar toggle, specifically to get this variant
+    # through the exact pipeline every other strategy goes through - the out-of-sample holdout
+    # split, the Šidák-corrected significance bar, and ranking against the random-entry control -
+    # rather than reading one flattering full-period number and trusting it. This project already
+    # ran this exact experiment once, on the legacy ORB strategy: a reversed variant that looked
+    # profitable on a 17-day sample lost money too once tested on a full year of real data (see
+    # quantconnect/main.py's own header).
+    # ---------------------------------------------------------------------------
+    tma_reversed_mod = _load_module("research.tma_trend_scalper_reversed_forex_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="tma_trend_scalper_reversed",
+        name="TMA Trend Scalper - REVERSED (fade the setup)",
+        module_name="research.tma_trend_scalper_reversed_forex_dukascopy_backtest",
+        granularity="5-min bars, London session only - same rules as TMA Trend Scalper, opposite side",
+        instruments=tma_reversed_mod.INSTRUMENTS,
+        params=[],   # not independently tunable - it mirrors the entry above's own live config
+                     # exactly except for direction, which isn't something a plain run's overrides
+                     # apply to either entry anyway (see the module header)
+        facets=["pattern"],
+        notes="THE SAME STRATEGY AS 'TMA Trend Scalper' ABOVE, with every signal flipped to the "
+              "opposite side - identical entry prices and stop distances, only LONG/SHORT swaps. "
+              "Exists because 'this loses money, so trade the opposite' is a tempting conclusion "
+              "that deserves the SAME scrutiny as a real strategy, not a shortcut around it. This "
+              "project already ran that exact experiment once, on the legacy ORB strategy: a "
+              "reversed variant that looked profitable on a 17-day sample lost money too once "
+              "tested on a full year of real QuantConnect/OANDA data (see quantconnect/main.py's "
+              "own header). Read this row's HOLDOUT result against the corrected significance bar "
+              "on the Compare All leaderboard, not its full-period total - a single flattering "
+              "number is exactly what burned the earlier attempt.",
         runner=_run_with_own_cache,
         default_history_days=2 * 365,
     ))

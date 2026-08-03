@@ -138,6 +138,18 @@ MIN_SEPARATION_ABS_BY_INSTRUMENT = {
 }
 DEFAULT_MIN_SEPARATION_ABS = 0.001
 
+# Not part of either source - added for the same reason every other REVERSE_SIGNALS in this
+# project exists (research/orb_indices_dukascopy_backtest.py, moving_average_setup_*, and every
+# quantconnect/*.py port): "this loses money, so trade the opposite" is a tempting conclusion that
+# needs testing through the SAME rigor as everything else, not trusting on sight. This project has
+# already run that exact experiment once, on the legacy ORB strategy - quantconnect/main.py's own
+# header records that a 17-day sample showed the reversed direction profitable, but a full YEAR of
+# real QuantConnect/OANDA data showed BOTH the original and reversed variants losing money. Default
+# stays False; the webapp registers a second catalog entry with this baked to True specifically so
+# it goes through the identical out-of-sample holdout + corrected-significance pipeline as
+# everything else, rather than being read off one flattering full-period number.
+REVERSE_SIGNALS = False
+
 # --- regime filters ---
 ADX_LEN = 14
 ADX_MIN = 25.0
@@ -425,11 +437,25 @@ def backtest_instrument(label, df):
         rsi_bull = rsi[i] > 50 and rsi[i] > rsi_smma[i]
         rsi_bear = rsi[i] < 50 and rsi[i] < rsi_smma[i]
 
+        long_setup = bull_quality and (bull_strike or bull_engulf) and rsi_bull
+        short_setup = bear_quality and (bear_strike or bear_engulf) and rsi_bear
+        long_pattern = _pattern_name(bull_strike, bull_engulf) if long_setup else None
+        short_pattern = _pattern_name(bear_strike, bear_engulf) if short_setup else None
+
+        if REVERSE_SIGNALS:
+            # Same one-line convention as every other REVERSE_SIGNALS in this project - swaps
+            # which SIDE each setup trades, upstream of entry/stop/target (both stay computed
+            # from the same signal-bar close and range either way). The pattern label stays tied
+            # to whichever setup actually fired: a reversed LONG trading a bearish setup is still
+            # labelled by the bearish pattern that triggered it, not relabelled as bullish.
+            long_setup, short_setup = short_setup, long_setup
+            long_pattern, short_pattern = short_pattern, long_pattern
+
         side = None
-        if bull_quality and (bull_strike or bull_engulf) and rsi_bull:
-            side, pattern = "LONG", _pattern_name(bull_strike, bull_engulf)
-        elif bear_quality and (bear_strike or bear_engulf) and rsi_bear:
-            side, pattern = "SHORT", _pattern_name(bear_strike, bear_engulf)
+        if long_setup:
+            side, pattern = "LONG", long_pattern
+        elif short_setup:
+            side, pattern = "SHORT", short_pattern
         if side is None:
             i += 1
             continue

@@ -46,9 +46,30 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _source_for(strategy):
-    path = os.path.join(REPO_ROOT, "research", strategy.module_name.replace("research.", "") + ".py")
-    with open(path) as f:
-        return f.read()
+    """Returns the registered module's own source, PLUS the source of every research.* module it
+    delegates to via `importlib.import_module("research.<name>")` (followed recursively, one level
+    is all any current wrapper needs but this doesn't assume that). Needed for delegating wrapper
+    modules like tma_trend_scalper_reversed_forex_dukascopy_backtest.py, whose own file contains no
+    `"stop_pct":`/`"date":` literal - it returns whatever the module it wraps produces, unmodified -
+    so checking only its own text would report a false violation of a contract it isn't actually
+    breaking. See TestSourceForFollowsDelegation below for proof this isn't vacuous either way."""
+    def read(module_name):
+        path = os.path.join(REPO_ROOT, "research", module_name.replace("research.", "") + ".py")
+        with open(path) as f:
+            return f.read()
+
+    seen = set()
+    to_visit = [strategy.module_name]
+    combined = []
+    while to_visit:
+        name = to_visit.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        text = read(name)
+        combined.append(text)
+        to_visit.extend(re.findall(r'importlib\.import_module\(\s*["\'](research\.\w+)["\']\s*\)', text))
+    return "\n".join(combined)
 
 
 def _writes_key(source, key):
@@ -123,6 +144,28 @@ class TestFacetLabelRendering(unittest.TestCase):
                 label = self._label(facet)
                 self.assertNotIn("_", label, f"{strategy.name}'s '{facet}' facet renders as {label!r}")
                 self.assertTrue(label[:1].isupper())
+
+
+class TestSourceForFollowsDelegation(unittest.TestCase):
+    """Proof that _source_for's delegation-following isn't vacuous in either direction: a wrapper
+    module's OWN text alone must not satisfy the contract (or a genuinely broken wrapper would pass
+    by accident), but the COMBINED text (wrapper + whatever it delegates to) must."""
+
+    def test_the_reversed_wrapper_alone_does_not_satisfy_the_contract(self):
+        path = os.path.join(REPO_ROOT, "research",
+                             "tma_trend_scalper_reversed_forex_dukascopy_backtest.py")
+        with open(path) as f:
+            wrapper_only = f.read()
+        self.assertFalse(_writes_key(wrapper_only, "stop_pct"),
+                          "if this starts passing, the wrapper grew its own trade-dict construction "
+                          "and _source_for's delegation-following is no longer being exercised by "
+                          "this test - update the fixture")
+
+    def test_source_for_combines_the_wrapper_with_what_it_delegates_to(self):
+        strategy = registry.STRATEGIES_BY_ID["tma_trend_scalper_reversed"]
+        combined = _source_for(strategy)
+        self.assertTrue(_writes_key(combined, "stop_pct"))
+        self.assertTrue(_writes_key(combined, "date"))
 
 
 class TestContractCheckerItself(unittest.TestCase):

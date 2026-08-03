@@ -20,8 +20,8 @@ MIN_TRADES_FOR_RANKING = 100
 # Fraction of a Compare-All comparison period held out for out-of-sample ranking (see
 # split_trades_for_holdout). Compare All doesn't fit any parameters - it just runs each
 # strategy's own already-fixed rules - so this isn't guarding against classic parameter
-# overfitting. What it IS guarding against: comparing 16 strategies on the exact same window and
-# crowning whichever one happens to look best is itself a form of data snooping (strategy-
+# overfitting. What it IS guarding against: comparing every strategy in the catalog on the exact
+# same window and crowning whichever one happens to look best is itself a form of data snooping (strategy-
 # selection bias, not parameter-selection bias) - the "winner" might just be the luckiest
 # strategy on that specific window, not the best one. Ranking by a HELD-OUT slice the "winner"
 # was never chosen using is the same discipline every research/*.py script's own SPLIT_DATE
@@ -45,19 +45,20 @@ def multiple_comparison_z_threshold(n_tests, family_wise_alpha=0.05):
 
     WHY THE WEBAPP NEEDS THIS AT ALL: Compare All runs every strategy in the catalog against the
     same data and prints a z-score per row. Reading each of those against the textbook |z| > 1.96
-    rule is exactly the multiple-comparisons error that manufactures false winners. With 16
-    strategies the honest bar is |z| > 2.95, and the difference is not cosmetic: on a real run of
-    this app, two strategies (z = -2.90 and z = -2.22) read as "significant" against 1.96 and are
-    NOT significant once corrected.
+    rule is exactly the multiple-comparisons error that manufactures false winners. The exact bar
+    grows with the catalog (computed live as multiple_comparison_z_threshold(len(results)), never
+    hardcoded) - as of this writing, with 20 registry entries, that's |z| > ~3.02, not 1.96. The gap
+    is not cosmetic: on a real run of this app with a smaller catalog, two strategies (z = -2.90 and
+    z = -2.22) read as "significant" against 1.96 and were NOT significant once corrected.
 
     HONEST LIMITATION, stated rather than buried: this correction assumes the tests are
-    independent. They are not - 14 of the 16 strategies in this catalog trade the SAME four FX
-    series over the SAME window, so their outcomes are heavily correlated and the true effective
-    number of independent tests is smaller than n_tests. That makes this bar CONSERVATIVE (it asks
-    for more evidence than a correlation-aware correction would). Erring conservative is the right
-    direction for a tool someone might trade real money on, but it is an approximation, not the
-    exact bar - which is why the UI says "does not clear the corrected bar" rather than "proven to
-    be noise"."""
+    independent. They are not - most strategies in this catalog trade overlapping FX pairs
+    (EURUSD/GBPUSD/USDJPY and others) over overlapping windows, so their outcomes are heavily
+    correlated and the true effective number of independent tests is smaller than n_tests. That
+    makes this bar CONSERVATIVE (it asks for more evidence than a correlation-aware correction
+    would). Erring conservative is the right direction for a tool someone might trade real money
+    on, but it is an approximation, not the exact bar - which is why the UI says "does not clear
+    the corrected bar" rather than "proven to be noise"."""
     if n_tests < 1:
         raise ValueError(f"multiple_comparison_z_threshold: n_tests must be >= 1, got {n_tests!r}")
     per_test_alpha = 1.0 - (1.0 - family_wise_alpha) ** (1.0 / n_tests)

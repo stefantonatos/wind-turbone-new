@@ -327,6 +327,72 @@ class TestPerInstrumentSeparationTable(unittest.TestCase):
         self.assertEqual(with_fallback_overridden, [])
 
 
+class TestReverseSignals(unittest.TestCase):
+    """Not part of either source - added so "this loses, trade the opposite" can be tested through
+    the same rigor as everything else rather than trusted on sight (see the module header for why:
+    this project already ran this exact experiment once, on the legacy ORB strategy, and a reversed
+    variant that looked good on a 17-day sample lost money too once tested on a full year).
+
+    Defaults to False, preserving every test above unchanged. When enabled, the entry price and
+    stop distance must be UNCHANGED (same signal-bar close/range, same fill mechanics) - only the
+    side flips, and the pattern label stays tied to whichever setup actually fired."""
+
+    def test_reversing_a_bull_setup_trades_short_at_the_same_entry_and_risk(self):
+        df, _ = build_scenario(_bull_strike_pattern, _hold_flat)
+        normal = run_scenario(df)
+        reversed_ = run_scenario(df, REVERSE_SIGNALS=1)
+        self.assertEqual(len(normal), 1)
+        self.assertEqual(len(reversed_), 1)
+        self.assertEqual(normal[0]["side"], "LONG")
+        self.assertEqual(reversed_[0]["side"], "SHORT")
+        self.assertAlmostEqual(normal[0]["entry"], reversed_[0]["entry"])
+        self.assertAlmostEqual(normal[0]["sl_distance"], reversed_[0]["sl_distance"])
+        self.assertEqual(normal[0]["pattern"], reversed_[0]["pattern"])
+
+    def test_reversing_a_bear_setup_trades_long_at_the_same_entry_and_risk(self):
+        # Mirrors the LONG scenario around a pivot (same technique TestLongShortMirror uses) to
+        # get a hand-verified SHORT setup, then reverses IT - should trade LONG instead.
+        df_up, _ = build_scenario(_bull_strike_pattern, _hold_flat)
+        pivot = 2.0
+        df_down = pd.DataFrame({
+            "Open": pivot - df_up["Open"], "High": pivot - df_up["Low"],
+            "Low": pivot - df_up["High"], "Close": pivot - df_up["Close"],
+        }, index=df_up.index)
+        normal = run_scenario(df_down)
+        reversed_ = run_scenario(df_down, REVERSE_SIGNALS=1)
+        self.assertEqual(len(normal), 1)
+        self.assertEqual(len(reversed_), 1)
+        self.assertEqual(normal[0]["side"], "SHORT")
+        self.assertEqual(reversed_[0]["side"], "LONG")
+        self.assertAlmostEqual(normal[0]["entry"], reversed_[0]["entry"])
+        self.assertAlmostEqual(normal[0]["sl_distance"], reversed_[0]["sl_distance"])
+
+    def test_reversed_outcome_is_the_mirror_image_not_independently_recomputed(self):
+        # A stop that would have hit the normal LONG's SL level must hit the reversed SHORT's TP
+        # instead (and vice versa) - the price path is identical, only which side is holding it
+        # differs, so a move in one direction can't be a loss for both sides at once.
+        def follow(signal_bar):
+            opening = signal_bar["Close"]
+            entry_bar = {"Open": opening, "High": opening + STEP * 0.02,
+                          "Low": opening - STEP * 0.02, "Close": opening}
+            down_move = {"Open": opening, "High": opening + STEP * 0.02,
+                         "Low": opening - STEP * 20, "Close": opening - STEP * 20}
+            return [entry_bar, down_move] + _hold_flat({"Close": opening - STEP * 20}, n=4)
+        df, _ = build_scenario(_bull_strike_pattern, follow)
+        normal = run_scenario(df)
+        reversed_ = run_scenario(df, REVERSE_SIGNALS=1)
+        self.assertEqual(normal[0]["outcome"], "SL")     # LONG, price fell -> stopped out
+        self.assertEqual(reversed_[0]["outcome"], "TP")  # SHORT, same fall -> target hit
+        self.assertAlmostEqual(normal[0]["r"], -1.0)
+        self.assertGreater(reversed_[0]["r"], 0.0)
+
+    def test_default_is_false_and_matches_the_unreversed_call(self):
+        df, _ = build_scenario(_bull_strike_pattern, _hold_flat)
+        with_explicit_false = run_scenario(df, REVERSE_SIGNALS=0)
+        with_default = run_scenario(df)   # no override
+        self.assertEqual(with_explicit_false, with_default)
+
+
 # ================================ patterns ================================
 
 class TestPatternDetection(unittest.TestCase):

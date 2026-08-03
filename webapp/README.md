@@ -132,13 +132,14 @@ store or the Git Data blobs API, not a larger constant.
 
 ## Strategies in the registry
 
-18 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+19 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
 Support/Resistance Zone Bounce, Parabolic SAR (Stop-and-Reverse), ICT Silver Bullet,
 London 3AM Range Reversal, ORB (indices), Big Daddy Max ORB + Failed-Breakout Reversal
-(indices), EvenDyer VWAP ORB, and TMA Trend Scalper. Plus the random-entry control, and a
-**Momentum** page outside the registry (see the top-level README).
+(indices), EvenDyer VWAP ORB, TMA Trend Scalper, and TMA Trend Scalper - REVERSED. Plus
+the random-entry control, and a **Momentum** page outside the registry (see the top-level
+README).
 
 Big Daddy Max ORB is a port of a public TradingView Pine strategy. Two things about it are
 worth knowing before reading its numbers. First, the source's own published result
@@ -180,6 +181,15 @@ that's the writeup's own recommended pair (gold, this project's usual fourth ins
 here, is never mentioned in either source). There is also no time-based exit beyond the
 daily cap, so a position opened near the end of one session can still be open well into a
 later one.
+
+**TMA Trend Scalper - REVERSED** is a separate catalog entry, not a sidebar toggle: it
+delegates to the exact same code above with every signal flipped to the opposite side, and
+exists so "this loses money, so trade the opposite" gets tested through the same holdout
+split + corrected significance bar as everything else instead of trusted on sight. This
+project already ran that exact experiment once, on the legacy Telegram-bot ORB strategy -
+`quantconnect/main.py`'s own header records that a reversed variant which looked profitable
+on a 17-day sample lost money too once tested on a full year of real data. Read this row's
+result against the Compare All leaderboard's corrected bar, not its full-period total.
 
 Parabolic SAR is the first strategy in this catalog sourced from an actual open-source
 repository (je-suis-tm/quant-trading, Apache 2.0) rather than a Pine script or a video
