@@ -834,9 +834,69 @@ def _build_registry():
             ParamSpec("MIN_RANGE_PCT", "Min range floor (% of price)", "float", orb_mod.MIN_RANGE_PCT, 0.0, 1.0, 0.01),
         ],
         facets=[],
-        notes="Per-index local session opens (own timezone each). Trade dicts carry no date field upstream, so the equity curve here is sequence order, not calendar order.",
+        notes="Per-index local session opens (own timezone each). One trade per index per day, "
+              "close-confirmed breakout with a filter stack (range-vs-ATR, impulsive candle, "
+              "relative volume, volatility regime) on top of the bare breakout rule.",
         runner=_run_orb_indices,
         optimization_module=_find_optimization_module("research.orb_indices_dukascopy_backtest"),
+    ))
+
+    # ---------------------------------------------------------------------------
+    # bdm_orb_reversal_indices_dukascopy_backtest.py ("Big Daddy Max ORB")
+    # Same INDICES [(label, const, tz, session_open)] shape and the same
+    # backtest_index(label, const, tz, session_start) signature as orb_indices above, so it reuses
+    # _run_orb_indices unchanged. Trade keys: side, outcome, r, date, entry, sl_distance, stop_pct,
+    # trade_type. Deliberately kept as a SEPARATE entry rather than folded into the ORB entry
+    # above as another parameter set - the failed-breakout reversal is a different bet with the
+    # opposite directional premise, and averaging the two into one row would hide whichever leg is
+    # carrying (or sinking) the result.
+    # ---------------------------------------------------------------------------
+    bdm_mod = _load_module("research.bdm_orb_reversal_indices_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="bdm_orb_reversal_indices",
+        name="Big Daddy Max ORB + Failed-Breakout Reversal - Indices",
+        module_name="research.bdm_orb_reversal_indices_dukascopy_backtest",
+        granularity="5-min bars - opening-range breakout with a reversal leg when it fails",
+        instruments=[(row[0],) for row in bdm_mod.INDICES],
+        params=[
+            ParamSpec("ORB_MINUTES", "Opening range length (min)", "int", bdm_mod.ORB_MINUTES, 5, 120, 5),
+            ParamSpec("SESSION_MINUTES", "Trade window from the open (min)", "int",
+                      bdm_mod.SESSION_MINUTES, 30, 720, 15),
+            ParamSpec("REWARD_RISK", "Reward:risk", "float", bdm_mod.REWARD_RISK, 0.5, 5.0, 0.5),
+            ParamSpec("CONTINUATION_STOP_AT_MID", "Continuation stop: 1 = ORB midpoint, 0 = opposite side",
+                      "int", bdm_mod.CONTINUATION_STOP_AT_MID, 0, 1, 1,
+                      help="The source strategy's default is the midpoint, which halves the stop "
+                           "distance versus the opposite side - so it doubles the R-multiple on the "
+                           "same price move AND doubles how often it is hit. Not a free improvement."),
+            ParamSpec("ENABLE_CONTINUATION", "Take the breakout trade (1/0)", "int",
+                      bdm_mod.ENABLE_CONTINUATION, 0, 1, 1,
+                      help="Turn off to test the reversal leg on its own. The breakout is still "
+                           "detected either way - it is what defines the reversal setup."),
+            ParamSpec("ENABLE_REVERSALS", "Take the failed-breakout reversal (1/0)", "int",
+                      bdm_mod.ENABLE_REVERSALS, 0, 1, 1),
+            ParamSpec("ALLOW_REVERSAL_AFTER_CLOSE", "Reverse even after the breakout trade closed (1/0)",
+                      "int", bdm_mod.ALLOW_REVERSAL_AFTER_CLOSE, 0, 1, 1,
+                      help="OFF (the source default) means the reversal only fires while the "
+                           "breakout trade is STILL OPEN, which with a midpoint stop restricts it to "
+                           "closes back inside the range but above the midpoint. ON makes any close "
+                           "back inside the range a trade. This single flag changes the strategy's "
+                           "character more than any other input here - compare both, don't assume."),
+            ParamSpec("MIN_STOP_PCT", "Minimum stop distance (% of price)", "float",
+                      bdm_mod.MIN_STOP_PCT, 0.0, 1.0, 0.01,
+                      help="Trades with a thinner stop than this are skipped rather than scored. A "
+                           "hairline stop produces an enormous R-multiple off a single bar and would "
+                           "dominate the average - the source strategy scores in dollars and never "
+                           "has to confront this."),
+        ],
+        facets=["trade_type"],
+        notes="Ported from a public TradingView Pine strategy whose own report showed +6.63% on a "
+              "FIXED ONE-CONTRACT size while the stop distance varies with each morning's range - "
+              "so that result is a sum of unequal bets and cannot say whether the average trade "
+              "was profitable per unit of risk. This port scores it in R, applies the same cost "
+              "model and out-of-sample split as everything else, and tags each trade as "
+              "'continuation' or 'reversal' so the two legs can be read apart with the Trade type "
+              "filter. Read those separately first: they are opposite bets sharing one script.",
+        runner=_run_orb_indices,
     ))
 
     vwap_mod = _load_module("research.evendyer_vwap_orb_dukascopy_backtest")
@@ -892,7 +952,10 @@ def _build_registry():
         default_history_days=3 * 365,
     ))
 
-    # --- trend_following_momentum_dukascopy_backtest.py: deliberately NOT included.
+    # --- trend_following_momentum_dukascopy_backtest.py: deliberately NOT included HERE, but it is
+    # no longer unreachable - it now has its own "Momentum" page in app.py (momentum_page()), which
+    # renders it in the unit it actually reports in. The reasoning below is why it can't live in
+    # this registry, not a reason it goes unevaluated.
     # It doesn't produce a list of R-multiple trade dicts at all - its unit of output is a
     # monthly-rebalanced PORTFOLIO return series (NAV, Sharpe, max drawdown, % positive
     # months), built from build_instrument_frame()/portfolio_return_series()/portfolio_stats().

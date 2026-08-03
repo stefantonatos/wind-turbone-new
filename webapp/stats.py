@@ -132,7 +132,17 @@ def split_trades_for_holdout(trades, holdout_fraction=HOLDOUT_FRACTION):
 # your actual firm's current conditions page before relying on this for a real decision, same
 # caveat this project's cost figures have always carried.
 DEFAULT_COST_PCT = 0.009   # instruments not in the table below - roughly the mid of the four
-                            # figures below, not a fifth independently-sourced number
+                            # figures below, not a fifth independently-sourced number.
+                            #
+                            # WHO ACTUALLY LANDS HERE: every INDEX CFD in this catalog (SP500,
+                            # NASDAQ100, DOWJONES, DAX, FTSE100, NIKKEI225 - used by both ORB
+                            # strategies and the VWAP ORB). That is a figure derived from FX
+                            # spreads being applied to a different asset class, which is a real
+                            # gap, not a considered choice. It happens not to be wild - a ~0.5
+                            # point spread on a ~5,000 index is ~0.01% - but nobody sourced it,
+                            # and index CFD spreads widen far more than FX around the cash open,
+                            # which is precisely when the ORB strategies trade. Treat index
+                            # results as the ones most in need of the Cost Sensitivity tab.
 TYPICAL_COST_PCT_BY_INSTRUMENT = {
     # THE5ERS published raw spread + $4/lot round-turn commission, converted to % of a reference
     # price. Worked example (EURUSD): 0.4 pip spread + $4/lot commission; a pip on a 100k lot is

@@ -72,8 +72,8 @@ and a "-98%" next to 300 trades are not the same claim. Check trade count and th
 per-trade average, not just the headline.
 
 Related: the Compare All leaderboard applies a **multiple-comparisons correction**. Running
-N strategies against the same data is N tests, so the significance bar is |z| > ~2.95 for
-16 strategies, not the familiar 1.96 - at 1.96 you'd expect ~1 in 20 to look "significant"
+N strategies against the same data is N tests, so the significance bar is |z| > ~2.9-3.0 for
+a catalog this size, not the familiar 1.96 - at 1.96 you'd expect ~1 in 20 to look "significant"
 by chance even if every strategy were worthless. The leaderboard also flags any strategy
 whose result is **not directly comparable** to the others (costs that couldn't be applied,
 or a holdout that couldn't be split by time).
@@ -126,11 +126,24 @@ existed.
 
 ## Strategies in the registry
 
-16 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+17 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
 Support/Resistance Zone Bounce, Parabolic SAR (Stop-and-Reverse), ICT Silver Bullet,
-London 3AM Range Reversal, ORB (indices), and EvenDyer VWAP ORB.
+London 3AM Range Reversal, ORB (indices), Big Daddy Max ORB + Failed-Breakout Reversal
+(indices), and EvenDyer VWAP ORB. Plus the random-entry control, and a **Momentum** page
+outside the registry (see below).
+
+Big Daddy Max ORB is a port of a public TradingView Pine strategy. Two things about it are
+worth knowing before reading its numbers. First, the source's own published result
+(+6.63%) was produced at a **fixed one-contract size while the stop distance varies with
+each morning's opening range** - so it is a sum of unequal bets and cannot answer whether
+the average trade made money per unit of risk. Scoring it in R, as this app does, is the
+whole reason to port it rather than trust the screenshot. Second, it is really *two*
+strategies sharing one script: a breakout leg and a failed-breakout reversal leg that bets
+the opposite way. Every trade is tagged `continuation` or `reversal`, and the **Trade type**
+filter separates them - read them apart before reading the total, or a profitable leg and a
+losing one will average into a meaningless middle.
 
 Parabolic SAR is the first strategy in this catalog sourced from an actual open-source
 repository (je-suis-tm/quant-trading, Apache 2.0) rather than a Pine script or a video

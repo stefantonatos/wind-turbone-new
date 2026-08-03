@@ -1,10 +1,12 @@
 # wind-turbone-new
 
 **The main thing in this repo is `webapp/` — a Streamlit strategy-backtesting
-app.** It runs 16 trading strategies (plus a random-entry control) against real
+app.** It runs 17 trading strategies (plus a random-entry control) against real
 historical Dukascopy data, deducts realistic prop-firm trading costs, ranks
 them on an out-of-sample holdout, and shows how much of each result is the
-strategy versus the cost assumption.
+strategy versus the cost assumption. A separate **Momentum** page runs a
+monthly-rebalanced trend-following portfolio across 27 instruments, which
+reports as a NAV curve rather than a trade list.
 
 ```bash
 pip install -r webapp/requirements.txt

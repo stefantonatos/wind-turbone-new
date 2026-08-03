@@ -220,7 +220,8 @@ def render_filterable_results(trades, strategy, key_prefix):
         facet_selections = {}
         for i, facet in enumerate(facets):
             values = sorted({t.get(facet) for t in trades if t.get(facet)})
-            facet_selections[facet] = cols[3 + i].multiselect(facet.capitalize(), values, default=values,
+            facet_selections[facet] = cols[3 + i].multiselect(facet.replace("_", " ").capitalize(),
+                                                                 values, default=values,
                                                                  key=f"{key_prefix}_f_{facet}")
 
         date_range_filter = None
