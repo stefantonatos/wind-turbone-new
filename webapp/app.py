@@ -312,8 +312,11 @@ def render_filterable_results(trades, strategy, key_prefix):
             metric_cols[2].metric(f"Avg {unit_label}/trade", avg_fmt.format(s_display["avg_r"]),
                                    help=f"95% CI: {avg_fmt.format(s_display['avg_r_ci_low'])} to "
                                         f"{avg_fmt.format(s_display['avg_r_ci_high'])}.")
-            metric_cols[3].metric("Win rate", f"{s_display['tp_pct']:.1f}%")
-            metric_cols[4].metric("Loss rate", f"{s_display['sl_pct']:.1f}%")
+            metric_cols[3].metric("Win rate", f"{s_display['win_pct']:.1f}%",
+                                   help="Fraction of trades with r > 0, regardless of what the exit was "
+                                        "labeled - a trailing-stop strategy (no fixed take-profit) can be "
+                                        "genuinely profitable while never producing a literal \"TP\" exit.")
+            metric_cols[4].metric("Loss rate", f"{s_display['loss_pct']:.1f}%")
             metric_cols[5].metric(f"Max drawdown", unit_fmt.format(-max_dd_display),
                                    help="Largest peak-to-trough decline in the cumulative equity curve "
                                         "below, not the worst single losing trade."
@@ -838,7 +841,7 @@ def _compare_all_pct_metrics(cost_trades, risk_pct):
     return {
         "n_trades": s["n_trades"], "total_pct": total_pct,
         "total_pct_ci_low": total_pct_ci_low, "total_pct_ci_high": total_pct_ci_high,
-        "avg_pct_per_trade": s["avg_r"] * risk_pct, "win_pct": s["tp_pct"],
+        "avg_pct_per_trade": s["avg_r"] * risk_pct, "win_pct": s["win_pct"],
         "max_drawdown_pct": max_drawdown_pct, "z_score": s["z_score"],
     }
 

@@ -202,6 +202,32 @@ class TestComputeStats(unittest.TestCase):
         self.assertEqual(s["sl"], 1)
         self.assertEqual(s["flat"], 1)
         self.assertAlmostEqual(s["tp_pct"], 100 / 3, places=6)
+        # win_pct/loss_pct are BY R (r > 0), not by outcome label - here they happen to match
+        # tp_pct/sl_pct exactly (1 winner, 2 non-winners) because this fixture's outcome labels
+        # happen to line up with sign of r, but see TestWinLossPctIsByRNotOutcomeLabel below for
+        # a fixture where they genuinely diverge (the whole point of these fields existing).
+        self.assertAlmostEqual(s["win_pct"], 100 / 3, places=6)
+        self.assertAlmostEqual(s["loss_pct"], 200 / 3, places=6)
+
+    def test_win_loss_pct_is_by_r_not_outcome_label(self):
+        # A trailing-stop strategy (Donchian/Dow Theory/Parabolic SAR convention) never produces a
+        # "TP" or "SL" label - only "STOP"/"FLAT" - so tp_pct/sl_pct show 0% regardless of how
+        # profitable the strategy actually is. win_pct/loss_pct must not have this blind spot:
+        # caught live on a real deployed leaderboard (Parabolic SAR: +1.8% holdout return, 0%
+        # "win rate" from the old tp_pct-based metric).
+        trades = [{"r": 2.0, "outcome": "STOP"}, {"r": 1.0, "outcome": "STOP"}, {"r": -1.0, "outcome": "STOP"},
+                  {"r": 0.0, "outcome": "FLAT"}]
+        s = stats_mod.compute_stats(trades)
+        self.assertEqual(s["tp"], 0)   # the old, blind-spotted metric - confirms the bug is real
+        self.assertEqual(s["tp_pct"], 0.0)
+        self.assertAlmostEqual(s["win_pct"], 50.0, places=6)    # 2 of 4 trades have r > 0
+        self.assertAlmostEqual(s["loss_pct"], 50.0, places=6)   # r <= 0: the -1.0 and the 0.0 (breakeven)
+
+    def test_breakeven_trade_does_not_count_as_a_win(self):
+        trades = [{"r": 0.0}, {"r": 0.0}, {"r": 1.0}]
+        s = stats_mod.compute_stats(trades)
+        self.assertAlmostEqual(s["win_pct"], 100 / 3, places=6)
+        self.assertAlmostEqual(s["loss_pct"], 200 / 3, places=6)
 
     def test_single_trade_has_zero_z_score_and_a_degenerate_ci(self):
         # stdev is undefined for n=1 - z-score and CI must not crash, and should collapse to the

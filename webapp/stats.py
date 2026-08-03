@@ -178,6 +178,17 @@ def compute_stats(trades):
     tp = sum(1 for t in trades if t.get("outcome") == "TP")
     sl = sum(1 for t in trades if t.get("outcome") == "SL")
     flat = sum(1 for t in trades if t.get("outcome") == "FLAT")
+    # win/loss BY R, not by outcome label - "Win rate"/"Loss rate" in the UI use these, not
+    # tp_pct/sl_pct below. Research/*.py scripts use several different outcome-label conventions
+    # across this project (TP/SL/FLAT for fixed-target strategies, but STOP/FLAT for trailing-stop
+    # ones like Donchian/Dow Theory/Parabolic SAR, plus CROSS/SAR/TRAIL/PASS/FAIL/INCONCLUSIVE
+    # elsewhere) - tp_pct/sl_pct only ever match the literal strings "TP"/"SL", so a trailing-stop
+    # strategy that never produces either label showed a nonsensical "0% win rate" even when
+    # genuinely profitable (caught live: Parabolic SAR showed +1.8% holdout return AND 0% win
+    # rate in the same leaderboard row). A win is r > 0 regardless of what the exit was called;
+    # breakeven (r == 0) does not count as a win, matching this project's existing win_rate()
+    # convention in optimization_engine.py.
+    wins = sum(1 for r in r_values if r > 0)
     # Corrected formula, matching the project-wide fix in commit 85aca19: the old
     # z = avg_r / (1/sqrt(n)) implicitly assumed the R-multiple distribution has
     # stddev exactly 1, which is false and inflates every significance claim. Uses
@@ -205,6 +216,7 @@ def compute_stats(trades):
         "avg_r": avg_r,
         "tp": tp, "sl": sl, "flat": flat,
         "tp_pct": tp / n * 100, "sl_pct": sl / n * 100, "flat_pct": flat / n * 100,
+        "win_pct": wins / n * 100, "loss_pct": (n - wins) / n * 100,
         "z_score": z,
         "max_drawdown_r": max_drawdown(trades),
         "avg_r_ci_low": avg_r_ci_low, "avg_r_ci_high": avg_r_ci_high,
