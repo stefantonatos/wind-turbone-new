@@ -1,0 +1,7 @@
+streamlit>=1.38
+pandas>=2.0
+numpy>=1.24
+dukascopy-python>=4.0
+plotly>=5.20
+tqdm>=4.65
+requests>=2.28
