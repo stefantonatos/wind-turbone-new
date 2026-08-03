@@ -158,11 +158,14 @@ weekday filter (`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but Pine nu
 **never trades Friday**. This app defaults to real Monday-to-Friday trading (the
 behaviour the source code was evidently trying to express); set the Weekdays parameter to
 0 to reproduce the source's own Sun-Thu/no-Friday behaviour exactly, e.g. to reconcile a
-result against its TradingView report. Its entries fill at the next bar's open while the
-stop and target were computed
-from the previous bar's close, so the advertised 1:2 risk:reward is an intention rather
-than a measured property - the realised reward on winners varies well above and below 2R.
-And its "minimum SMMA separation" is an absolute price number (0.001), which is ~0.009% of
+result against its TradingView report. In the source, entries fill at the next bar's open
+while the stop and target were computed from the previous bar's close, so the source's
+advertised 1:2 risk:reward is an intention rather than a measured property - the realised
+reward on winners varies well above and below 2R (0.30R-4.62R on test data). This app
+defaults to filling at the signal bar's close instead, giving a clean, undistorted 2:1;
+set the fill-timing parameter to reproduce the source's real next-bar-open behaviour and
+see how much that convention was worth. And its "minimum SMMA separation" is an absolute
+price number (0.001), which is ~0.009% of
 EURUSD but ~0.00004% of gold, so on anything but a EUR-priced pair that filter is
 effectively switched off; it is expressed here as a percentage instead. There is also no
 time-based exit at all, so one position can sit open for days blocking every later signal.

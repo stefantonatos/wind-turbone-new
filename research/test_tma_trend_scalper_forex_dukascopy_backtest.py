@@ -342,8 +342,13 @@ class TestPatternDetection(unittest.TestCase):
 # ================================ the fill convention ================================
 
 class TestNextBarOpenFill(unittest.TestCase):
-    """The source computes the stop and target from the SIGNAL bar's close, then fills at the NEXT
-    bar's open. The realised risk and reward therefore are not the nominal 2x/4x."""
+    """FILL_AT_NEXT_OPEN defaults to 0 (fill at the signal bar's close - a clean, undistorted 2:1)
+    because that is the strategy actually being tested, not an audit of the Pine script's order-
+    fill quirk. The source itself computes the stop/target from the SIGNAL bar's close but fills at
+    the NEXT bar's open (FILL_AT_NEXT_OPEN=1), which is reproduced here as an explicit opt-in so it
+    can still be measured - every test that exercises IT sets the override explicitly rather than
+    relying on the module's current default, so a future default change can't silently invalidate
+    what these pin."""
 
     def _scenario_with_gap(self, gap_multiple):
         def follow(signal_bar):
@@ -354,9 +359,18 @@ class TestNextBarOpenFill(unittest.TestCase):
             return bars
         return build_scenario(_bull_strike_pattern, follow)
 
-    def test_a_favourable_gap_shrinks_the_risk_and_raises_the_reward_multiple(self):
+    def test_the_default_fills_at_the_signal_close_for_a_clean_two_r(self):
         df, signal = self._scenario_with_gap(0.5)
-        trades = run_scenario(df)
+        trades = run_scenario(df)          # no override - pins the actual shipped default
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertAlmostEqual(t["entry"], df["Close"].iloc[signal])
+        candle = df["High"].iloc[signal] - df["Low"].iloc[signal]
+        self.assertAlmostEqual(t["sl_distance"], candle * tma.STOP_CANDLE_MULT)
+
+    def test_next_open_fill_opt_in_shrinks_a_favourable_gaps_risk(self):
+        df, signal = self._scenario_with_gap(0.5)
+        trades = run_scenario(df, FILL_AT_NEXT_OPEN=1)
         self.assertEqual(len(trades), 1)
         t = trades[0]
         signal_close = df["Close"].iloc[signal]
@@ -366,29 +380,21 @@ class TestNextBarOpenFill(unittest.TestCase):
         self.assertAlmostEqual(t["entry"], expected_entry)
         self.assertAlmostEqual(t["sl_distance"], expected_entry - expected_stop)
         # Entry above the reference price: risk is larger than the nominal 2x candle, so the
-        # reward multiple on a win is BELOW the intended 2.0.
+        # reward multiple on a win is BELOW the intended 2.0 - this is the source's real behaviour.
         self.assertGreater(t["sl_distance"], candle * tma.STOP_CANDLE_MULT)
-
-    def test_filling_at_the_signal_close_gives_exactly_the_nominal_two_r(self):
-        df, signal = self._scenario_with_gap(0.5)
-        trades = run_scenario(df, FILL_AT_NEXT_OPEN=0)
-        self.assertEqual(len(trades), 1)
-        t = trades[0]
-        self.assertAlmostEqual(t["entry"], df["Close"].iloc[signal])
-        candle = df["High"].iloc[signal] - df["Low"].iloc[signal]
-        self.assertAlmostEqual(t["sl_distance"], candle * tma.STOP_CANDLE_MULT)
 
     def test_the_two_fill_conventions_produce_different_risk(self):
         df, _ = self._scenario_with_gap(0.5)
-        at_open = run_scenario(df)[0]["sl_distance"]
         at_close = run_scenario(df, FILL_AT_NEXT_OPEN=0)[0]["sl_distance"]
+        at_open = run_scenario(df, FILL_AT_NEXT_OPEN=1)[0]["sl_distance"]
         self.assertNotAlmostEqual(at_open, at_close)
 
-    def test_a_gap_straight_through_the_stop_is_skipped_not_scored(self):
+    def test_a_next_open_gap_straight_through_the_stop_is_skipped_not_scored(self):
         # Opening far BELOW the intended long stop leaves entry < stop: a negative risk. Scoring it
-        # would invent an instant winner out of an unfillable setup.
+        # would invent an instant winner out of an unfillable setup. Only the next-open-fill
+        # convention can produce this - filling at the signal close never gaps past its own stop.
         df, _ = self._scenario_with_gap(-5.0)
-        self.assertEqual(run_scenario(df), [])
+        self.assertEqual(run_scenario(df, FILL_AT_NEXT_OPEN=1), [])
 
     def test_hairline_signal_candle_is_skipped(self):
         def flat_signal(level):
@@ -397,7 +403,9 @@ class TestNextBarOpenFill(unittest.TestCase):
             bars[-1] = {"Open": mid, "High": mid + 1e-9, "Low": mid - 1e-9, "Close": mid}
             return bars
         df, _ = build_scenario(flat_signal, _hold_flat)
+        # Thin regardless of fill convention - the candle range itself is near-zero.
         self.assertEqual(run_scenario(df), [])
+        self.assertEqual(run_scenario(df, FILL_AT_NEXT_OPEN=1), [])
 
 
 # ================================ trade management ================================

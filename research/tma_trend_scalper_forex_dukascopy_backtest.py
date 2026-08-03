@@ -30,11 +30,11 @@
 #    signal bar. The gap between that close and the next open therefore shifts the real risk and
 #    the real reward away from the intended 2x/4x - sometimes favourably, sometimes not, and
 #    occasionally far enough that the entry is already past its own stop. The nominal "1:2 R:R" is
-#    an intention, not a measured property. This port reproduces the behaviour (see
-#    FILL_AT_NEXT_OPEN) and computes each trade's R from the prices actually used, so the
-#    distortion shows up in the results instead of being assumed away. Set FILL_AT_NEXT_OPEN = 0
-#    to fill at the signal bar's close instead and see how much of the result that one convention
-#    was worth.
+#    an intention in the source, not a measured property (0.30R-4.62R on test data). FILL_AT_NEXT_OPEN
+#    defaults to 0 here - fill at the signal bar's close, giving a clean, undistorted 2:1 - since
+#    that is the strategy actually being tested, not an audit of the Pine script's order-fill quirk.
+#    Set FILL_AT_NEXT_OPEN = 1 to reproduce the source's real next-bar-open behaviour instead and
+#    see how much that one fill-timing convention was worth.
 #
 # 3. minDist IS AN ABSOLUTE PRICE NUMBER, SO IT ONLY MEANS ANYTHING ON EURUSD. The source sets
 #    `minDist = 0.001` with a comment saying to adjust it per pair. As a raw price distance that
@@ -138,7 +138,8 @@ RSI_SMMA_LEN = 50
 # --- risk ---
 STOP_CANDLE_MULT = 2.0
 TARGET_CANDLE_MULT = 4.0
-FILL_AT_NEXT_OPEN = 1     # 1 = the source's real behaviour; 0 = fill at the signal bar's close. See note 2.
+FILL_AT_NEXT_OPEN = 0     # 0 = fill at the signal bar's close (clean, undistorted 2:1 - default);
+                           # 1 = the source's real next-bar-open behaviour. See note 2.
 MIN_STOP_PCT = 0.005      # % of price. A signal candle with a near-zero range would otherwise
                            # produce a hairline stop and an enormous R-multiple off one bar.
 

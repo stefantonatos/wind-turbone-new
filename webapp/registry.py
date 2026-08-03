@@ -963,13 +963,15 @@ def _build_registry():
                       tma_mod.STOP_CANDLE_MULT, 0.5, 6.0, 0.5),
             ParamSpec("TARGET_CANDLE_MULT", "Target = signal candle range x", "float",
                       tma_mod.TARGET_CANDLE_MULT, 0.5, 12.0, 0.5),
-            ParamSpec("FILL_AT_NEXT_OPEN", "Fill at next bar's open (1) or signal close (0)", "int",
+            ParamSpec("FILL_AT_NEXT_OPEN", "Fill at signal close (0) or next bar's open (1)", "int",
                       tma_mod.FILL_AT_NEXT_OPEN, 0, 1, 1,
-                      help="The source's strategy() call leaves process_orders_on_close at its "
-                           "default of false, so entries fill at the NEXT bar's open while the stop "
-                           "and target were already computed from THIS bar's close. That moves the "
-                           "realised risk and reward away from the nominal 1:2. 1 reproduces it; 0 "
-                           "fills at the signal close and shows how much that convention was worth."),
+                      help="Defaults to 0 - fill at the signal bar's close, giving a clean, "
+                           "undistorted 2:1 R:R. The source's strategy() call actually leaves "
+                           "process_orders_on_close at its default of false, so entries fill at the "
+                           "NEXT bar's open while the stop and target were computed from THIS bar's "
+                           "close - which moves the realised risk and reward away from the nominal "
+                           "1:2 (0.30R-4.62R on test data). Set to 1 to reproduce that real "
+                           "next-bar-open behaviour and see how much it was worth."),
             ParamSpec("MIN_STOP_PCT", "Minimum stop distance (% of price)", "float",
                       tma_mod.MIN_STOP_PCT, 0.0, 0.5, 0.001),
         ],
