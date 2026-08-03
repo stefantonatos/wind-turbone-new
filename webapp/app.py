@@ -750,9 +750,37 @@ def render_generic_param_sweep(strategy, instruments, start_date, end_date):
                "the best combination above.")
 
 
+def _render_known_pipeline_section(strategy, known_module):
+    """The heavy, real 4-step optimization/robustness pipeline for the couple of strategies with
+    a hand-wired research/<x>_optimization.py companion script (optimization.KNOWN_PIPELINES).
+    Shared between the Optimization & Robustness tab (reachable only after a plain "Run Backtest"
+    has already produced trades) and a standalone button on the run-config page - the companion
+    script has its own fixed instrument list and date range baked in (see its own "THE 4 STEPS"
+    header), so running it never actually depended on anything picked in the config console or on
+    a plain backtest having run first; this just removes that artificial requirement."""
+    strategy_id = strategy.id
+    st.caption(f"A real companion script ({known_module.rsplit('.', 1)[-1]}.py) exists for this strategy: a full "
+               f"parameter-stability grid, Monte Carlo resampling per cell, a cluster/plateau-vs-spike check, and "
+               f"a rolling walk-forward validation, run against real Dukascopy data using this script's own fixed "
+               f"instrument list and date range (independent of anything picked above). This is genuinely heavy - "
+               f"the script's own header warns 30 minutes to well over an hour end to end - so it only runs when "
+               f"you explicitly ask for it below.")
+
+    cache_key = f"opt_result_{strategy_id}"
+    if st.button("Run Deep Optimization (4-Step)", key=f"deep_opt_run_{strategy_id}"):
+        with st.spinner("Running the full 4-step optimization & robustness pass against real Dukascopy data - "
+                         "this can take a long time..."):
+            st.session_state[cache_key] = optimization.run_known_pipeline(strategy_id)
+
+    result = st.session_state.get(cache_key)
+    if result is None:
+        st.info("Not run yet this session - click the button above when you're ready to wait for it.")
+    else:
+        _render_optimization_result(result, strategy.optimization_module or known_module)
+
+
 def render_optimization_tab(strategy, instruments, start_date, end_date):
     strategy_id = strategy.id if strategy else None
-    opt_module_name = strategy.optimization_module if strategy else None
     known_module = optimization.known_pipeline_module_name(strategy_id)
 
     if known_module is None:
@@ -763,24 +791,7 @@ def render_optimization_tab(strategy, instruments, start_date, end_date):
         render_lockbox_section(strategy_id)
         return
 
-    st.caption(f"A real companion script ({known_module.rsplit('.', 1)[-1]}.py) exists for this strategy: a full "
-               f"parameter-stability grid, Monte Carlo resampling per cell, a cluster/plateau-vs-spike check, and "
-               f"a rolling walk-forward validation, run against real Dukascopy data. This is genuinely heavy - "
-               f"the script's own header warns 30 minutes to well over an hour end to end - so it only runs when "
-               f"you explicitly ask for it below, never automatically on opening this tab.")
-
-    cache_key = f"opt_result_{strategy_id}"
-    if st.button("Run full optimization & robustness pass", key=f"opt_run_{strategy_id}"):
-        with st.spinner("Running the full 4-step optimization & robustness pass against real Dukascopy data - "
-                         "this can take a long time..."):
-            st.session_state[cache_key] = optimization.run_known_pipeline(strategy_id)
-
-    result = st.session_state.get(cache_key)
-    if result is None:
-        st.info("Not run yet this session - click the button above when you're ready to wait for it.")
-    else:
-        _render_optimization_result(result, opt_module_name or known_module)
-
+    _render_known_pipeline_section(strategy, known_module)
     render_lockbox_section(strategy_id)
 
 
@@ -1262,6 +1273,18 @@ def _render_run_config(strategy):
         run_clicked = st.button("Run Backtest", type="primary", use_container_width=True,
                                  help="Fetches real historical data live from Dukascopy - nothing here is "
                                       "mocked or precomputed.")
+
+    # Standalone entry point into the heavy 4-step pipeline (grid search, Monte Carlo, walk-forward,
+    # cluster/plateau check) for the couple of strategies that have one - previously only reachable
+    # from the Optimization & Robustness tab, which itself only appeared after a plain "Run Backtest"
+    # had already produced trades. That requirement was never real: the companion script uses its own
+    # fixed instrument list and date range, not anything picked in the console above, so it never
+    # actually depended on a prior run - this just exposes it directly instead of gating it behind one.
+    known_module = optimization.known_pipeline_module_name(strategy.id)
+    if known_module is not None:
+        st.markdown("---")
+        st.markdown(eyebrow("DEEP OPTIMIZATION (4-STEP)"), unsafe_allow_html=True)
+        _render_known_pipeline_section(strategy, known_module)
 
     if run_clicked:
         if not selected_instruments:
