@@ -40,14 +40,39 @@
 # blob; rather than fail or silently skip it, that one entry just stays local-only for this
 # process and gets re-fetched for real next cold start, same as before this feature existed.
 
+import functools
 import hashlib
 import os
 import pickle
 from contextlib import contextmanager
 
 import dukascopy_python
+import requests
 
 import github_storage
+
+# dukascopy_python's own _fetch() calls requests.get(...) with no timeout= at all, and
+# requests has no default timeout of its own - if Dukascopy's server accepts the connection
+# but then stalls (never finishes the response), that single call blocks forever with no
+# exception ever raised, so _stream()'s own retry loop (which only triggers on an exception)
+# never kicks in either. From the outside this looks exactly like "stuck" with no way to
+# recover short of manually rebooting the whole app - confirmed live on the deployed app,
+# stuck on one strategy for 10+ minutes with a static progress bar. Patched here rather than
+# in the vendored package: only fills in a default when a caller didn't already pass timeout=
+# (github_storage.py's own requests calls already set one explicitly and are unaffected), so
+# a genuinely stalled connection now fails after a bounded time and surfaces as a real error
+# instead of hanging the whole run.
+_DUKASCOPY_HTTP_TIMEOUT_S = 30
+_original_requests_get = requests.get
+
+
+@functools.wraps(_original_requests_get)
+def _requests_get_with_default_timeout(*args, **kwargs):
+    kwargs.setdefault("timeout", _DUKASCOPY_HTTP_TIMEOUT_S)
+    return _original_requests_get(*args, **kwargs)
+
+
+requests.get = _requests_get_with_default_timeout
 
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "dukascopy_raw")
 _GITHUB_CACHE_PREFIX = "webapp_price_cache"
