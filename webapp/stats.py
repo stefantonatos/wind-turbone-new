@@ -131,15 +131,36 @@ def split_trades_for_holdout(trades, holdout_fraction=HOLDOUT_FRACTION):
 # firm pricing also varies by account type/promotion and changes over time - re-verify against
 # your actual firm's current conditions page before relying on this for a real decision, same
 # caveat this project's cost figures have always carried.
-DEFAULT_COST_PCT = 0.008   # instruments not in the table below - roughly the average of the four
-                            # researched instruments' own prop-firm cost below, not a fifth
-                            # independently-sourced number
+DEFAULT_COST_PCT = 0.009   # instruments not in the table below - roughly the mid of the four
+                            # figures below, not a fifth independently-sourced number
 TYPICAL_COST_PCT_BY_INSTRUMENT = {
-    "EURUSD": 0.011,   # ~$11.5/lot average (FTMO/FundedNext/The5ers) at ~1.08
-    "GBPUSD": 0.005,   # ~$6.2/lot average at ~1.27
-    "USDJPY": 0.005,   # ~$4.9/lot average at ~150
-    "XAUUSD": 0.009,   # ~$22/lot average at ~$2,600
+    # THE5ERS published raw spread + $4/lot round-turn commission, converted to % of a reference
+    # price. Worked example (EURUSD): 0.4 pip spread + $4/lot commission; a pip on a 100k lot is
+    # $10, so the commission is 0.4 pips, total 0.8 pips = 0.00008 price units = 0.0074% at 1.08.
+    #
+    # These REPLACE an earlier three-firm average whose per-instrument figures were partly
+    # inferred rather than sourced. Correcting them moved three of the four UP, not down - the
+    # old table was too harsh on EURUSD (0.011% vs 0.0074%) and too lenient on the other three,
+    # most notably USDJPY (0.005% vs 0.0079%, because a JPY pip is worth ~$6.67 not $10, so the
+    # same $4 commission costs MORE pips) and gold (0.009% vs 0.0135%).
+    "EURUSD": 0.0074,   # 0.4 pip spread + 0.4 pip commission  = 0.80 pips @ 1.08
+    "GBPUSD": 0.0063,   # 0.4 pip spread + 0.4 pip commission  = 0.80 pips @ 1.27
+    "USDJPY": 0.0079,   # 0.59 pip spread + 0.60 pip commission = 1.19 pips @ 150
+    "XAUUSD": 0.0135,   # $0.31/oz spread + $0.04/oz commission = $0.35/oz @ $2,600
 }
+# THREE THINGS THESE NUMBERS ARE NOT, stated so they don't get read as more than they are:
+#
+#   1. NOT firm-agnostic. The5ers is the cheapest of the three firms this project models. FTMO in
+#      particular runs wider, so a result that only just survives here would not survive there.
+#   2. NOT worst-case. These are AVERAGE spreads. They tighten on the London/New York overlap and
+#      widen materially at rollover and through the Asian session - which is exactly when several
+#      strategies in this catalog deliberately trade (London 3AM Range Reversal, Asian Range
+#      Breakout). Those strategies realistically pay more than the table says.
+#   3. NOT slippage. Spread and commission only. Stop-outs during fast moves fill worse than the
+#      exact stop level every backtest here assumes.
+#
+# All three push the same way: real costs are more likely to be higher than this than lower. Use
+# the Results page's Cost Sensitivity tab to see how much any of that would actually change.
 
 
 def cost_pct_for_instrument(instrument):
