@@ -921,6 +921,72 @@ def _build_registry():
         optimization_module=_find_optimization_module("research.evendyer_vwap_orb_dukascopy_backtest"),
     ))
 
+    # ---------------------------------------------------------------------------
+    # tma_trend_scalper_forex_dukascopy_backtest.py ("TMA Trend Scalper")
+    # Follows the _run_with_own_cache shape exactly (own pickle cache, FETCH_START/FETCH_END,
+    # fetch_instrument_data(label, const) -> df, backtest_instrument(label, df) -> trades).
+    # Trade keys: side, outcome, r, date, entry, sl_distance, stop_pct, pattern.
+    # ---------------------------------------------------------------------------
+    tma_mod = _load_module("research.tma_trend_scalper_forex_dukascopy_backtest")
+    entries.append(StrategyDef(
+        id="tma_trend_scalper",
+        name="TMA Trend Scalper (triple SMMA + pattern + RSI)",
+        module_name="research.tma_trend_scalper_forex_dukascopy_backtest",
+        granularity="5-min bars, London session only",
+        instruments=tma_mod.INSTRUMENTS,
+        params=[
+            ParamSpec("SESSION_START_HOUR", "Session start hour (UTC)", "int",
+                      tma_mod.SESSION_START_HOUR, 0, 23, 1),
+            ParamSpec("SESSION_END_HOUR", "Session end hour (UTC, exclusive)", "int",
+                      tma_mod.SESSION_END_HOUR, 1, 24, 1),
+            ParamSpec("WEEKDAY_FILTER_MODE", "Weekdays: 0 = source (Sun-Thu), 1 = Mon-Fri", "int",
+                      tma_mod.WEEKDAY_FILTER_MODE, 0, 1, 1,
+                      help="The source's `dayofweek >= 1 and <= 5` reads like Monday-Friday, but "
+                           "Pine numbers Sunday as 1 - so it actually trades Sunday to THURSDAY and "
+                           "never trades Friday. 0 reproduces that exactly (so this can be compared "
+                           "against the source's own report); 1 is what the code was trying to say. "
+                           "Run both - the gap between them is a free robustness check."),
+            ParamSpec("MIN_SEPARATION_PCT", "Min SMMA separation (% of price)", "float",
+                      tma_mod.MIN_SEPARATION_PCT, 0.0, 0.5, 0.001,
+                      help="The source hard-codes this as an absolute 0.001 price units with a note "
+                           "to adjust it per pair. That is ~0.009% of EURUSD but ~0.00004% of gold, "
+                           "so on anything but a EUR-priced pair the filter is effectively off. "
+                           "Expressed here as a percentage so it means the same thing everywhere; "
+                           "the default is the EURUSD-equivalent of the source's value."),
+            ParamSpec("ADX_MIN", "Minimum ADX", "float", tma_mod.ADX_MIN, 0.0, 60.0, 1.0),
+            ParamSpec("ATR_MIN_MULT", "ATR vs its 50-bar average (multiple)", "float",
+                      tma_mod.ATR_MIN_MULT, 0.0, 3.0, 0.1),
+            ParamSpec("SMMA_FAST_LEN", "Fast SMMA length", "int", tma_mod.SMMA_FAST_LEN, 5, 100, 1),
+            ParamSpec("SMMA_MED_LEN", "Medium SMMA length", "int", tma_mod.SMMA_MED_LEN, 10, 200, 5),
+            ParamSpec("SMMA_SLOW_LEN", "Slow SMMA length", "int", tma_mod.SMMA_SLOW_LEN, 50, 400, 10),
+            ParamSpec("STOP_CANDLE_MULT", "Stop = signal candle range x", "float",
+                      tma_mod.STOP_CANDLE_MULT, 0.5, 6.0, 0.5),
+            ParamSpec("TARGET_CANDLE_MULT", "Target = signal candle range x", "float",
+                      tma_mod.TARGET_CANDLE_MULT, 0.5, 12.0, 0.5),
+            ParamSpec("FILL_AT_NEXT_OPEN", "Fill at next bar's open (1) or signal close (0)", "int",
+                      tma_mod.FILL_AT_NEXT_OPEN, 0, 1, 1,
+                      help="The source's strategy() call leaves process_orders_on_close at its "
+                           "default of false, so entries fill at the NEXT bar's open while the stop "
+                           "and target were already computed from THIS bar's close. That moves the "
+                           "realised risk and reward away from the nominal 1:2. 1 reproduces it; 0 "
+                           "fills at the signal close and shows how much that convention was worth."),
+            ParamSpec("MIN_STOP_PCT", "Minimum stop distance (% of price)", "float",
+                      tma_mod.MIN_STOP_PCT, 0.0, 0.5, 0.001),
+        ],
+        facets=["pattern"],
+        notes="Ported from a public TradingView Pine strategy. Three things found in the source and "
+              "reproduced here rather than quietly fixed, each switchable above: its weekday filter "
+              "excludes FRIDAY and includes Sunday (Pine numbers Sunday as day 1); its entries fill "
+              "at the next bar's open while the stop and target come from the previous bar's close, "
+              "so the advertised 1:2 is an intention rather than a measured property; and its "
+              "'minimum SMMA separation' is an absolute price number only calibrated for EURUSD. "
+              "There is also NO time-based exit - a position can sit open for days blocking every "
+              "later signal, which is why a 'scalper' here can hold a trade for weeks. Trades are "
+              "tagged by pattern (3-line strike / engulfing / both) for the Pattern filter.",
+        runner=_run_with_own_cache,
+        default_history_days=2 * 365,
+    ))
+
     # RANDOM ENTRY CONTROL - listed LAST on purpose so it reads as the yardstick at the bottom of
     # the catalog rather than as strategy #17. It is the reference line every other row should be
     # compared against: coin-flip entries, zero edge by construction, run through the identical

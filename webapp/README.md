@@ -118,21 +118,27 @@ minutes again after sitting idle. `data_cache.py` now pushes each fetched chunk 
 same dedicated GitHub branch (binary-safe, since a pickled price DataFrame isn't UTF-8
 text - see `github_storage.read_file_bytes`/`write_file_bytes`) and pulls it back
 before ever hitting Dukascopy again on a cold start. No separate setup - the same
-`GITHUB_TOKEN`/`GITHUB_REPO` secrets above cover both. One cap worth knowing: a single
-cached chunk over ~8MB (`data_cache._MAX_GITHUB_BLOB_BYTES`) just stays local-only for
-that process instead of syncing - only realistic on a manually widened, non-default
-date range - and gets re-fetched for real on the next cold start, same as before this
-existed.
+`GITHUB_TOKEN`/`GITHUB_REPO` secrets above cover both.
+
+**The real cap here is smaller than it looks, and it is a genuine limit rather than a
+tuning knob.** GitHub's Contents API rejects anything much over ~1MB, and base64 inflates
+the payload by a third on top of that, so `data_cache._MAX_GITHUB_BLOB_BYTES` sits at
+700KB. Run-history JSON compresses roughly 290x and fits comfortably. Pickled float64 OHLC
+frames compress about 1.2x - they are near-incompressible - so a wide date range's price
+cache genuinely does not fit this backend and stays local-only, getting re-fetched on the
+next cold start. Oversized content now fails fast with a distinct error before any network
+call rather than burning a doomed request per chunk. Fixing this properly needs an object
+store or the Git Data blobs API, not a larger constant.
 
 ## Strategies in the registry
 
-17 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
+18 total: ICT Power of Three, Scam or Slam (Day Trading Rauf), Donchian/Turtle Breakout,
 MA Golden/Death Cross, Bollinger Band Mean-Reversion, RSI Mean-Reversion, Asian Range
 Breakout, Dow Theory Swing Structure, Bollinger Squeeze Breakout, Climax Volume Reversal,
 Support/Resistance Zone Bounce, Parabolic SAR (Stop-and-Reverse), ICT Silver Bullet,
 London 3AM Range Reversal, ORB (indices), Big Daddy Max ORB + Failed-Breakout Reversal
-(indices), and EvenDyer VWAP ORB. Plus the random-entry control, and a **Momentum** page
-outside the registry (see below).
+(indices), EvenDyer VWAP ORB, and TMA Trend Scalper. Plus the random-entry control, and a
+**Momentum** page outside the registry (see the top-level README).
 
 Big Daddy Max ORB is a port of a public TradingView Pine strategy. Two things about it are
 worth knowing before reading its numbers. First, the source's own published result
@@ -144,6 +150,18 @@ strategies sharing one script: a breakout leg and a failed-breakout reversal leg
 the opposite way. Every trade is tagged `continuation` or `reversal`, and the **Trade type**
 filter separates them - read them apart before reading the total, or a profitable leg and a
 losing one will average into a meaningless middle.
+
+TMA Trend Scalper is also a Pine port, and porting it surfaced three things in the source
+worth knowing, all reproduced rather than quietly fixed and all switchable from the
+parameters. Its weekday filter (`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but
+Pine numbers **Sunday** as day 1 - so it trades Sunday through Thursday and **never trades
+Friday**. Its entries fill at the next bar's open while the stop and target were computed
+from the previous bar's close, so the advertised 1:2 risk:reward is an intention rather
+than a measured property - the realised reward on winners varies well above and below 2R.
+And its "minimum SMMA separation" is an absolute price number (0.001), which is ~0.009% of
+EURUSD but ~0.00004% of gold, so on anything but a EUR-priced pair that filter is
+effectively switched off; it is expressed here as a percentage instead. There is also no
+time-based exit at all, so one position can sit open for days blocking every later signal.
 
 Parabolic SAR is the first strategy in this catalog sourced from an actual open-source
 repository (je-suis-tm/quant-trading, Apache 2.0) rather than a Pine script or a video
