@@ -215,12 +215,13 @@ def render_filterable_results(trades, strategy, key_prefix):
         set_cols = st.columns([1.5, 1.1, 1.1, 2.3])
         apply_costs = set_cols[0].checkbox("Apply typical trading costs", value=True,
                                              key=f"{key_prefix}_apply_costs",
-                                             help="Deducts a typical retail round-trip spread cost per "
-                                                  "instrument from every trade (see stats.py's "
-                                                  "TYPICAL_COST_PCT_BY_INSTRUMENT) - every backtest here "
-                                                  "runs with ZERO cost modeled by default, so this is on by "
-                                                  "default to avoid overstating what's achievable. Turn off "
-                                                  "to see the underlying research script's raw numbers.")
+                                             help="Deducts a typical PROP FIRM round-trip cost (raw spread + "
+                                                  "per-lot commission, averaged across FTMO/FundedNext/The5ers "
+                                                  "- see stats.py's TYPICAL_COST_PCT_BY_INSTRUMENT) per "
+                                                  "instrument from every trade - every backtest here runs with "
+                                                  "ZERO cost modeled by default, so this is on by default to "
+                                                  "avoid overstating what's achievable. Turn off to see the "
+                                                  "underlying research script's raw numbers.")
         display_mode = set_cols[1].radio("Units", ["% of account", "R-multiples"], index=0,
                                           key=f"{key_prefix}_display_mode", label_visibility="collapsed")
         risk_pct = set_cols[2].number_input("Risk/trade %", min_value=0.05, max_value=10.0, value=1.0,

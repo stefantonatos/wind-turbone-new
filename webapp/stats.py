@@ -57,7 +57,7 @@ def split_trades_for_holdout(trades, holdout_fraction=HOLDOUT_FRACTION):
     return trades[:split_idx], trades[split_idx:], False
 
 
-# --- typical retail trading cost, applied by DEFAULT everywhere this app shows results -----
+# --- typical PROP FIRM trading cost, applied by DEFAULT everywhere this app shows results ---
 # Every backtest in this project runs with NO commission/spread/slippage modeled (see each
 # research/*.py script's own header caveat) - each script's own "COST SENSITIVITY" section only
 # ever showed a few illustrative what-if scenarios, never actually applied to the headline
@@ -66,23 +66,46 @@ def split_trades_for_holdout(trades, holdout_fraction=HOLDOUT_FRACTION):
 # already recorded on most trades project-wide since the cost-sensitivity rollout) - applied to
 # every metric, chart, and leaderboard by default, not just an optional report line.
 #
-# SOURCING (same discipline as prop_firm_presets.py - real, checkable, gaps flagged honestly,
-# not guessed): figures below are TYPICAL RETAIL STANDARD-ACCOUNT round-trip spreads, order-of-
-# magnitude from public broker-comparison sources (checked August 2026: EURUSD ~0.6-1.0 pip,
-# GBPUSD ~0.6-1.5 pip, USDJPY ~0.1-0.7 pip typical across tested standard accounts; XAUUSD
-# ~20-35 "pip"/$0.20-0.35 typical standard-account spread), deliberately rounded toward the
-# WIDER/more conservative end of each range - those sources mostly test best-in-class/ECN
-# conditions, and understating cost is the more dangerous error for a tool people might trade
-# real money on. These are NOT live, NOT broker-specific, and exclude commission (many ECN
-# accounts charge a separate per-lot fee on top of a tighter spread) and slippage entirely.
-# Re-verify against your actual broker before relying on this for a real decision.
-DEFAULT_COST_PCT = 0.03   # instruments not in the table below - matches the middle scenario
-                           # every research script's own COST_PCT_SCENARIOS already prints
+# WHY PROP FIRM COSTS, NOT RETAIL: this app's own Prop Firm Fit section (render_prop_firm_fit_
+# section) and prop_firm_presets.py already frame the whole tool around "would this pass a real
+# funded-account evaluation" - the cost model below now matches that framing instead of a generic
+# retail account nobody using this tool for that purpose would actually be trading on.
+#
+# SOURCING (same discipline as prop_firm_presets.py - real, checkable, gaps flagged honestly, not
+# guessed - researched via web search, August 2026): the three firms prop_firm_presets.py already
+# models (FTMO, FundedNext, The5ers) all run RAW/ECN-style pricing - a near-zero base spread plus
+# a separate per-lot $ commission - genuinely different from a retail "standard account"'s single
+# wider all-in spread with no separate commission. Figures below are each firm's own round-trip
+# cost (spread + commission, converted to $ per 1.0 standard lot - 100,000 units FX, 100 oz gold -
+# then to %-of-reference-price, same reference prices the old retail table used: EURUSD ~1.08,
+# GBPUSD ~1.27, USDJPY ~150, XAUUSD ~2,600), AVERAGED across the three firms, not any one firm's
+# exact number - a real trader would be on one specific firm/account type, not an average of three.
+#   EURUSD: FTMO ~1-3 pip spread via its approved liquidity providers (own commission unclear from
+#     sources checked) ~$20-24/lot; FundedNext ~0.0-0.2 pip + $5/lot ~$6-7/lot; The5ers ~0.0 pip +
+#     $4/lot ~$4/lot. Average ~$11.5/lot -> ~0.011%.
+#   GBPUSD: FTMO 0.5 pip + $3/lot ~$8/lot (fxverify.com's FTMO-specific spread comparison);
+#     FundedNext/The5ers assumed similar to their own EURUSD structure (no GBP-specific figures
+#     found) ~$6.5/$4/lot. Average ~$6.2/lot -> ~0.005%.
+#   USDJPY: FTMO 0.4 pip + $3/lot ~$5.7/lot; FundedNext/The5ers not specifically found, assumed
+#     similar to their EURUSD structure ~$5/$4/lot. Average ~$4.9/lot -> ~0.005%.
+#   XAUUSD: FTMO ~$0.15-0.30/oz spread (own commission not found) ~$22-28/lot; FundedNext ~$0.10-
+#     0.25/oz raw spread + $7/lot ~$24.5/lot; The5ers ~$0.10/oz + $4/lot (its own generic "Forex
+#     and Gold carry a $4 commission" note) ~$14/lot. Average ~$22/lot -> ~0.009%.
+# GENUINE GAPS, flagged rather than papered over: FTMO's own per-instrument commission (Normal vs.
+# Swing account types charge differently) and FundedNext/The5ers' GBPUSD/USDJPY-specific figures
+# weren't confirmed from the sources checked - those cells above lean on the same firm's EURUSD
+# structure as the closest available estimate, not a confirmed number for that exact pair. Prop
+# firm pricing also varies by account type/promotion and changes over time - re-verify against
+# your actual firm's current conditions page before relying on this for a real decision, same
+# caveat this project's cost figures have always carried.
+DEFAULT_COST_PCT = 0.008   # instruments not in the table below - roughly the average of the four
+                            # researched instruments' own prop-firm cost below, not a fifth
+                            # independently-sourced number
 TYPICAL_COST_PCT_BY_INSTRUMENT = {
-    "EURUSD": 0.01,    # ~0.8-1.0 pip typical retail standard-account spread at ~1.08
-    "GBPUSD": 0.015,   # ~1.2-1.5 pip at ~1.27
-    "USDJPY": 0.01,    # ~0.5-0.7 pip at ~150 (some brokers tighter; kept conservative)
-    "XAUUSD": 0.02,    # ~20-30 "pip" ($0.20-0.30) standard-account gold spread at ~$2,600
+    "EURUSD": 0.011,   # ~$11.5/lot average (FTMO/FundedNext/The5ers) at ~1.08
+    "GBPUSD": 0.005,   # ~$6.2/lot average at ~1.27
+    "USDJPY": 0.005,   # ~$4.9/lot average at ~150
+    "XAUUSD": 0.009,   # ~$22/lot average at ~$2,600
 }
 
 
