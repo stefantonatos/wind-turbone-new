@@ -18,10 +18,10 @@
 #    1 for SUNDAY through 7 for Saturday, so 1..5 is Sunday-to-Thursday. On forex the 07:00-15:00
 #    Sunday window is closed, so the practical effect is that the strategy trades Monday through
 #    THURSDAY and never trades Friday - roughly a fifth of the available sessions, silently
-#    dropped. WEEKDAY_FILTER_MODE below defaults to 0, reproducing the source exactly so this port
-#    can be compared against the source's own report; set it to 1 for the Monday-Friday behaviour
-#    the code was evidently trying to express. Run both - the difference is a free robustness
-#    check that costs nothing to look at.
+#    dropped. WEEKDAY_FILTER_MODE below defaults to 1 - real Monday-to-Friday London trading, the
+#    behaviour the code was evidently trying to express - since that is what this project is
+#    actually testing. Set it to 0 to reproduce the source's own Sun-Thu/no-Friday behaviour
+#    exactly, e.g. to reconcile a result against the source's own TradingView report.
 #
 # 2. ORDERS FILL AT THE NEXT BAR'S OPEN, BUT THE STOP AND TARGET ARE COMPUTED FROM THIS BAR'S
 #    CLOSE. The Pine's strategy() call does not set process_orders_on_close, which defaults to
@@ -110,7 +110,9 @@ DUKASCOPY_OFFER_SIDE = dukascopy_python.OFFER_SIDE_BID
 # London session either way, which is plainly what "London Session Only" intended.
 SESSION_START_HOUR = 7
 SESSION_END_HOUR = 15
-WEEKDAY_FILTER_MODE = 0   # 0 = as the source behaves (Sun-Thu, no Friday); 1 = Mon-Fri. See note 1.
+WEEKDAY_FILTER_MODE = 1   # 0 = as the source behaves (Sun-Thu, no Friday); 1 = Mon-Fri (default -
+                           # this project trades the real London week, not the source's off-by-one).
+                           # See note 1.
 
 # --- trend stack ---
 SMMA_FAST_LEN = 21

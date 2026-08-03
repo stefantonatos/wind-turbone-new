@@ -152,10 +152,14 @@ filter separates them - read them apart before reading the total, or a profitabl
 losing one will average into a meaningless middle.
 
 TMA Trend Scalper is also a Pine port, and porting it surfaced three things in the source
-worth knowing, all reproduced rather than quietly fixed and all switchable from the
-parameters. Its weekday filter (`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but
-Pine numbers **Sunday** as day 1 - so it trades Sunday through Thursday and **never trades
-Friday**. Its entries fill at the next bar's open while the stop and target were computed
+worth knowing, all reproduced as a switchable option rather than silently discarded. Its
+weekday filter (`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but Pine numbers
+**Sunday** as day 1 - so as literally written it trades Sunday through Thursday and
+**never trades Friday**. This app defaults to real Monday-to-Friday trading (the
+behaviour the source code was evidently trying to express); set the Weekdays parameter to
+0 to reproduce the source's own Sun-Thu/no-Friday behaviour exactly, e.g. to reconcile a
+result against its TradingView report. Its entries fill at the next bar's open while the
+stop and target were computed
 from the previous bar's close, so the advertised 1:2 risk:reward is an intention rather
 than a measured property - the realised reward on winners varies well above and below 2R.
 And its "minimum SMMA separation" is an absolute price number (0.001), which is ~0.009% of

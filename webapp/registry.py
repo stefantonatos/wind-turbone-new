@@ -939,13 +939,13 @@ def _build_registry():
                       tma_mod.SESSION_START_HOUR, 0, 23, 1),
             ParamSpec("SESSION_END_HOUR", "Session end hour (UTC, exclusive)", "int",
                       tma_mod.SESSION_END_HOUR, 1, 24, 1),
-            ParamSpec("WEEKDAY_FILTER_MODE", "Weekdays: 0 = source (Sun-Thu), 1 = Mon-Fri", "int",
+            ParamSpec("WEEKDAY_FILTER_MODE", "Weekdays: 1 = Mon-Fri, 0 = source (Sun-Thu)", "int",
                       tma_mod.WEEKDAY_FILTER_MODE, 0, 1, 1,
-                      help="The source's `dayofweek >= 1 and <= 5` reads like Monday-Friday, but "
-                           "Pine numbers Sunday as 1 - so it actually trades Sunday to THURSDAY and "
-                           "never trades Friday. 0 reproduces that exactly (so this can be compared "
-                           "against the source's own report); 1 is what the code was trying to say. "
-                           "Run both - the gap between them is a free robustness check."),
+                      help="Defaults to 1 - real Monday-to-Friday London trading. The source's "
+                           "`dayofweek >= 1 and <= 5` reads like Monday-Friday, but Pine numbers "
+                           "Sunday as 1 - so as literally written it trades Sunday to THURSDAY and "
+                           "never trades Friday. Set to 0 to reproduce that exactly, e.g. to "
+                           "reconcile a result against the source's own TradingView report."),
             ParamSpec("MIN_SEPARATION_PCT", "Min SMMA separation (% of price)", "float",
                       tma_mod.MIN_SEPARATION_PCT, 0.0, 0.5, 0.001,
                       help="The source hard-codes this as an absolute 0.001 price units with a note "
