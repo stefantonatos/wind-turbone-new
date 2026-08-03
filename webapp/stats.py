@@ -483,6 +483,31 @@ def dollar_equity_curve(trades, risk_pct, starting_balance=10000.0):
     return xs, equity, has_dates
 
 
+def fixed_fraction_dollar_equity_curve(trades, risk_pct, starting_balance=10000.0):
+    """Same ordering convention as dollar_equity_curve(), but ADDITIVE rather than compounded:
+    every trade risks risk_pct% of the STARTING balance, never the current one, so the curve is
+    starting_balance * (1 + cumulative_r * risk_pct / 100) - no compounding, no volatility drag.
+
+    Unlike dollar_equity_curve() this is NOT bounded below at zero. A long enough losing streak
+    can drive it negative, which is the real (if extreme) consequence of never resizing risk down
+    as the account shrinks - shown as-is rather than floored, since hiding it would misrepresent
+    what "fixed dollar risk" actually does to an account. This is also exactly why prop firms and
+    real trading accounts risk a % of CURRENT balance instead (see dollar_equity_curve) - this
+    mode exists to isolate the R-multiples themselves from compounding's volatility drag, at the
+    cost of allowing this otherwise-impossible account state.
+
+    Returns (x_labels, equity_dollars, chronological)."""
+    has_dates = all(t.get("date") for t in trades)
+    ordered = sorted(trades, key=lambda t: str(t.get("date"))) if has_dates else list(trades)
+    xs, equity = [], []
+    cum_r = 0.0
+    for i, t in enumerate(ordered):
+        cum_r += t.get("r", 0.0) or 0.0
+        xs.append(i + 1)
+        equity.append(starting_balance * (1.0 + (cum_r * risk_pct) / 100.0))
+    return xs, equity, has_dates
+
+
 def daily_pnl(trades):
     """Groups trades by calendar date, summing 'r' per day. Returns {date: total_r} for every
     date that had at least one trade (dates with zero trades are simply absent - the caller

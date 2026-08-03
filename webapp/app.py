@@ -254,6 +254,28 @@ def render_filterable_results(trades, strategy, key_prefix):
         set_cols[3].caption("Costs applied (typical, not live broker data)" if apply_costs
                              else "⚠ RAW - no costs deducted")
 
+        sizing_mode = "compounding"
+        if display_mode == "% of account":
+            sizing_cols = st.columns([2.0, 3.7])
+            sizing_choice = sizing_cols[0].radio(
+                "Position sizing", ["Compounding (% of current balance)", "Fixed $ (of starting balance)"],
+                index=0, key=f"{key_prefix}_sizing_mode", label_visibility="collapsed")
+            sizing_mode = "fixed" if sizing_choice.startswith("Fixed") else "compounding"
+            if sizing_mode == "fixed":
+                sizing_cols[1].caption(
+                    "Removes compounding's volatility drag, isolating the raw R-multiples - a "
+                    "symmetric 50/50 bet nets to ~0% here even over thousands of trades. But it "
+                    "can show an impossible negative balance on a bad enough run, since risk is "
+                    "never resized down as the account shrinks. Real prop accounts (and every "
+                    "prop-firm rule this app models) compound instead - use this to see how much "
+                    "of a result is edge vs. drag, not as a realistic account simulation.")
+            else:
+                sizing_cols[1].caption(
+                    "Risks % of the CURRENT balance each trade, same as every prop-firm rule this "
+                    "app models. A long, high-trade-count run drifts toward a loss from "
+                    "compounding's volatility drag ALONE, even at exactly zero real edge - switch "
+                    "to 'Fixed $' to isolate the R-multiples from that effect.")
+
     filtered = []
     for t in trades:
         if sel_outcomes and t.get("outcome") not in sel_outcomes:
@@ -297,13 +319,17 @@ def render_filterable_results(trades, strategy, key_prefix):
     unit_fmt = "{:+.2f}%" if display_mode == "% of account" else "{:+.3f}R"
     s_display = stats_mod.compute_stats(display_trades)
 
-    # "Total" is COMPOUNDED for the "% of account" unit, not the naive sum compute_stats returns
-    # (which treats every trade as risking a fixed dollar amount off the STARTING balance
-    # forever - fine for R-multiples themselves, which are meant to sum, but it can show an
-    # impossible return past -100% once losses accumulate over enough trades). R-multiples stay
-    # additive (that IS what a raw R total means) - see stats.compounded_return_pct's own
-    # docstring for the full reasoning.
-    if unit_label == "%":
+    # "Total" is COMPOUNDED for the "% of account" unit by default, not the naive sum
+    # compute_stats returns (which treats every trade as risking a fixed dollar amount off the
+    # STARTING balance forever - fine for R-multiples themselves, which are meant to sum, but it
+    # can show an impossible return past -100% once losses accumulate over enough trades).
+    # Compounding is also exactly what introduces volatility drag (a symmetric 50/50 bet drifts to
+    # a loss purely from resizing risk against a moving balance) - the "Fixed $" sizing mode above
+    # switches back to the additive/naive numbers on purpose, to isolate the R-multiples from that
+    # effect. Both are already sitting in s_display (pre-scaled by risk_pct via scale_trades_r) for
+    # that mode - no separate computation needed. R-multiples stay additive either way (that IS
+    # what a raw R total means) - see stats.compounded_return_pct's own docstring for more.
+    if unit_label == "%" and sizing_mode == "compounding":
         total_display = stats_mod.compounded_return_pct(filtered, risk_pct)
         total_ci_low, total_ci_high = stats_mod.compounded_return_ci(
             s["avg_r_ci_low"], s["avg_r_ci_high"], risk_pct, s["n_trades"])
@@ -329,8 +355,11 @@ def render_filterable_results(trades, strategy, key_prefix):
                                    help=f"95% CI: {unit_fmt.format(total_ci_low)} to "
                                         f"{unit_fmt.format(total_ci_high)} (normal "
                                         f"approximation - wide on a small sample, not a guarantee)."
-                                        + (" Compounded (risking % of current balance each trade), "
+                                        + (" Compounded (risking % of CURRENT balance each trade), "
                                            "not a naive sum - can approach but never cross -100%."
+                                           if unit_label == "%" and sizing_mode == "compounding"
+                                           else " Fixed $ sizing: risks % of the STARTING balance "
+                                                "every trade, no compounding - can go past -100%."
                                            if unit_label == "%" else ""))
             avg_fmt = unit_fmt if unit_label == "R" else "{:+.3f}%"
             metric_cols[2].metric(f"Avg {unit_label}/trade", avg_fmt.format(s_display["avg_r"]),
@@ -346,6 +375,8 @@ def render_filterable_results(trades, strategy, key_prefix):
                                         "below, not the worst single losing trade."
                                         + (" Compounded, same reasoning as Total % above - bounded to "
                                            "[0, 100]%, unlike a naive additive drawdown."
+                                           if unit_label == "%" and sizing_mode == "compounding"
+                                           else " Fixed $ sizing: additive, not bounded to 100%."
                                            if unit_label == "%" else ""))
             metric_cols[6].metric("z-score", f"{s_display['z_score']:.2f}",
                                    help="Approximate significance vs. zero edge - scale-invariant (same in "
@@ -358,11 +389,17 @@ def render_filterable_results(trades, strategy, key_prefix):
                        f"as rankable. Directional at best, not evidence either way.")
 
         st.markdown(eyebrow("EQUITY CURVE (ACCOUNT \\$, \\$10,000 START)"), unsafe_allow_html=True)
-        xs, equity, chronological = stats_mod.dollar_equity_curve(filtered, risk_pct)
+        if sizing_mode == "fixed":
+            xs, equity, chronological = stats_mod.fixed_fraction_dollar_equity_curve(filtered, risk_pct)
+        else:
+            xs, equity, chronological = stats_mod.dollar_equity_curve(filtered, risk_pct)
         render_dollar_equity_chart(xs, equity, chronological, key=f"{key_prefix}_equity_chart")
-        st.caption(f"\\${risk_pct:.2f}% risked/trade, green above \\$10,000 red below - a sizing assumption "
-                   f"for this chart only." + ("" if chronological else " Order shown is backtest sequence, "
-                   "not calendar order (no date field upstream)."))
+        sizing_caption = ("compounded (% of current balance)" if sizing_mode == "compounding"
+                           else "fixed $ (% of starting balance, no compounding)")
+        st.caption(f"\\${risk_pct:.2f}% risked/trade, {sizing_caption}, green above \\$10,000 red "
+                   f"below - a sizing assumption for this chart only." +
+                   ("" if chronological else " Order shown is backtest sequence, not calendar "
+                    "order (no date field upstream)."))
 
     with result_tabs["Breakdown"]:
         st.markdown(eyebrow("PER-INSTRUMENT BREAKDOWN"), unsafe_allow_html=True)
