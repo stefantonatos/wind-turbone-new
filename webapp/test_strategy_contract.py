@@ -52,9 +52,19 @@ def _source_for(strategy):
 
 
 def _writes_key(source, key):
-    """True if the module ever writes `"<key>":` into a dict literal - i.e. actually emits it on a
-    trade, as opposed to merely mentioning it in a comment or reading it back."""
-    return re.search(r'"%s"\s*:' % re.escape(key), source) is not None
+    """True if the module ever WRITES the key onto a trade, as opposed to merely mentioning it in a
+    comment or reading it back. Two forms count, because both are in use in research/:
+
+        trades.append({"stop_pct": risk / entry})   <- dict literal
+        trade["window"] = window_label              <- subscript assignment after the fact
+
+    Only matching the first form would have reported ICT Silver Bullet's `window` facet as missing
+    when it is emitted on every trade. A read (`t["window"]`, `t["window"] == x`) must not match -
+    that is the whole distinction this checker exists to draw."""
+    quoted = re.escape(key)
+    in_dict_literal = re.search(r'"%s"\s*:' % quoted, source)
+    by_assignment = re.search(r'\[\s*"%s"\s*\]\s*=(?!=)' % quoted, source)
+    return bool(in_dict_literal or by_assignment)
 
 
 class TestEveryStrategyRecordsStopPct(unittest.TestCase):
@@ -78,6 +88,43 @@ class TestEveryStrategyRecordsDate(unittest.TestCase):
                                        f"time): {missing}")
 
 
+class TestEveryDeclaredFacetIsActuallyEmitted(unittest.TestCase):
+    """A StrategyDef's `facets` list names extra trade-dict keys the Results page turns into filter
+    dropdowns. app.py builds each one with `{t.get(facet) for t in trades}` - so a facet naming a
+    key the strategy never writes produces an EMPTY multiselect that filters nothing, with no error
+    anywhere. Same silent-failure shape as the two bugs this file was written for."""
+
+    def test_all_declared_facets_are_written_by_their_strategy(self):
+        broken = [(s.name, facet) for s in registry.STRATEGIES for facet in s.facets
+                  if not _writes_key(_source_for(s), facet)]
+        self.assertEqual(broken, [], f"facets declared in the registry but never written onto a "
+                                      f"trade (they'd render as empty filter dropdowns): {broken}")
+
+
+class TestFacetLabelRendering(unittest.TestCase):
+    """Facet keys are snake_case; the filter label shown to a user should not be. Pinned because
+    the transform is easy to drop back to a bare .capitalize() during unrelated edits, and the
+    result ("Trade_type") is ugly rather than broken, so nothing else would catch it."""
+
+    @staticmethod
+    def _label(facet):
+        return facet.replace("_", " ").capitalize()
+
+    def test_multiword_facet_keys_render_as_words(self):
+        self.assertEqual(self._label("trade_type"), "Trade type")
+
+    def test_single_word_facet_keys_are_unchanged_apart_from_the_capital(self):
+        self.assertEqual(self._label("pattern"), "Pattern")
+        self.assertEqual(self._label("range"), "Range")
+
+    def test_every_registered_facet_produces_a_clean_label(self):
+        for strategy in registry.STRATEGIES:
+            for facet in strategy.facets:
+                label = self._label(facet)
+                self.assertNotIn("_", label, f"{strategy.name}'s '{facet}' facet renders as {label!r}")
+                self.assertTrue(label[:1].isupper())
+
+
 class TestContractCheckerItself(unittest.TestCase):
     """The checker is only worth anything if it actually distinguishes the two cases - a test that
     passes vacuously would have hidden both original bugs just as well as no test at all."""
@@ -85,11 +132,18 @@ class TestContractCheckerItself(unittest.TestCase):
     def test_detects_a_key_written_into_a_dict(self):
         self.assertTrue(_writes_key('trades.append({"stop_pct": x / y})', "stop_pct"))
 
+    def test_detects_a_key_written_by_subscript_assignment(self):
+        self.assertTrue(_writes_key('trade["window"] = window_label', "window"))
+
     def test_ignores_a_key_only_mentioned_in_prose(self):
         self.assertFalse(_writes_key("# stop_pct is what the cost model keys off", "stop_pct"))
 
     def test_ignores_a_key_only_read_back(self):
         self.assertFalse(_writes_key('sp = t.get("stop_pct")\nif t["stop_pct"]:', "stop_pct"))
+
+    def test_ignores_a_subscript_comparison(self):
+        # `==` is a read, not a write - the (?!=) guard in the pattern is what makes this hold.
+        self.assertFalse(_writes_key('if t["window"] == "10am":', "window"))
 
 
 if __name__ == "__main__":
