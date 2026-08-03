@@ -262,12 +262,12 @@ def _hold_flat(signal_bar, n=6):
             for _ in range(n)]
 
 
-def run_scenario(df, **overrides):
+def run_scenario(df, label="TEST", **overrides):
     overrides.setdefault("WEEKDAY_FILTER_MODE", 1)
     overrides.setdefault("SESSION_START_HOUR", 0)
     overrides.setdefault("SESSION_END_HOUR", 24)
     with config(**overrides):
-        return tma.backtest_instrument("TEST", df)
+        return tma.backtest_instrument(label, df)
 
 
 class TestScenarioHarness(unittest.TestCase):
@@ -295,8 +295,36 @@ class TestScenarioHarness(unittest.TestCase):
         # Each of these makes one gate unsatisfiable; the trade must disappear in every case.
         self.assertEqual(run_scenario(df, ADX_MIN=101.0), [])
         self.assertEqual(run_scenario(df, ATR_MIN_MULT=1000.0), [])
-        self.assertEqual(run_scenario(df, MIN_SEPARATION_PCT=100.0), [])
+        # "TEST" isn't a key in MIN_SEPARATION_ABS_BY_INSTRUMENT, so it falls back to
+        # DEFAULT_MIN_SEPARATION_ABS - overriding that is how to make the separation gate bind here.
+        self.assertEqual(run_scenario(df, DEFAULT_MIN_SEPARATION_ABS=100.0), [])
         self.assertEqual(run_scenario(df, SESSION_START_HOUR=23, SESSION_END_HOUR=24), [])
+
+
+class TestPerInstrumentSeparationTable(unittest.TestCase):
+    """MIN_SEPARATION_ABS_BY_INSTRUMENT holds the writeup's own per-pair values (0.001 for EURUSD/
+    GBPUSD/AUDUSD, 0.10 for USDJPY) as absolute price distances, not a synthetic percentage - so the
+    same scenario must be read differently depending on which instrument label is passed in."""
+
+    def test_the_three_majors_share_the_tight_threshold(self):
+        df, _ = build_scenario(_bull_strike_pattern, _hold_flat)
+        for label in ("EURUSD", "GBPUSD", "AUDUSD"):
+            trades = run_scenario(df, label=label)
+            self.assertEqual(len(trades), 1, f"{label} should trade at the 0.001 threshold")
+
+    def test_usdjpy_uses_a_stricter_threshold_and_rejects_the_same_scenario(self):
+        # At the price scale this harness builds (~1.0), USDJPY's documented 0.10 absolute
+        # separation is far wider than the SMMA stack the scenario actually produces - the same
+        # setup that qualifies for EURUSD/GBPUSD/AUDUSD must NOT qualify for USDJPY.
+        df, _ = build_scenario(_bull_strike_pattern, _hold_flat)
+        self.assertEqual(run_scenario(df, label="USDJPY"), [])
+
+    def test_an_unlisted_instrument_falls_back_to_the_default(self):
+        df, _ = build_scenario(_bull_strike_pattern, _hold_flat)
+        with_default = run_scenario(df, label="NOT_IN_THE_TABLE")
+        with_fallback_overridden = run_scenario(df, label="NOT_IN_THE_TABLE", DEFAULT_MIN_SEPARATION_ABS=100.0)
+        self.assertEqual(len(with_default), 1)
+        self.assertEqual(with_fallback_overridden, [])
 
 
 # ================================ patterns ================================
@@ -342,13 +370,15 @@ class TestPatternDetection(unittest.TestCase):
 # ================================ the fill convention ================================
 
 class TestNextBarOpenFill(unittest.TestCase):
-    """FILL_AT_NEXT_OPEN defaults to 0 (fill at the signal bar's close - a clean, undistorted 2:1)
-    because that is the strategy actually being tested, not an audit of the Pine script's order-
-    fill quirk. The source itself computes the stop/target from the SIGNAL bar's close but fills at
-    the NEXT bar's open (FILL_AT_NEXT_OPEN=1), which is reproduced here as an explicit opt-in so it
-    can still be measured - every test that exercises IT sets the override explicitly rather than
-    relying on the module's current default, so a future default change can't silently invalidate
-    what these pin."""
+    """FILL_AT_NEXT_OPEN defaults to 1: enter at the OPEN of the candle after the signal candle
+    CLOSES. That is the writeup's own documented entry timing ('wait for the candle to close...
+    enter at open of next candle'), not an accidental Pine quirk - reading the Pine alone, before
+    the writeup existed, made it look like an unintended mismatch between the entry price and the
+    prices the stop/target were computed from. It is not; it's the design. The realised risk:reward
+    still isn't a clean 2:1 as a result of that gap (0.30R-4.62R on test data), which is a genuine
+    property of the strategy, pinned here rather than hidden. Every test below sets FILL_AT_NEXT_OPEN
+    explicitly rather than relying on the module's current default, so a future default change can't
+    silently invalidate what's pinned here."""
 
     def _scenario_with_gap(self, gap_multiple):
         def follow(signal_bar):
@@ -359,18 +389,9 @@ class TestNextBarOpenFill(unittest.TestCase):
             return bars
         return build_scenario(_bull_strike_pattern, follow)
 
-    def test_the_default_fills_at_the_signal_close_for_a_clean_two_r(self):
+    def test_the_default_fills_at_the_next_bar_open_and_shrinks_a_favourable_gaps_risk(self):
         df, signal = self._scenario_with_gap(0.5)
         trades = run_scenario(df)          # no override - pins the actual shipped default
-        self.assertEqual(len(trades), 1)
-        t = trades[0]
-        self.assertAlmostEqual(t["entry"], df["Close"].iloc[signal])
-        candle = df["High"].iloc[signal] - df["Low"].iloc[signal]
-        self.assertAlmostEqual(t["sl_distance"], candle * tma.STOP_CANDLE_MULT)
-
-    def test_next_open_fill_opt_in_shrinks_a_favourable_gaps_risk(self):
-        df, signal = self._scenario_with_gap(0.5)
-        trades = run_scenario(df, FILL_AT_NEXT_OPEN=1)
         self.assertEqual(len(trades), 1)
         t = trades[0]
         signal_close = df["Close"].iloc[signal]
@@ -380,21 +401,30 @@ class TestNextBarOpenFill(unittest.TestCase):
         self.assertAlmostEqual(t["entry"], expected_entry)
         self.assertAlmostEqual(t["sl_distance"], expected_entry - expected_stop)
         # Entry above the reference price: risk is larger than the nominal 2x candle, so the
-        # reward multiple on a win is BELOW the intended 2.0 - this is the source's real behaviour.
+        # reward multiple on a win is BELOW the intended 2.0 - a real property of the design.
         self.assertGreater(t["sl_distance"], candle * tma.STOP_CANDLE_MULT)
+
+    def test_filling_at_the_signal_close_opt_out_gives_exactly_the_nominal_two_r(self):
+        df, signal = self._scenario_with_gap(0.5)
+        trades = run_scenario(df, FILL_AT_NEXT_OPEN=0)
+        self.assertEqual(len(trades), 1)
+        t = trades[0]
+        self.assertAlmostEqual(t["entry"], df["Close"].iloc[signal])
+        candle = df["High"].iloc[signal] - df["Low"].iloc[signal]
+        self.assertAlmostEqual(t["sl_distance"], candle * tma.STOP_CANDLE_MULT)
 
     def test_the_two_fill_conventions_produce_different_risk(self):
         df, _ = self._scenario_with_gap(0.5)
-        at_close = run_scenario(df, FILL_AT_NEXT_OPEN=0)[0]["sl_distance"]
         at_open = run_scenario(df, FILL_AT_NEXT_OPEN=1)[0]["sl_distance"]
+        at_close = run_scenario(df, FILL_AT_NEXT_OPEN=0)[0]["sl_distance"]
         self.assertNotAlmostEqual(at_open, at_close)
 
-    def test_a_next_open_gap_straight_through_the_stop_is_skipped_not_scored(self):
+    def test_a_gap_straight_through_the_stop_is_skipped_not_scored(self):
         # Opening far BELOW the intended long stop leaves entry < stop: a negative risk. Scoring it
-        # would invent an instant winner out of an unfillable setup. Only the next-open-fill
-        # convention can produce this - filling at the signal close never gaps past its own stop.
+        # would invent an instant winner out of an unfillable setup. Only the (default) next-open-
+        # fill convention can produce this - filling at the signal close never gaps past its stop.
         df, _ = self._scenario_with_gap(-5.0)
-        self.assertEqual(run_scenario(df, FILL_AT_NEXT_OPEN=1), [])
+        self.assertEqual(run_scenario(df), [])
 
     def test_hairline_signal_candle_is_skipped(self):
         def flat_signal(level):
@@ -405,7 +435,7 @@ class TestNextBarOpenFill(unittest.TestCase):
         df, _ = build_scenario(flat_signal, _hold_flat)
         # Thin regardless of fill convention - the candle range itself is near-zero.
         self.assertEqual(run_scenario(df), [])
-        self.assertEqual(run_scenario(df, FILL_AT_NEXT_OPEN=1), [])
+        self.assertEqual(run_scenario(df, FILL_AT_NEXT_OPEN=0), [])
 
 
 # ================================ trade management ================================
@@ -468,6 +498,85 @@ class TestTradeManagement(unittest.TestCase):
         df, _ = build_scenario(_bull_strike_pattern, follow)
         trades = run_scenario(df)
         self.assertEqual(len(trades), 1)
+
+
+# ================================ daily trade cap ================================
+
+class TestMaxTradesPerDay(unittest.TestCase):
+    """The writeup's explicit, repeated rule ('One Trade Per Day (Maximum)... NOT 50 trades, NOT
+    10 trades, just ONE') isn't enforced by the Pine code at all - it only blocks a second trade
+    while the FIRST is still open. This scenario has the first trade hit its target and CLOSE, then
+    a second, independent, fully-qualifying signal fire later the SAME calendar day."""
+
+    def _two_signals_same_day(self):
+        def first_signal(level):
+            return _bull_strike_pattern(level)
+
+        def rest_of_day(signal_bar):
+            opening = signal_bar["Close"]
+            fill_bar = _bar(opening, opening + STEP * 0.02)          # the fill bar itself
+            target_reach = opening + STEP * 20                        # far enough to hit any target
+            hit_bar = {"Open": opening, "High": target_reach,
+                        "Low": opening - STEP * 0.02, "Close": target_reach}   # closes the 1st trade
+            continuation = []                                          # keeps trend/momentum/RSI
+            level = target_reach                                       # bullish for a 2nd signal
+            for _ in range(6):
+                continuation.append(_bar(level, level + STEP * 0.3))
+                level += STEP * 0.3
+            second_signal = _bull_strike_pattern(level)
+            tail = _hold_flat({"Close": second_signal[-1]["Close"]}, n=6)
+            return [fill_bar, hit_bar] + continuation + second_signal + tail
+
+        return build_scenario(first_signal, rest_of_day)
+
+    def test_the_default_cap_blocks_a_second_same_day_signal(self):
+        df, _ = self._two_signals_same_day()
+        trades = run_scenario(df)          # no override - pins the actual shipped default (cap=1)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["outcome"], "TP")
+
+    def test_disabling_the_cap_allows_both_same_day_signals(self):
+        df, _ = self._two_signals_same_day()
+        trades = run_scenario(df, MAX_TRADES_PER_DAY_PER_INSTRUMENT=0)
+        self.assertEqual(len(trades), 2)
+        # Both genuinely land on the same calendar day - not a date-rollover coincidence.
+        self.assertEqual(trades[0]["date"], trades[1]["date"])
+
+    def test_a_higher_cap_allows_exactly_that_many(self):
+        df, _ = self._two_signals_same_day()
+        trades = run_scenario(df, MAX_TRADES_PER_DAY_PER_INSTRUMENT=2)
+        self.assertEqual(len(trades), 2)
+
+    def test_the_cap_resets_on_a_new_calendar_day(self):
+        # Same two-signal shape, but with the second signal pushed into the following session
+        # rather than later the same day - the cap must NOT carry over across the date boundary.
+        def first_signal(level):
+            return _bull_strike_pattern(level)
+
+        def next_day_follow(signal_bar):
+            opening = signal_bar["Close"]
+            fill_bar = _bar(opening, opening + STEP * 0.02)
+            target_reach = opening + STEP * 20
+            hit_bar = {"Open": opening, "High": target_reach,
+                        "Low": opening - STEP * 0.02, "Close": target_reach}
+            # ~26 hours of continuation (312 5-min bars) pushes the second signal well past
+            # midnight into a later calendar day. Reuses WARMUP_CYCLE's own pace (not a flatter
+            # one) - a near-flat stretch this long lets the SMMAs converge and collapses the
+            # separation gate, which isn't what this test is checking.
+            continuation = []
+            level = target_reach
+            for k in range(312):
+                delta = WARMUP_CYCLE[k % len(WARMUP_CYCLE)] * STEP * 0.6
+                continuation.append(_bar(level, level + delta))
+                level += delta
+            second_signal = _bull_strike_pattern(level)
+            tail = _hold_flat({"Close": second_signal[-1]["Close"]}, n=6)
+            return [fill_bar, hit_bar] + continuation + second_signal + tail
+
+        df, _ = build_scenario(first_signal, next_day_follow)
+        trades = run_scenario(df)   # default cap=1, but the two signals are on different dates
+        self.assertEqual(len(trades), 2)
+        self.assertNotEqual(trades[0]["date"], trades[1]["date"])
 
 
 # ================================ symmetry + contract ================================

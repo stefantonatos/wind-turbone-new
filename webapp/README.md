@@ -151,24 +151,35 @@ the opposite way. Every trade is tagged `continuation` or `reversal`, and the **
 filter separates them - read them apart before reading the total, or a profitable leg and a
 losing one will average into a meaningless middle.
 
-TMA Trend Scalper is also a Pine port, and porting it surfaced three things in the source
-worth knowing, all reproduced as a switchable option rather than silently discarded. Its
-weekday filter (`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but Pine numbers
-**Sunday** as day 1 - so as literally written it trades Sunday through Thursday and
-**never trades Friday**. This app defaults to real Monday-to-Friday trading (the
-behaviour the source code was evidently trying to express); set the Weekdays parameter to
-0 to reproduce the source's own Sun-Thu/no-Friday behaviour exactly, e.g. to reconcile a
-result against its TradingView report. In the source, entries fill at the next bar's open
-while the stop and target were computed from the previous bar's close, so the source's
-advertised 1:2 risk:reward is an intention rather than a measured property - the realised
-reward on winners varies well above and below 2R (0.30R-4.62R on test data). This app
-defaults to filling at the signal bar's close instead, giving a clean, undistorted 2:1;
-set the fill-timing parameter to reproduce the source's real next-bar-open behaviour and
-see how much that convention was worth. And its "minimum SMMA separation" is an absolute
-price number (0.001), which is ~0.009% of
-EURUSD but ~0.00004% of gold, so on anything but a EUR-priced pair that filter is
-effectively switched off; it is expressed here as a percentage instead. There is also no
-time-based exit at all, so one position can sit open for days blocking every later signal.
+TMA Trend Scalper is also a Pine port, built against two sources rather than one: the Pine
+v6 script itself, and a separate plain-English writeup (from the same creator) describing
+what the strategy is meant to do. They disagreed in two places, and the writeup - the
+stated intent - wins both times.
+
+The writeup is explicit that entry happens at the **open of the candle after the signal
+candle closes**; read from the Pine alone, that looked like an accidental mismatch between
+the entry price and the prices the stop/target were computed from (it isn't - it's the
+design, and this app's default reflects that). The realised risk:reward still isn't a
+clean 2:1 as a result (0.30R-4.62R on test data); set the fill-timing parameter to fill at
+the signal close instead and isolate what that convention is worth. The writeup also
+states **"One Trade Per Day (Maximum)"** as a hard, repeatedly-emphasized rule the Pine
+code itself never enforces (it only blocks a second trade while the first is still open) -
+capped here by default, switchable to unlimited same-day re-entries to test the Pine
+literally.
+
+Two more things, both corrected rather than left as options: its weekday filter
+(`dayofweek >= 1 and <= 5`) reads like Monday-Friday, but Pine numbers **Sunday** as day 1
+- so as literally written it trades Sunday through Thursday and **never trades Friday**;
+both sources agree the intent is Monday-Friday, which is the default (set the Weekdays
+parameter to 0 to reproduce the Pine's literal Sun-Thu/no-Friday behaviour, e.g. to
+reconcile against its TradingView report). And its "minimum SMMA separation" is an
+absolute price number the Pine hardcodes to one value (0.001) with a comment to adjust it
+per pair - the writeup actually gives that table, so this app trades EURUSD/GBPUSD/AUDUSD
+(0.001) and USDJPY (0.10) using the writeup's own per-pair values, led by AUD/USD since
+that's the writeup's own recommended pair (gold, this project's usual fourth instrument
+here, is never mentioned in either source). There is also no time-based exit beyond the
+daily cap, so a position opened near the end of one session can still be open well into a
+later one.
 
 Parabolic SAR is the first strategy in this catalog sourced from an actual open-source
 repository (je-suis-tm/quant-trading, Apache 2.0) rather than a Pine script or a video

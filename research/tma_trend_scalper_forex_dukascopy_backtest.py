@@ -3,60 +3,67 @@
 #
 # WHAT IT DOES: during the London session, require a clean 21/50/200 SMMA stack (fast above
 # medium above slow, each separated by a minimum distance), a trending ADX, live volatility, price
-# on the correct side of the 200, and short-term momentum agreeing. When all of that holds, take a
-# 3-line-strike or engulfing reversal pattern in the trend's direction, confirmed by RSI on the
-# correct side of 50 and of its own 50-period SMMA. Stop is 2x the signal candle's range, target
-# is 4x - a 1:2 risk:reward. One position at a time.
+# on the correct side of the 200, and short-term momentum agreeing. When all of that holds, wait
+# for a 3-line-strike or engulfing reversal pattern candle to CLOSE, then enter at the OPEN of the
+# next candle - confirmed by RSI on the correct side of 50 and of its own 50-period SMMA. Stop is
+# 2x the signal candle's range, target is 4x - a 1:2 risk:reward. At most ONE trade per instrument
+# per day, whether it wins, loses, or is still open at day end.
 #
-# ==========================================================================================
-# FOUR THINGS THE PORT FOUND IN THE SOURCE. These are stated up front because each one changes
-# what the strategy actually does versus what it reads like it does.
-# ==========================================================================================
+# THIS PORT IS BUILT AGAINST TWO SOURCES, NOT ONE: the Pine v6 script itself, and a separate plain-
+# English strategy writeup (from the same creator's material) describing what the script is meant
+# to do. They disagree in two places, and the writeup - the stated INTENT - wins both times, because
+# it is more specific than the code and the code's gap looks like an omission rather than a choice:
 #
-# 1. THE WEEKDAY FILTER EXCLUDES FRIDAY AND INCLUDES SUNDAY.
-#    `dayofweek >= 1 and dayofweek <= 5` looks like Monday-to-Friday. In Pine, dayofweek returns
-#    1 for SUNDAY through 7 for Saturday, so 1..5 is Sunday-to-Thursday. On forex the 07:00-15:00
-#    Sunday window is closed, so the practical effect is that the strategy trades Monday through
-#    THURSDAY and never trades Friday - roughly a fifth of the available sessions, silently
-#    dropped. WEEKDAY_FILTER_MODE below defaults to 1 - real Monday-to-Friday London trading, the
-#    behaviour the code was evidently trying to express - since that is what this project is
-#    actually testing. Set it to 0 to reproduce the source's own Sun-Thu/no-Friday behaviour
-#    exactly, e.g. to reconcile a result against the source's own TradingView report.
+#   - The writeup is explicit that entry happens at the OPEN OF THE NEXT CANDLE after the signal
+#     candle CLOSES ("wait for the candle to close... enter at open of next candle"). The Pine code
+#     produces exactly this by NOT setting process_orders_on_close (defaults to false), so an order
+#     placed on the signal bar fills on the following bar's open while stopLoss/takeProfit are
+#     still computed from the signal bar's close and range. This looked, on first reading the Pine
+#     alone, like an accidental mismatch between the entry price and the prices the stop/target were
+#     computed from - it is not; it is the documented, intended design. FILL_AT_NEXT_OPEN defaults
+#     to 1 for that reason. The realised R:R still is not a clean 2:1 as a result (0.30R-4.62R on
+#     test data, per the entry/reference-price gap) - that is a real property of the strategy, not a
+#     bug to hide. Set FILL_AT_NEXT_OPEN = 0 to fill at the signal close instead and isolate exactly
+#     what the next-bar-open convention is worth.
 #
-# 2. ORDERS FILL AT THE NEXT BAR'S OPEN, BUT THE STOP AND TARGET ARE COMPUTED FROM THIS BAR'S
-#    CLOSE. The Pine's strategy() call does not set process_orders_on_close, which defaults to
-#    false, so `strategy.entry` submits a market order filled at the OPEN of the following bar.
-#    Meanwhile stopLoss/takeProfit are computed from `close` and the signal candle's range on the
-#    signal bar. The gap between that close and the next open therefore shifts the real risk and
-#    the real reward away from the intended 2x/4x - sometimes favourably, sometimes not, and
-#    occasionally far enough that the entry is already past its own stop. The nominal "1:2 R:R" is
-#    an intention in the source, not a measured property (0.30R-4.62R on test data). FILL_AT_NEXT_OPEN
-#    defaults to 0 here - fill at the signal bar's close, giving a clean, undistorted 2:1 - since
-#    that is the strategy actually being tested, not an audit of the Pine script's order-fill quirk.
-#    Set FILL_AT_NEXT_OPEN = 1 to reproduce the source's real next-bar-open behaviour instead and
-#    see how much that one fill-timing convention was worth.
+#   - The writeup states "One Trade Per Day (Maximum)" as a hard, repeatedly emphasized rule ("NOT
+#     50 trades, NOT 10 trades, just ONE") - and its own trade checklist asks "Is this my first
+#     trade today?" as a precondition. The pasted Pine code never enforces this: it only blocks a
+#     SECOND trade while the FIRST is still open (`strategy.position_size == 0`), so a fresh signal
+#     later the same day, after the first trade has already closed by TP or SL, is free to fire
+#     again in the code as written. MAX_TRADES_PER_DAY_PER_INSTRUMENT below enforces the documented
+#     rule rather than the code's gap, since testing the documented strategy is the point of this
+#     port. Set it to 0 to allow unlimited same-day re-entries and measure the Pine-literal version.
 #
-# 3. minDist IS AN ABSOLUTE PRICE NUMBER, SO IT ONLY MEANS ANYTHING ON EURUSD. The source sets
-#    `minDist = 0.001` with a comment saying to adjust it per pair. As a raw price distance that
-#    is ~0.09% of EURUSD but ~0.0007% of USDJPY and ~0.00004% of gold - on anything but a
-#    EUR/GBP-priced pair the "clean separation" filter is effectively switched off, and the
-#    strategy silently becomes a different, looser one. Ported here as MIN_SEPARATION_PCT, a
-#    PERCENTAGE of price, defaulting to the EURUSD-equivalent value so the source's behaviour on
-#    its calibrated instrument is preserved while the filter keeps meaning the same thing
-#    everywhere else. This is a deliberate deviation, not an oversight.
+# TWO MORE THINGS THE PORT FOUND, both switchable or corrected as noted:
 #
-# 4. THE POSITION SIZE INPUTS CONTRADICT EACH OTHER, WHICH IS WHY ITS EQUITY CURVE IS FLAT.
-#    strategy() declares `default_qty_type = strategy.percent_of_equity, default_qty_value = 100`,
-#    but every strategy.entry call passes `qty = 1`, which overrides it - one unit, not 100% of a
-#    $1,000 account. Nothing in this port depends on that (results here are in R-multiples, which
-#    are size-independent by construction), but it means the source's own P&L curve is not
-#    measuring what its settings say it is.
+#   - THE WEEKDAY FILTER EXCLUDES FRIDAY AND INCLUDES SUNDAY. `dayofweek >= 1 and dayofweek <= 5`
+#     looks like Monday-to-Friday. In Pine, dayofweek returns 1 for SUNDAY through 7 for Saturday,
+#     so 1..5 is Sunday-to-Thursday. On forex the 07:00-15:00 Sunday window is closed, so the
+#     practical effect is that the strategy trades Monday through THURSDAY and never trades Friday
+#     - roughly a fifth of the available sessions, silently dropped, and never mentioned in the
+#     writeup either (which says plainly "Days: Weekdays Only (Monday - Friday)"). Both sources
+#     agree the INTENT is Monday-Friday, so WEEKDAY_FILTER_MODE defaults to 1 (real Mon-Fri). Set
+#     it to 0 to reproduce the Pine's literal Sun-Thu/no-Friday behaviour, e.g. to reconcile a
+#     result against the source's own TradingView report.
 #
-# ALSO NOT PORTED, deliberately: `ema2 = ta.ema(close, 2)` is computed and plotted but never used
-# in a single condition; and there is no time-based exit of any kind, so a position can sit open
-# for days or weeks blocking every subsequent signal. That second one is kept faithfully (no
-# timeout) because it is a real property of the strategy worth measuring, not a bug to paper over
-# - but it is why a "scalper" here can hold a trade for a month.
+#   - minDist IS AN ABSOLUTE PRICE NUMBER, PER-PAIR IN THE WRITEUP BUT HARDCODED TO ONE VALUE IN
+#     THE PINE. The Pine sets `minDist = 0.001` with a comment saying to adjust it per pair; the
+#     writeup actually gives that table - EURUSD/GBPUSD/AUDUSD -> 0.001, USDJPY (and other JPY
+#     crosses) -> 0.10. Ported here as MIN_SEPARATION_ABS_BY_INSTRUMENT, using the writeup's own
+#     values for the four instruments this port trades, rather than either hardcoding the Pine's
+#     single EURUSD-calibrated number across every pair (silently switching the filter off on
+#     USDJPY) or inventing a synthetic percentage of my own.
+#
+# ALSO NOT PORTED, deliberately: the writeup's position-size inputs contradict each other in the
+# Pine (`default_qty_type = strategy.percent_of_equity, default_qty_value = 100` overridden by
+# `qty = 1` on every entry - one unit, not 100% of equity), which is why the source's own dollar
+# equity curve doesn't reflect its own settings; irrelevant here since this port scores everything
+# in R-multiples, which are size-independent by construction. `ema2 = ta.ema(close, 2)` is computed
+# and plotted in the Pine but never used in a single condition, so it is not ported. There is no
+# time-based exit of any kind beyond the one-trade-per-day cap, so a position opened near the end of
+# a session can still be open well into a later one - kept faithfully, since it's a real property of
+# the strategy worth measuring, not a bug to paper over.
 #
 # COST NOTE: the source assumes 0.03% commission per side, i.e. 0.06% round trip. That is roughly
 # EIGHT TIMES this project's measured EURUSD figure (0.0074%). Costs are applied downstream by the
@@ -89,13 +96,15 @@ logging.getLogger("DUKASCRIPT").addFilter(_SuppressDukascopyInfoFilter())
 CACHE_DIR = "/content/drive/MyDrive/dukascopy_cache" if os.path.isdir("/content/drive/MyDrive") else "dukascopy_cache"
 FETCH_CHUNK_MONTHS = 3
 
-# The same four instruments most of this catalog trades, so this sits on the same underlying price
-# series as the strategies it will be ranked against.
+# The four instruments the writeup's own minDist table gives explicit values for, led by AUDUSD -
+# "AUD/USD Recommended" is the writeup's own words for the pair this strategy was actually designed
+# around. Not this project's usual EURUSD/GBPUSD/USDJPY/XAUUSD set - gold is never mentioned in the
+# writeup at all, so it's dropped in favour of the pair the strategy is actually calibrated to.
 INSTRUMENTS = [
     ("EURUSD", dki.INSTRUMENT_FX_MAJORS_EUR_USD),
     ("GBPUSD", dki.INSTRUMENT_FX_MAJORS_GBP_USD),
+    ("AUDUSD", dki.INSTRUMENT_FX_MAJORS_AUD_USD),
     ("USDJPY", dki.INSTRUMENT_FX_MAJORS_USD_JPY),
-    ("XAUUSD", dki.INSTRUMENT_FX_METALS_XAU_USD),
 ]
 
 FETCH_START = datetime.datetime(2022, 1, 1)
@@ -118,7 +127,16 @@ WEEKDAY_FILTER_MODE = 1   # 0 = as the source behaves (Sun-Thu, no Friday); 1 = 
 SMMA_FAST_LEN = 21
 SMMA_MED_LEN = 50
 SMMA_SLOW_LEN = 200
-MIN_SEPARATION_PCT = 0.0093   # % of price. 0.001 absolute on EURUSD @ ~1.08 = 0.0093%. See note 3.
+# The writeup's own per-pair minDist table (absolute price units, exactly as the Pine's `minDist`
+# constant is used) - NOT a synthetic percentage. DEFAULT_MIN_SEPARATION_ABS is used for any
+# instrument not in the table (shouldn't happen for INSTRUMENTS above; kept for safety only).
+MIN_SEPARATION_ABS_BY_INSTRUMENT = {
+    "EURUSD": 0.001,
+    "GBPUSD": 0.001,
+    "AUDUSD": 0.001,
+    "USDJPY": 0.10,
+}
+DEFAULT_MIN_SEPARATION_ABS = 0.001
 
 # --- regime filters ---
 ADX_LEN = 14
@@ -138,10 +156,15 @@ RSI_SMMA_LEN = 50
 # --- risk ---
 STOP_CANDLE_MULT = 2.0
 TARGET_CANDLE_MULT = 4.0
-FILL_AT_NEXT_OPEN = 0     # 0 = fill at the signal bar's close (clean, undistorted 2:1 - default);
-                           # 1 = the source's real next-bar-open behaviour. See note 2.
+FILL_AT_NEXT_OPEN = 1     # 1 = enter at the next bar's open after the signal bar closes (the
+                           # writeup's documented, intended entry timing - default); 0 = fill at
+                           # the signal bar's close instead, isolating what that convention is worth.
 MIN_STOP_PCT = 0.005      # % of price. A signal candle with a near-zero range would otherwise
                            # produce a hairline stop and an enormous R-multiple off one bar.
+MAX_TRADES_PER_DAY_PER_INSTRUMENT = 1   # the writeup's "One Trade Per Day (Maximum)" rule - the
+                                          # Pine code itself doesn't enforce this (see header). 0
+                                          # disables the cap and allows unlimited same-day re-entries,
+                                          # matching the Pine exactly as written instead.
 
 COST_PCT_SCENARIOS = [0.0, 0.01, 0.03, 0.05]
 
@@ -331,10 +354,19 @@ def backtest_instrument(label, df):
     rsi_first = next((i for i, r in enumerate(rsi) if r is not None), n)
     rsi_smma = rma_series(rsi, RSI_SMMA_LEN, start_index=rsi_first)
 
+    min_separation_abs = MIN_SEPARATION_ABS_BY_INSTRUMENT.get(label, DEFAULT_MIN_SEPARATION_ABS)
+
     trades = []
     position = None
+    current_day = None
+    trades_opened_today = 0
     i = max(SMMA_SLOW_LEN, MOMENTUM_LOOKBACK + 1, 3)
     while i < n:
+        bar_day = times[i].date()
+        if bar_day != current_day:
+            current_day = bar_day
+            trades_opened_today = 0
+
         # --- manage an open position first: the protective bracket is live during this bar and
         # fills intrabar, before any new signal is evaluated. Stop before target on a bar that
         # spans both - this project's standard pessimistic tie-break.
@@ -355,12 +387,18 @@ def backtest_instrument(label, df):
         if not in_session(times[i]):
             i += 1
             continue
+        if MAX_TRADES_PER_DAY_PER_INSTRUMENT and trades_opened_today >= MAX_TRADES_PER_DAY_PER_INSTRUMENT:
+            i += 1
+            continue
         if any(v is None for v in (smma_fast[i], smma_med[i], smma_slow[i], adx[i], atr[i],
                                     atr_avg[i], mom_sma[i], rsi[i], rsi_smma[i])):
             i += 1
             continue
 
-        separation = closes[i] * (MIN_SEPARATION_PCT / 100.0)
+        # ABSOLUTE price distance, exactly like the Pine's own `minDist` constant - NOT scaled by
+        # price - since these are the writeup's own per-pair literal values (0.001 for EURUSD/
+        # GBPUSD/AUDUSD, 0.10 for USDJPY), already calibrated per instrument at the source.
+        separation = min_separation_abs
         bull_stack = smma_fast[i] > smma_med[i] + separation and smma_med[i] > smma_slow[i] + separation
         bear_stack = smma_fast[i] < smma_med[i] - separation and smma_med[i] < smma_slow[i] - separation
         trending = adx[i] > ADX_MIN
@@ -396,9 +434,9 @@ def backtest_instrument(label, df):
             i += 1
             continue
 
-        # Stop and target come off the SIGNAL bar's close and range, exactly as the source computes
-        # them - but the fill lands on the NEXT bar's open (note 2). Both prices are therefore
-        # fixed before the entry price is known, which is what distorts the nominal 1:2.
+        # Stop and target come off the SIGNAL bar's close and range; the fill (by default) lands on
+        # the NEXT bar's open - the writeup's own documented entry timing (see header). Both prices
+        # are fixed before the entry price is known, which is why the realised R:R isn't a clean 2:1.
         candle_size = highs[i] - lows[i]
         reference = closes[i]
         if side == "LONG":
@@ -423,6 +461,9 @@ def backtest_instrument(label, df):
 
         position = {"side": side, "entry": entry, "stop": stop, "target": target, "risk": risk,
                      "reward_r": reward / risk, "pattern": pattern, "entry_time": times[fill_index]}
+        trades_opened_today += 1   # counts against the SIGNAL bar's day - see MAX_TRADES_PER_DAY_
+                                     # PER_INSTRUMENT above; the entry itself may land moments into
+                                     # the next bar but not, in practice, a different calendar day
         i = fill_index    # management begins on the fill bar itself, same as the broker emulator
 
     if position is not None:

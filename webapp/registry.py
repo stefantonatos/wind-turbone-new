@@ -925,7 +925,10 @@ def _build_registry():
     # tma_trend_scalper_forex_dukascopy_backtest.py ("TMA Trend Scalper")
     # Follows the _run_with_own_cache shape exactly (own pickle cache, FETCH_START/FETCH_END,
     # fetch_instrument_data(label, const) -> df, backtest_instrument(label, df) -> trades).
-    # Trade keys: side, outcome, r, date, entry, sl_distance, stop_pct, pattern.
+    # Trade keys: side, outcome, r, date, entry, sl_distance, stop_pct, pattern. Ported from both
+    # the Pine v6 script AND a separate plain-English strategy writeup describing the same system -
+    # they disagreed on entry timing and on a daily trade cap, and the writeup (the stated intent)
+    # is what this port follows; see the module's own header for the full reasoning.
     # ---------------------------------------------------------------------------
     tma_mod = _load_module("research.tma_trend_scalper_forex_dukascopy_backtest")
     entries.append(StrategyDef(
@@ -941,18 +944,20 @@ def _build_registry():
                       tma_mod.SESSION_END_HOUR, 1, 24, 1),
             ParamSpec("WEEKDAY_FILTER_MODE", "Weekdays: 1 = Mon-Fri, 0 = source (Sun-Thu)", "int",
                       tma_mod.WEEKDAY_FILTER_MODE, 0, 1, 1,
-                      help="Defaults to 1 - real Monday-to-Friday London trading. The source's "
-                           "`dayofweek >= 1 and <= 5` reads like Monday-Friday, but Pine numbers "
-                           "Sunday as 1 - so as literally written it trades Sunday to THURSDAY and "
-                           "never trades Friday. Set to 0 to reproduce that exactly, e.g. to "
-                           "reconcile a result against the source's own TradingView report."),
-            ParamSpec("MIN_SEPARATION_PCT", "Min SMMA separation (% of price)", "float",
-                      tma_mod.MIN_SEPARATION_PCT, 0.0, 0.5, 0.001,
-                      help="The source hard-codes this as an absolute 0.001 price units with a note "
-                           "to adjust it per pair. That is ~0.009% of EURUSD but ~0.00004% of gold, "
-                           "so on anything but a EUR-priced pair the filter is effectively off. "
-                           "Expressed here as a percentage so it means the same thing everywhere; "
-                           "the default is the EURUSD-equivalent of the source's value."),
+                      help="Defaults to 1 - real Monday-to-Friday London trading, which both the "
+                           "Pine's evident intent and the writeup ('Weekdays Only') agree on. The "
+                           "Pine's `dayofweek >= 1 and <= 5` reads like Monday-Friday, but Pine "
+                           "numbers Sunday as 1 - so as literally written it trades Sunday to "
+                           "THURSDAY and never trades Friday. Set to 0 to reproduce that exactly, "
+                           "e.g. to reconcile a result against the source's own TradingView report."),
+            ParamSpec("MAX_TRADES_PER_DAY_PER_INSTRUMENT", "Max new trades per instrument per day (0 = unlimited)",
+                      "int", tma_mod.MAX_TRADES_PER_DAY_PER_INSTRUMENT, 0, 5, 1,
+                      help="Defaults to 1, matching the writeup's explicit, repeated rule ('One "
+                           "Trade Per Day (Maximum)... NOT 50 trades, NOT 10 trades, just ONE'). "
+                           "The Pine code itself doesn't enforce this - it only blocks a second "
+                           "trade while the first is still OPEN, so a fresh signal later the same "
+                           "day after the first trade already closed is free to fire again as "
+                           "literally coded. Set to 0 to test that Pine-literal, uncapped version."),
             ParamSpec("ADX_MIN", "Minimum ADX", "float", tma_mod.ADX_MIN, 0.0, 60.0, 1.0),
             ParamSpec("ATR_MIN_MULT", "ATR vs its 50-bar average (multiple)", "float",
                       tma_mod.ATR_MIN_MULT, 0.0, 3.0, 0.1),
@@ -963,28 +968,33 @@ def _build_registry():
                       tma_mod.STOP_CANDLE_MULT, 0.5, 6.0, 0.5),
             ParamSpec("TARGET_CANDLE_MULT", "Target = signal candle range x", "float",
                       tma_mod.TARGET_CANDLE_MULT, 0.5, 12.0, 0.5),
-            ParamSpec("FILL_AT_NEXT_OPEN", "Fill at signal close (0) or next bar's open (1)", "int",
+            ParamSpec("FILL_AT_NEXT_OPEN", "Fill at next bar's open (1) or signal close (0)", "int",
                       tma_mod.FILL_AT_NEXT_OPEN, 0, 1, 1,
-                      help="Defaults to 0 - fill at the signal bar's close, giving a clean, "
-                           "undistorted 2:1 R:R. The source's strategy() call actually leaves "
-                           "process_orders_on_close at its default of false, so entries fill at the "
-                           "NEXT bar's open while the stop and target were computed from THIS bar's "
-                           "close - which moves the realised risk and reward away from the nominal "
-                           "1:2 (0.30R-4.62R on test data). Set to 1 to reproduce that real "
-                           "next-bar-open behaviour and see how much it was worth."),
+                      help="Defaults to 1 - enter at the OPEN of the candle after the signal candle "
+                           "CLOSES, exactly as the writeup describes ('wait for the candle to "
+                           "close... enter at open of next candle'). The stop/target are still "
+                           "computed from the signal bar's close and range, so the realised R:R "
+                           "isn't a clean 2:1 as a result (0.30R-4.62R on test data) - that's a real "
+                           "property of the strategy as designed, not a bug. Set to 0 to fill at the "
+                           "signal close instead and isolate what the next-bar-open timing is worth."),
             ParamSpec("MIN_STOP_PCT", "Minimum stop distance (% of price)", "float",
                       tma_mod.MIN_STOP_PCT, 0.0, 0.5, 0.001),
         ],
         facets=["pattern"],
-        notes="Ported from a public TradingView Pine strategy. Three things found in the source and "
-              "reproduced here rather than quietly fixed, each switchable above: its weekday filter "
-              "excludes FRIDAY and includes Sunday (Pine numbers Sunday as day 1); its entries fill "
-              "at the next bar's open while the stop and target come from the previous bar's close, "
-              "so the advertised 1:2 is an intention rather than a measured property; and its "
-              "'minimum SMMA separation' is an absolute price number only calibrated for EURUSD. "
-              "There is also NO time-based exit - a position can sit open for days blocking every "
-              "later signal, which is why a 'scalper' here can hold a trade for weeks. Trades are "
-              "tagged by pattern (3-line strike / engulfing / both) for the Pattern filter.",
+        notes="Ported from a TradingView Pine script AND a separate plain-English writeup of the "
+              "same strategy - they disagreed in two places, and the writeup (the stated intent) "
+              "wins both times. It documents entering at the OPEN of the candle AFTER the signal "
+              "candle closes (default here); the Pine code produces exactly that by never setting "
+              "process_orders_on_close, which the Pine alone looked like an accidental mismatch "
+              "before the writeup confirmed it's deliberate. It also states 'One Trade Per Day "
+              "(Maximum)' as a hard rule the Pine code itself never enforces - capped here by "
+              "default, switchable to unlimited same-day re-entries to test the Pine literally. "
+              "Trades EURUSD/GBPUSD/AUDUSD/USDJPY - AUD/USD is the writeup's own recommended pair - "
+              "using its own per-pair minimum-SMMA-separation table (0.001 for the first three, "
+              "0.10 for USDJPY) rather than one value calibrated for EURUSD alone. There is also NO "
+              "time-based exit beyond the daily cap - a position can still be open well into a "
+              "later session. Trades are tagged by pattern (3-line strike / engulfing / both) for "
+              "the Pattern filter.",
         runner=_run_with_own_cache,
         default_history_days=2 * 365,
     ))
