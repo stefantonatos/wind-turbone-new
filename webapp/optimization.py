@@ -269,16 +269,108 @@ def _rauf_pipeline(module):
                                 decay=decay)
 
 
-# strategy id -> (companion module name, real pipeline function). Populated for the two
-# companion scripts that exist as of this build; extend this dict (with its own small
-# hand-written pipeline function above, following the same shape) the next time a new
-# companion optimization script lands and its exact function names have been confirmed
-# by reading it fully - do not repurpose the generic detector below for a known, heavy,
-# real pipeline, since the generic path calls whatever it finds immediately with no
-# "this is expensive" gate.
+def _dowtheory_pipeline(module):
+    # research/dow_theory_swing_structure_dukascopy_optimization.py exposes: INSTRUMENTS,
+    # FETCH_START/FETCH_END, SWING_LEN_GRID, LOCKBOX_MONTHS, opt_engine (=research/
+    # optimization_engine.py), fetch_instrument_data(label, const), run_full_pipeline(all_dfs,
+    # swing_len_grid, fetch_start, fetch_end, ...) -> dict with keys step1_search,
+    # step2_monte_carlo, step3_cluster, step3_plateau, step4_folds, step4_wfe, step4_verdict,
+    # verdict. Unlike PO3/Rauf, this strategy has exactly ONE tunable parameter (SWING_LEN) -
+    # heatmap/monte_carlo/walk_forward below are all 1-dimensional (a single named column/index
+    # instead of a 2-parameter grid pivot), not a simplification of the methodology, just its
+    # honest shape for a 1-parameter strategy.
+    all_dfs = {}
+    with cached_dukascopy_fetch():
+        for label, const in module.INSTRUMENTS:
+            df = module.fetch_instrument_data(label, const)
+            if df is None or df.empty:
+                continue
+            all_dfs[label] = df
+    if not all_dfs:
+        return OptimizationResult(available=False, reason="no data could be fetched for any instrument")
+
+    opt_engine = module.opt_engine
+    try:
+        search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            module.FETCH_START, module.FETCH_END, lockbox_months=module.LOCKBOX_MONTHS)
+    except ValueError:
+        search_start, search_end = module.FETCH_START, module.FETCH_END
+        lockbox_start = lockbox_end = None
+
+    results = module.run_full_pipeline(all_dfs, module.SWING_LEN_GRID, search_start.date(), search_end.date(),
+                                         show_progress=False, verbose=False)
+    if results["verdict"] != "SCORED":
+        return OptimizationResult(available=False, reason=f"pipeline verdict: {results['verdict']}")
+
+    search_result = results["step1_search"]
+    sorted_entries = sorted(search_result["all"], key=lambda e: e["params"]["SWING_LEN"])
+    heatmap_df = pd.DataFrame(
+        {"avg_r": [opt_engine.avg_r(e["trades"]) for e in sorted_entries]},
+        index=[f"SWING_LEN={e['params']['SWING_LEN']}" for e in sorted_entries])
+
+    mc_rows = []
+    for swing_len, mc in sorted(results["step2_monte_carlo"].items()):
+        boot = mc["bootstrap"]
+        mc_rows.append({"SWING_LEN": swing_len, "n_trades": mc["n_trades"],
+                         "boot_total_r_p05": boot["total_r_p05"], "boot_total_r_p50": boot["total_r_p50"],
+                         "boot_total_r_p95": boot["total_r_p95"], "p_total_r_leq_0": boot["p_total_r_leq_0"]})
+    mc_df = pd.DataFrame(mc_rows)
+
+    plateau = results["step3_plateau"]
+    cluster_verdict = (f"Best SWING_LEN={plateau['best_params']['SWING_LEN']} "
+                        f"(avg R/trade={plateau['best_avg_r']:+.4f}). {plateau['verdict']}.")
+    cluster = results["step3_cluster"]
+    if cluster is not None:
+        cluster_verdict += (f" KMeans cluster containing the best cell: {cluster['best_cluster_size']} of "
+                             f"{len(search_result['all'])} cells, mean avg R/trade="
+                             f"{cluster['best_cluster_mean_avg_r']:+.4f}.")
+    else:
+        cluster_verdict += " (scikit-learn not installed - cluster analysis skipped, neighbor check above still stands.)"
+
+    wf_rows = [{
+        "is_start": f["is_start"], "is_end": f["is_end"], "oos_start": f["oos_start"], "oos_end": f["oos_end"],
+        "chosen_swing_len": f["chosen_swing_len"], "is_avg_r": f["is_avg_r"], "n_oos_trades": len(f["oos_trades"]),
+        "oos_total_r": opt_engine.total_r(f["oos_trades"]) if f["oos_trades"] else 0.0,
+    } for f in results["step4_folds"]]
+    wf_df = pd.DataFrame(wf_rows)
+
+    thin_folds = [r for r in wf_rows if r["n_oos_trades"] < 5]
+    thin_note = ""
+    if thin_folds:
+        thin_note = (f" {len(thin_folds)}/{len(wf_rows)} fold(s) had <5 OOS trades - this strategy is a "
+                     f"naturally selective, low-frequency filter by design (see the base script's own "
+                     f"header), so this is expected, not a bug; treat Walk-Forward Efficiency below as "
+                     f"weak evidence at best when folds are this thin.")
+    wfe = results["step4_wfe"]
+    if wfe is None or (isinstance(wfe, float) and np.isnan(wfe)):
+        wfe_text = "undefined (no scorable out-of-sample trades)"
+    else:
+        wfe_text = f"{wfe:.3f} -> {results['step4_verdict']} the >=0.5 rule of thumb"
+    lockbox_note = (f"excluding the {module.LOCKBOX_MONTHS}-month lockbox window "
+                     f"{lockbox_start.date()} to {lockbox_end.date()}"
+                     if lockbox_start is not None else "no lockbox window carved (fetch range too short)")
+    best = search_result["best"]
+    extra_notes = (f"Best SWING_LEN from STEP 1 ({lockbox_note}): {best['params']['SWING_LEN']} "
+                   f"({len(best['trades'])} trades, {opt_engine.total_r(best['trades']):+.2f}R). "
+                   f"Walk-Forward Efficiency = {wfe_text}.{thin_note}")
+
+    decay = opt_engine.estimate_decay(results["step4_folds"])
+
+    return OptimizationResult(available=True, reason="full", heatmap=heatmap_df, monte_carlo=mc_df,
+                                cluster_verdict=cluster_verdict, walk_forward=wf_df, extra_notes=extra_notes,
+                                decay=decay)
+
+
+# strategy id -> (companion module name, real pipeline function). Extend this dict (with its own
+# small hand-written pipeline function above, following the same shape) the next time a new
+# companion optimization script lands and its exact function names have been confirmed by
+# reading it fully - do not repurpose the generic detector below for a known, heavy, real
+# pipeline, since the generic path calls whatever it finds immediately with no "this is
+# expensive" gate.
 KNOWN_PIPELINES = {
     "po3": ("research.ict_po3_forex_dukascopy_optimization", _po3_pipeline),
     "rauf": ("research.day_trading_rauf_dukascopy_optimization", _rauf_pipeline),
+    "dow_theory_swing_structure": ("research.dow_theory_swing_structure_dukascopy_optimization", _dowtheory_pipeline),
 }
 
 
