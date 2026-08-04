@@ -148,6 +148,28 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
     { label: "TP", values: window.map(() => levels.target), color: "#00e6a0", width: 1.5, dash: [4, 4] },
   ];
 
+  // THE SIGNAL MARKER. A horizontal entry line gives the price but not the bar, and
+  // on 60 candles "which one actually fired" is the first thing you look for. This is
+  // a single triangle sitting on the signal candle - up under a BUY, down over a
+  // SELL, matching the arrows the Pine indicator plots.
+  const signalIdx = window.length - 1;
+  const marker = (pointed) => ({
+    type: "line",
+    label: `${side} signal`,
+    data: pointed
+      ? [{ x: at[signalIdx], y: levels.entry }]
+      : window.map((_, i) => (i === signalIdx ? levels.entry : null)),
+    borderColor: "rgba(0,0,0,0)",
+    backgroundColor: side === "BUY" ? "#00e6a0" : "#ff4d6a",
+    pointStyle: side === "BUY" ? "triangle" : "triangle",
+    pointRadius: 9,
+    pointRotation: side === "BUY" ? 0 : 180,
+    pointBorderColor: "#0a0e17",
+    pointBorderWidth: 2,
+    showLine: false,
+    fill: false,
+  });
+
   const asLine = (o, pointed) => ({
     type: "line",
     label: o.label,
@@ -159,6 +181,7 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
     fill: false,
     spanGaps: true,
   });
+
 
   const common = {
     plugins: {
@@ -183,6 +206,7 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
             borderColor: { up: "#00e6a0", down: "#ff4d6a", unchanged: "#9aa7b8" },
           },
           ...overlays.map((o) => asLine(o, true)),
+          marker(true),
         ],
       },
       options: {
@@ -207,6 +231,7 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
       datasets: [
         { type: "line", label: symbol, data: window.map((c) => c.close), borderColor: "#e6edf3", borderWidth: 2, pointRadius: 0, fill: false },
         ...overlays.map((o) => asLine(o, false)),
+        marker(false),
       ],
     },
     options: {
