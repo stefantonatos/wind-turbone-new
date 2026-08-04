@@ -134,20 +134,6 @@ check the bot against the chart row by row. Deliberately not a `strategy()`:
 its job is alerts and eyeballing signals, and backtesting properly happens in
 `webapp/` against real costs and a holdout rather than on ~5000 free-plan bars.
 
-`pine/combined-setup-alert.pine` mirrors the same logic as a TradingView
-indicator, purely so you can visually sanity-check the `BUY`/`SELL`
-labels against what the bot sends you. It is **not** wired to any
-TradingView alert — no paid plan needed anywhere in this setup.
-
-`pine/combined-setup-strategy.pine` is the same rules again, but declared
-as a `strategy()` so TradingView's own Strategy Tester (Performance
-Summary, List of Trades) can backtest it directly on the chart. Free-plan
-history is limited to ~5000 bars (~2-3 weeks on 5-min candles), and the
-dollar P&L it shows isn't precise for forex without proper lot sizing —
-treat win rate and trade count as the numbers worth looking at, not the $
-figures. For a real backtest with real costs and an out-of-sample holdout, use
-the Streamlit app in `webapp/` rather than TradingView.
-
 ## Backtesting on QuantConnect (free, real historical data)
 
 `quantconnect/main.py` is the same strategy again, ported to QuantConnect's
