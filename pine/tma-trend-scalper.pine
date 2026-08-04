@@ -70,9 +70,14 @@ bgcolor(inSession ? color.new(color.blue, 92) : na, title="Session")
 // SMMA 21 / 50 / 200
 // ============================================
 
+// ta.sma is hoisted out of the ternary deliberately. Called inside it, it only
+// evaluates on the bars where the branch is taken, and a function carrying its own
+// history has to run every bar or that history is wrong. Pine warns about exactly
+// this; the fix is to evaluate it unconditionally, not to suppress the warning.
 smma(src, len) =>
+    seed = ta.sma(src, len)
     s = 0.0
-    s := na(s[1]) ? ta.sma(src, len) : (s[1] * (len - 1) + src) / len
+    s := na(s[1]) ? seed : (s[1] * (len - 1) + src) / len
     s
 
 smma21  = smma(close, 21)
