@@ -24,6 +24,7 @@
 # other changes needed anywhere in this file or in app.py.
 
 import importlib
+import inspect
 import json
 import os
 from dataclasses import dataclass
@@ -367,10 +368,139 @@ def _dowtheory_pipeline(module):
 # reading it fully - do not repurpose the generic detector below for a known, heavy, real
 # pipeline, since the generic path calls whatever it finds immediately with no "this is
 # expensive" gate.
+def _orb_pipeline(module, progress_cb=None):
+    """ORB (indices). research/orb_indices_optimization_and_ml.py has had a complete
+    4-step pipeline since it was written, but no adapter here and a filename the
+    registry's detector didn't recognise, so the app silently fell back to the generic
+    random sweep for the one strategy with the best independent research behind it.
+
+    Signature differences from _po3_pipeline, all real and all checked against the
+    module rather than assumed:
+      - data values are 4-tuples (df, indicators, tz_name, session_start), not bare
+        indicator frames; fetch is fetch_index_data(const, tz_name).
+      - the grid is (range_minutes, reward_risk), not (stop_buffer, fallback_rr).
+      - run_param_search returns (grid_results, search_result), and takes window
+        bounds as dates.
+
+    LOCKBOX BOUNDING: this module's own main() bounds only its optional WIDE_SEARCH
+    path to the search side, leaving its narrow PART 1 to run over the full range
+    including the lockbox window. This adapter bounds BOTH, matching every other
+    pipeline here - running the app's search across the sealed window would quietly
+    consume the one-shot holdout before the user ever reaches the Lockbox section."""
+    data = {}
+    with cached_dukascopy_fetch():
+        for label, instrument_const, tz_name, session_start in module.INDICES:
+            df = module.fetch_index_data(instrument_const, tz_name)
+            if df is None or df.empty:
+                continue
+            data[label] = (df, module.precompute_indicators(df), tz_name, session_start)
+    if not data:
+        return OptimizationResult(available=False, reason="no data could be fetched for any index")
+
+    opt_engine = module.opt_engine
+    try:
+        search_start, search_end, lockbox_start, lockbox_end = opt_engine.split_lockbox(
+            module.FETCH_START, module.FETCH_END, lockbox_months=module.LOCKBOX_MONTHS)
+    except ValueError:
+        search_start, search_end = module.FETCH_START, module.FETCH_END
+        lockbox_start = lockbox_end = None
+    ss, se = search_start.date(), search_end.date()
+
+    _tick(progress_cb, 0, "running", "grid search over range x reward:risk")
+    grid_results, search_result = module.run_param_search(
+        data, window_start=ss, window_end=se, desc="webapp step 1")
+    rm_list, rr_list, avg_r_matrix, _total = module.build_grid_matrix(grid_results)
+    heatmap_df = pd.DataFrame(avg_r_matrix,
+                              index=[f"RANGE={v:g}m" for v in rm_list],
+                              columns=[f"RR={v:g}" for v in rr_list])
+    _tick(progress_cb, 0, "done", f"{len(grid_results)} cells scored")
+
+    _tick(progress_cb, 1, "running", f"{module.MC_ITERATIONS} resamples per cell")
+    mc_results = module.run_monte_carlo_all_cells(grid_results)
+    mc_rows = []
+    for cell, mc in zip(grid_results, mc_results):
+        boot = mc.get("bootstrap") or {}
+        mc_rows.append({
+            "range_minutes": cell["range_minutes"], "reward_risk": cell["reward_risk"],
+            "n_trades": cell["n_trades"], "avg_r": cell["avg_r"],
+            "boot_total_r_p5": boot.get("total_r_p5"), "boot_total_r_p50": boot.get("total_r_p50"),
+            "boot_total_r_p95": boot.get("total_r_p95"), "p_total_r_le_0": boot.get("p_total_r_le_0"),
+        })
+    mc_df = pd.DataFrame(mc_rows).sort_values("avg_r", ascending=False).reset_index(drop=True)
+    _tick(progress_cb, 1, "done", f"{len(mc_rows)} cells resampled")
+
+    _tick(progress_cb, 2, "running", "plateau vs isolated spike")
+    neighbor = module.neighbor_plateau_check(grid_results)
+    cluster_verdict = (f"Best cell: RANGE_MINUTES={neighbor['best_range_minutes']:g}, "
+                       f"REWARD_RISK={neighbor['best_reward_risk']:g} "
+                       f"(avg R/trade={neighbor['best_avg_r']:+.4f}). "
+                       f"{neighbor['n_decent_neighbors']}/{neighbor['n_neighbors']} immediate grid "
+                       f"neighbors are decent -> {neighbor['verdict']}.")
+    try:
+        cluster = module.sklearn_cluster_analysis(grid_results)
+        if cluster is not None:
+            cluster_verdict += (f" KMeans cluster containing the best cell: {cluster['cluster_size']} of "
+                                f"{len(grid_results)} cells, mean avg R/trade={cluster['cluster_mean_avg_r']:+.4f}.")
+        else:
+            cluster_verdict += " (scikit-learn not installed - cluster analysis skipped, neighbor check above still stands.)"
+    except Exception as exc:
+        cluster_verdict += f" (cluster analysis raised {exc} - skipped.)"
+    _tick(progress_cb, 2, "done", neighbor.get("verdict", ""))
+
+    _tick(progress_cb, 3, "running", "refitting each fold, scoring unseen")
+    folds = module.generate_walk_forward_folds(module.FETCH_START.year, search_end.year)
+    fold_results, combined_oos_r = module.run_walk_forward(data, folds)
+    wfe_stats = module.compute_walk_forward_efficiency(fold_results, combined_oos_r)
+    wf_df = pd.DataFrame(fold_results)
+    _tick(progress_cb, 3, "done", f"{len(fold_results)} folds")
+
+    wfe = wfe_stats["wfe"]
+    if wfe_stats["mean_is_avg_r"] == 0 or (isinstance(wfe, float) and np.isnan(wfe)):
+        wfe_text = "undefined (mean in-sample avg R/trade is ~0)"
+    else:
+        wfe_text = f"{wfe:.3f} -> {'PASS' if wfe >= module.WFE_PASS_THRESHOLD else 'FAIL'} the >=0.5 rule of thumb"
+
+    # Multiple-testing bar, using the module's own corrected z-score rather than an
+    # avg_r*sqrt(n) shortcut - the number that decides whether the best cell means
+    # anything after searching this many combinations.
+    best_cell = module._find_cell(grid_results, search_result["best"]["params"])
+    best_z = opt_engine.zscore([{"r": r} for r in best_cell["trades_r"]])
+    n_trials = search_result.get("n_evals", len(grid_results))
+    z_bar = opt_engine.bonferroni_adjusted_z_threshold(n_trials)
+
+    lockbox_note = (f"excluding the {module.LOCKBOX_MONTHS}-month lockbox window "
+                    f"{lockbox_start.date()} to {lockbox_end.date()}"
+                    if lockbox_start is not None else "no lockbox window carved (fetch range too short)")
+    extra_notes = (f"Combined out-of-sample across {len(fold_results)} rolling folds (bounded by "
+                   f"{ss} to {se}, {lockbox_note}): "
+                   f"{wfe_stats['combined_oos_n_trades']} trades, {wfe_stats['combined_oos_total_r']:+.2f}R, "
+                   f"{wfe_stats['combined_oos_avg_r']:+.4f}R/trade. Walk-Forward Efficiency = {wfe_text}. "
+                   f"Best cell corrected z = {best_z:+.2f} against a Bonferroni-adjusted bar of "
+                   f"{z_bar:.2f} for the {n_trials} combinations tried -> "
+                   f"{'CLEARS' if abs(best_z) >= z_bar else 'does NOT clear'} it.")
+
+    decay = opt_engine.estimate_decay(fold_results)
+    return OptimizationResult(available=True, reason="full", heatmap=heatmap_df, monte_carlo=mc_df,
+                              cluster_verdict=cluster_verdict, walk_forward=wf_df, extra_notes=extra_notes,
+                              decay=decay)
+
+
+def _tick(progress_cb, stage, state, detail=""):
+    """Fire a pipeline-stage progress update, if the caller asked for one. Never lets a
+    UI callback's failure take down a pipeline that has already done real work."""
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(stage, state, detail)
+    except Exception:
+        pass
+
+
 KNOWN_PIPELINES = {
     "po3": ("research.ict_po3_forex_dukascopy_optimization", _po3_pipeline),
     "rauf": ("research.day_trading_rauf_dukascopy_optimization", _rauf_pipeline),
     "dow_theory_swing_structure": ("research.dow_theory_swing_structure_dukascopy_optimization", _dowtheory_pipeline),
+    "orb_indices": ("research.orb_indices_optimization_and_ml", _orb_pipeline),
 }
 
 
@@ -379,11 +509,16 @@ def known_pipeline_module_name(strategy_id):
     return entry[0] if entry else None
 
 
-def run_known_pipeline(strategy_id):
+def run_known_pipeline(strategy_id, progress_cb=None):
     """Actually runs the full, real, heavy 4-step pipeline for a strategy with a hand-wired
     adapter above. Caller (app.py) is responsible for gating this behind an explicit button
     and a spinner - this function does the real work and can take a long time. Never raises;
-    returns an OptimizationResult with available=False and a reason on any failure."""
+    returns an OptimizationResult with available=False and a reason on any failure.
+
+    `progress_cb(stage_index, state, detail)` is called as each of the four methodology
+    steps starts and finishes, so the UI can render which step is actually running rather
+    than an undifferentiated spinner. Only passed to adapters that declare they accept it
+    (checked by signature, so the older three keep working untouched)."""
     entry = KNOWN_PIPELINES.get(strategy_id)
     if entry is None:
         return OptimizationResult(available=False, reason="no hand-wired pipeline for this strategy")
@@ -393,6 +528,8 @@ def run_known_pipeline(strategy_id):
     except Exception as exc:
         return OptimizationResult(available=False, reason=f"import_failed: {exc}")
     try:
+        if progress_cb is not None and "progress_cb" in inspect.signature(pipeline_fn).parameters:
+            return pipeline_fn(module, progress_cb=progress_cb)
         return pipeline_fn(module)
     except Exception as exc:
         return OptimizationResult(available=False, reason=f"pipeline run failed: {exc}")
