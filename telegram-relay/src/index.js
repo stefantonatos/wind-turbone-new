@@ -16,16 +16,17 @@
 // "be ready", never an entry. Only the CLOSE pass reflects the strategy's real rule,
 // which is evaluated on a closed bar.
 //
-// WHAT REPLACED WHAT: this used to alert on the ORIGINAL, simpler setup in
-// ./strategy.js - a 21/50/200 stack + pattern + RSI>50 over an 08:00-02:30 London
-// window, with no ADX gate, no ATR volatility gate, no momentum check, no minimum
-// SMMA separation, and RSI compared to 50 rather than to its own SMMA(50). Those
-// alerts fired on setups the current strategy rejects. ./strategy.js is left
-// untouched because backtester/backtest.js imports it.
+// WHAT REPLACED WHAT: this used to alert on the ORIGINAL, simpler setup - a 21/50/200
+// stack + pattern + RSI>50 over an 08:00-02:30 London window, with no ADX gate, no ATR
+// volatility gate, no momentum check, no minimum SMMA separation, and RSI compared to
+// 50 rather than to its own SMMA(50). Those alerts fired on setups the current
+// strategy rejects. That logic has since been deleted outright rather than left beside
+// this one, so there is no second file in the repo that could be mistaken for the
+// rules the bot actually runs.
 
 import {
   MIN_BARS, SESSION_END_HOUR, SESSION_START_HOUR,
-  evaluateTMA, firstBlockingGate, inSession, minutesToClose, parseUTC, splitCandles,
+  evaluateTMA, firstBlockingGate, inSession, minutesToClose, parseUTC, rmaSeries, splitCandles,
 } from "./tma-strategy.js";
 
 // TwelveData free tier: 800 requests/day, 8/minute.
@@ -58,7 +59,11 @@ const OUTPUT_SIZE = 400; // > MIN_BARS (200 SMMA + 50-period RSI SMMA + slack)
 // Which cron fired. wrangler.toml registers the early pass first.
 const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 
-const CHART_IMG_ENDPOINT = "https://api.chart-img.com/v2/tradingview/advanced-chart";
+// QuickChart renders the chart server-side. No account and no API key, which is the
+// whole reason it is here rather than chart-img - see fetchChartImage below. If the
+// call fails for any reason the alert still goes out as text; a missing picture must
+// never cost you the signal.
+const QUICKCHART_ENDPOINT = "https://quickchart.io/chart";
 
 async function resolveSecret(binding) {
   if (binding == null) return undefined;
@@ -103,35 +108,109 @@ async function quotaUsed(env) {
   return Number((await env.ALERT_STATE.get(key)) || 0);
 }
 
-async function fetchChartImage(env, symbol, levels) {
-  const key = await resolveSecret(env.CHARTIMG_API_KEY);
-  if (!key) return null;
-  const body = {
-    symbol: tvSymbol(symbol),
-    interval: "5m",
-    theme: "dark",
-    width: 800,
-    height: 500,
-    timezone: "Etc/UTC",
-    studies: [
-      { name: "Moving Average", input: { length: 21 }, override: { "Plot.color": "rgb(255,255,255)" } },
-      { name: "Moving Average", input: { length: 50 }, override: { "Plot.color": "rgb(0,255,0)" } },
-      { name: "Moving Average", input: { length: 200 }, override: { "Plot.color": "rgb(255,0,0)" } },
-      { name: "Relative Strength Index", input: { length: 14 } },
-    ],
-    drawings: [
-      { name: "Horizontal Line", input: { price: levels.entry, text: "ENTRY" }, override: { lineColor: "rgb(255,255,255)" } },
-      { name: "Horizontal Line", input: { price: levels.stop, text: "SL" }, override: { lineColor: "rgb(255,0,0)" } },
-      { name: "Horizontal Line", input: { price: levels.target, text: "TP" }, override: { lineColor: "rgb(0,255,0)" } },
-    ],
+// How many bars of context the chart shows. Enough to read the swing that produced
+// the setup without shrinking the signal candle to a hairline.
+const CHART_BARS = 60;
+
+function chartConfig(symbol, candles, levels, side, { candlestick }) {
+  const window = candles.slice(-CHART_BARS);
+  const closes = candles.map((c) => c.close);
+  const smmaAt = (len) => {
+    const out = rmaSeries(closes, len, 0);
+    return out.slice(-CHART_BARS);
   };
-  const resp = await fetch(CHART_IMG_ENDPOINT, {
-    method: "POST",
-    headers: { "x-api-key": key, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+  const labels = window.map((c) => c.time.slice(11, 16));
+  const flat = (value) => window.map(() => value);
+
+  const priceSeries = candlestick
+    ? {
+        type: "candlestick",
+        label: symbol,
+        data: window.map((c, i) => ({ x: i, o: c.open, h: c.high, l: c.low, c: c.close })),
+        color: { up: "#00e6a0", down: "#ff4d6a", unchanged: "#9aa7b8" },
+      }
+    : {
+        type: "line",
+        label: symbol,
+        data: window.map((c) => c.close),
+        borderColor: "#e6edf3",
+        borderWidth: 2,
+        pointRadius: 0,
+        fill: false,
+      };
+
+  const line = (label, data, color, width = 1.5, dash = undefined) => ({
+    type: "line", label, data, borderColor: color, borderWidth: width,
+    pointRadius: 0, fill: false, borderDash: dash,
   });
-  if (!resp.ok) throw new Error(`chart-img ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
-  return await resp.arrayBuffer();
+
+  return {
+    type: candlestick ? "candlestick" : "line",
+    data: {
+      labels,
+      datasets: [
+        priceSeries,
+        line("SMMA 21", smmaAt(21), "#ffffff"),
+        line("SMMA 50", smmaAt(50), "#00e6a0"),
+        line("SMMA 200", smmaAt(200), "#ff4d6a"),
+        line(`Entry ${levels.entry}`, flat(levels.entry), "#00c2ff", 1.5, [6, 4]),
+        line("SL", flat(levels.stop), "#ff4d6a", 1.5, [4, 4]),
+        line("TP", flat(levels.target), "#00e6a0", 1.5, [4, 4]),
+      ],
+    },
+    options: {
+      plugins: {
+        title: { display: true, text: `${symbol} 5m — ${side}`, color: "#e6edf3", font: { size: 16 } },
+        legend: { labels: { color: "#9aa7b8", boxWidth: 12, font: { size: 10 } } },
+      },
+      scales: {
+        x: { ticks: { color: "#5c6b7f", maxTicksLimit: 8, font: { size: 9 } }, grid: { color: "rgba(255,255,255,0.06)" } },
+        y: { ticks: { color: "#5c6b7f", font: { size: 9 } }, grid: { color: "rgba(255,255,255,0.06)" }, position: "right" },
+      },
+    },
+  };
+}
+
+/**
+ * Renders the signal on a chart via QuickChart.
+ *
+ * WHY NOT chart-img: it would have produced a real TradingView-style image, but its
+ * only sign-in path is Google OAuth, which loops on iOS Safari - and the account here
+ * is driven from a phone. An image source you cannot get a key for is not an image
+ * source. QuickChart needs no account and no key at all.
+ *
+ * POST rather than a GET URL: the config carries 60 bars of OHLC plus four overlay
+ * series, which blows past practical URL length limits. Posting returns the PNG bytes
+ * directly, which is also the same shape the Telegram upload already wanted.
+ *
+ * CANDLESTICK WITH A LINE FALLBACK: candlesticks come from a Chart.js plugin whose
+ * availability is not guaranteed. If that render fails, this retries once as a plain
+ * line of closes rather than dropping the picture - the moving-average stack and the
+ * entry/SL/TP levels, which are most of the value, survive either way.
+ */
+async function fetchChartImage(env, symbol, candles, levels, side) {
+  const render = async (candlestick) => {
+    const resp = await fetch(QUICKCHART_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chart: chartConfig(symbol, candles, levels, side, { candlestick }),
+        width: 900,
+        height: 500,
+        format: "png",
+        backgroundColor: "#0a0e17",
+        version: "4",
+      }),
+    });
+    if (!resp.ok) throw new Error(`quickchart ${resp.status}: ${(await resp.text()).slice(0, 200)}`);
+    return await resp.arrayBuffer();
+  };
+
+  try {
+    return await render(true);
+  } catch (err) {
+    return await render(false);
+  }
 }
 
 async function sendText(env, text) {
@@ -158,9 +237,9 @@ async function sendPhoto(env, imageBuffer, caption) {
 }
 
 /** Sends the picture when it is available, and the words regardless. */
-async function deliver(env, caption, levels, symbol) {
+async function deliver(env, caption, levels, symbol, candles, side) {
   try {
-    const image = await fetchChartImage(env, symbol, levels);
+    const image = await fetchChartImage(env, symbol, candles, levels, side);
     if (image) {
       await sendPhoto(env, image, caption);
       return { imageSent: true };
@@ -267,7 +346,7 @@ async function earlyPass(env) {
       }
 
       const minsLeft = minutesToClose(forming);
-      const delivery = await deliver(env, formingMessage(pair, result, minsLeft), result.levels, pair.symbol);
+      const delivery = await deliver(env, formingMessage(pair, result, minsLeft), result.levels, pair.symbol, candles, result.side);
 
       if (env.ALERT_STATE) {
         await env.ALERT_STATE.put(warnKey, "1", { expirationTtl: 60 * 30 });
@@ -315,7 +394,7 @@ async function closePass(env) {
 
       const result = evaluateTMA(closed, { minDist: pair.minDist });
       if (result.ok && result.side === flagged.side) {
-        const delivery = await deliver(env, confirmedMessage(pair, result), result.levels, pair.symbol);
+        const delivery = await deliver(env, confirmedMessage(pair, result), result.levels, pair.symbol, closed, result.side);
         await env.ALERT_STATE.put(`${pair.symbol}:day:${dayStamp(last.time)}`, "1", { expirationTtl: 60 * 60 * 36 });
         results.push({ symbol: pair.symbol, confirmed: result.side, ...delivery });
       } else {
@@ -365,12 +444,11 @@ export default {
       const size = last.high - last.low;
       const levels = { entry: last.close, stop: last.close - size * 2, target: last.close + size * 4 };
       try {
-        const image = await fetchChartImage(env, pair.symbol, levels);
-        if (!image) return new Response("CHARTIMG_API_KEY not set", { status: 400 });
+        const image = await fetchChartImage(env, pair.symbol, candles, levels, "BUY");
         await sendPhoto(env, image, `🧪 *Test chart* — ${pair.symbol}\nNot a signal. Levels are illustrative.`);
         return new Response("Sent test chart", { status: 200 });
       } catch (err) {
-        return new Response(`chart-img failed: ${err}`, { status: 502 });
+        return new Response(`chart render failed: ${err}`, { status: 502 });
       }
     }
 

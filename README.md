@@ -213,15 +213,19 @@ npx wrangler secret put TWELVEDATA_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler secret put WEBHOOK_SECRET    # any random string you make up, for testing access
-npx wrangler secret put CHARTIMG_API_KEY  # optional - free key from https://chart-img.com
 
 npx wrangler deploy
 ```
 
-`CHARTIMG_API_KEY` is what puts a TradingView-style chart image on each alert.
-It is optional by design: if it is missing, or the call fails, or you run out of
-free-tier quota, the alert still goes out as text. A missing picture must never
-cost you the signal.
+The chart image on each alert is rendered by **QuickChart**, which needs no
+account and no API key — so there is no secret to set for it. That was not the
+first choice: chart-img.com would have produced a real TradingView-style image,
+but its only sign-in path is Google OAuth, which loops endlessly on iOS Safari,
+and this account is driven from a phone. An image source you cannot get a key for
+is not an image source.
+
+The picture is best-effort regardless: if the render fails for any reason the
+alert still goes out as text. A missing image must never cost you the signal.
 
 **Never paste any of these tokens into a chat, a commit, or a code file.**
 `wrangler secret put` prompts for the value and stores it encrypted with
