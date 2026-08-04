@@ -118,60 +118,101 @@ async function quotaUsed(env) {
 // the setup without shrinking the signal candle to a hairline.
 const CHART_BARS = 60;
 
+/**
+ * X AXIS, and the trap that cost a render.
+ *
+ * A candlestick dataset reads `x` as a TIMESTAMP IN MILLISECONDS, not as a position.
+ * The first version passed x: 0,1,2..., so every candle was plotted on 1 Jan 1970 -
+ * the axis said "1970" - and the overlay lines, which were index-aligned arrays
+ * against `labels`, had no valid x at all on that scale and were silently dropped.
+ * They showed in the legend and never appeared on the chart.
+ *
+ * So the two chart types need genuinely different shapes, not one shape with a flag:
+ *   candlestick -> every dataset is {x: epochMs, ...} on a time scale
+ *   line        -> plain arrays aligned to `labels` on the default category scale
+ * Trying to share one shape across both is what produced a chart with no indicators.
+ */
 function chartConfig(symbol, candles, levels, side, { candlestick }) {
   const window = candles.slice(-CHART_BARS);
   const closes = candles.map((c) => c.close);
-  const smmaAt = (len) => {
-    const out = rmaSeries(closes, len, 0);
-    return out.slice(-CHART_BARS);
-  };
-  const labels = window.map((c) => c.time.slice(11, 16));
-  const flat = (value) => window.map(() => value);
+  const smmaAt = (len) => rmaSeries(closes, len, 0).slice(-CHART_BARS);
+  const at = window.map((c) => parseUTC(c.time).getTime());
 
-  const priceSeries = candlestick
-    ? {
-        type: "candlestick",
-        label: symbol,
-        data: window.map((c, i) => ({ x: i, o: c.open, h: c.high, l: c.low, c: c.close })),
-        color: { up: "#00e6a0", down: "#ff4d6a", unchanged: "#9aa7b8" },
-      }
-    : {
-        type: "line",
-        label: symbol,
-        data: window.map((c) => c.close),
-        borderColor: "#e6edf3",
-        borderWidth: 2,
-        pointRadius: 0,
-        fill: false,
-      };
+  const overlays = [
+    { label: "SMMA 21", values: smmaAt(21), color: "#ffffff", width: 1.5 },
+    { label: "SMMA 50", values: smmaAt(50), color: "#00e6a0", width: 1.5 },
+    { label: "SMMA 200", values: smmaAt(200), color: "#ff4d6a", width: 1.5 },
+    { label: `Entry ${levels.entry}`, values: window.map(() => levels.entry), color: "#00c2ff", width: 1.5, dash: [6, 4] },
+    { label: "SL", values: window.map(() => levels.stop), color: "#ff4d6a", width: 1.5, dash: [4, 4] },
+    { label: "TP", values: window.map(() => levels.target), color: "#00e6a0", width: 1.5, dash: [4, 4] },
+  ];
 
-  const line = (label, data, color, width = 1.5, dash = undefined) => ({
-    type: "line", label, data, borderColor: color, borderWidth: width,
-    pointRadius: 0, fill: false, borderDash: dash,
+  const asLine = (o, pointed) => ({
+    type: "line",
+    label: o.label,
+    data: pointed ? o.values.map((v, i) => ({ x: at[i], y: v })) : o.values,
+    borderColor: o.color,
+    borderWidth: o.width,
+    borderDash: o.dash,
+    pointRadius: 0,
+    fill: false,
+    spanGaps: true,
   });
 
+  const common = {
+    plugins: {
+      title: { display: true, text: `${symbol} 5m — ${side}`, color: "#e6edf3", font: { size: 16 } },
+      legend: { labels: { color: "#9aa7b8", boxWidth: 12, font: { size: 10 } } },
+    },
+    scales: {
+      y: { ticks: { color: "#5c6b7f", font: { size: 9 } }, grid: { color: "rgba(255,255,255,0.06)" }, position: "right" },
+    },
+  };
+
+  if (candlestick) {
+    return {
+      type: "candlestick",
+      data: {
+        datasets: [
+          {
+            type: "candlestick",
+            label: symbol,
+            data: window.map((c, i) => ({ x: at[i], o: c.open, h: c.high, l: c.low, c: c.close })),
+            color: { up: "#00e6a0", down: "#ff4d6a", unchanged: "#9aa7b8" },
+            borderColor: { up: "#00e6a0", down: "#ff4d6a", unchanged: "#9aa7b8" },
+          },
+          ...overlays.map((o) => asLine(o, true)),
+        ],
+      },
+      options: {
+        ...common,
+        scales: {
+          ...common.scales,
+          x: {
+            type: "time",
+            time: { unit: "minute", stepSize: 15, displayFormats: { minute: "HH:mm" } },
+            ticks: { color: "#5c6b7f", maxTicksLimit: 8, font: { size: 9 } },
+            grid: { color: "rgba(255,255,255,0.06)" },
+          },
+        },
+      },
+    };
+  }
+
   return {
-    type: candlestick ? "candlestick" : "line",
+    type: "line",
     data: {
-      labels,
+      labels: window.map((c) => c.time.slice(11, 16)),
       datasets: [
-        priceSeries,
-        line("SMMA 21", smmaAt(21), "#ffffff"),
-        line("SMMA 50", smmaAt(50), "#00e6a0"),
-        line("SMMA 200", smmaAt(200), "#ff4d6a"),
-        line(`Entry ${levels.entry}`, flat(levels.entry), "#00c2ff", 1.5, [6, 4]),
-        line("SL", flat(levels.stop), "#ff4d6a", 1.5, [4, 4]),
-        line("TP", flat(levels.target), "#00e6a0", 1.5, [4, 4]),
+        { type: "line", label: symbol, data: window.map((c) => c.close), borderColor: "#e6edf3", borderWidth: 2, pointRadius: 0, fill: false },
+        ...overlays.map((o) => asLine(o, false)),
       ],
     },
     options: {
-      plugins: {
-        title: { display: true, text: `${symbol} 5m — ${side}`, color: "#e6edf3", font: { size: 16 } },
-        legend: { labels: { color: "#9aa7b8", boxWidth: 12, font: { size: 10 } } },
-      },
+      ...common,
       scales: {
+        ...common.scales,
         x: { ticks: { color: "#5c6b7f", maxTicksLimit: 8, font: { size: 9 } }, grid: { color: "rgba(255,255,255,0.06)" } },
-        y: { ticks: { color: "#5c6b7f", font: { size: 9 } }, grid: { color: "rgba(255,255,255,0.06)" }, position: "right" },
       },
     },
   };
