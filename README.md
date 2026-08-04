@@ -47,22 +47,43 @@ place the trade manually in MetaTrader 5.
 
 ## The setup being detected
 
-- **Trend gate (must hold)**: 21/50/200 smoothed moving averages stacked
-  in trend order, with price on the matching side of the 200 — only
-  bullish signals count in an uptrend, only bearish in a downtrend.
-- **Arrow**: a 3 Line Strike or Engulfing Candle pattern, matching the
-  trend direction.
-- **RSI confirm**: RSI(14) above 50 for a buy, below 50 for a sell.
-- Fires **once per closed 5-minute candle**, only during your trading
-  window (08:00–02:30 Europe/London, covering your waking hours — edit
-  `isWithinTradingWindow` in `telegram-relay/src/index.js` if that
-  changes).
-- Monitors **EUR/USD, GBP/USD, USD/JPY** (edit the `PAIRS` array in the
-  same file to change the list — more pairs costs more of the free API
-  quota, see below).
-- The Telegram message includes a suggested SL (2× the signal candle's
-  range) and TP (2:1 reward:risk), per the strategy's rule — you still
-  decide and place the actual trade.
+The alerts run the **TMA Trend Scalper (vFinal)** — the strategy currently
+being forward-tested. All seven gates must hold on a closed 5-minute candle:
+
+| Gate | Rule |
+|---|---|
+| Session | 07:00–15:00 UTC, Monday–Friday |
+| Trend stack | SMMA 21/50/200 in order, each separated by at least `minDist` |
+| Trend strength | ADX(14) > 25 |
+| Volatility | ATR(14) > 70% of its own 50-bar average |
+| Position | price on the correct side of the 200 SMMA |
+| Momentum | close vs SMA(5) and vs close[5], agreeing with the trend |
+| Pattern | 3 Line Strike **or** Engulfing, matching the trend |
+| RSI | RSI(14) past 50 **and** past its own SMMA(50) |
+
+Then: **one alert per instrument per day**, stop at 2× the signal candle's
+range, target at 4× (2:1). Position size comes from the stop distance, not a
+fixed lot — that is what "risk 1%" means when the stop moves every bar.
+
+> **Note on the earlier version of this bot.** It alerted on a simpler setup:
+> the same 21/50/200 stack, pattern and `RSI > 50`, over an 08:00–02:30 London
+> window. It had no ADX gate, no volatility gate, no momentum check, no minimum
+> SMMA separation, and it never compared RSI to its own average. It therefore
+> fired on setups the current strategy rejects. That logic still lives in
+> `telegram-relay/src/strategy.js` because `backtester/backtest.js` imports it;
+> the live alerts now use `telegram-relay/src/tma-strategy.js` instead.
+
+Monitors **8 pairs** — AUD/USD, EUR/USD, GBP/USD, NZD/USD, USD/CAD, USD/CHF,
+USD/JPY, EUR/JPY. Eight is the ceiling on the free TwelveData tier, not an
+arbitrary choice: 8 session hours × 12 fires/hour × 8 pairs = 768 requests/day
+against an 800/day cap, and one fire calls every pair back to back against an
+8-requests-per-minute limit. Adding a ninth breaks both. JPY pairs use
+`minDist: 0.10` rather than `0.001` — it is an absolute price distance, so it
+does not scale across quote currencies.
+
+`pine/tma-trend-scalper.pine` is the same rules as a TradingView strategy, with
+a live confluence table so you can see which gate is blocking a signal and
+check the bot against the chart row by row.
 
 `pine/combined-setup-alert.pine` mirrors the same logic as a TradingView
 indicator, purely so you can visually sanity-check the `BUY`/`SELL`
@@ -139,9 +160,19 @@ npx wrangler secret put TWELVEDATA_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler secret put WEBHOOK_SECRET    # any random string you make up, for testing access
+npx wrangler secret put CHARTIMG_API_KEY  # optional - free key from https://chart-img.com
 
 npx wrangler deploy
 ```
+
+`CHARTIMG_API_KEY` is what puts a TradingView-style chart image on each alert.
+It is optional by design: if it is missing, or the call fails, or you run out of
+free-tier quota, the alert still goes out as text. A missing picture must never
+cost you the signal.
+
+**Never paste any of these tokens into a chat, a commit, or a code file.**
+`wrangler secret put` prompts for the value and stores it encrypted with
+Cloudflare — it never touches the repo.
 
 The Cron Trigger (`*/5 * * * *`, every 5 minutes) is defined in
 `wrangler.toml` and starts running automatically once deployed — nothing
@@ -150,16 +181,29 @@ else to wire up.
 ## 4. Test it
 
 ```bash
-# Confirm Telegram delivery works at all:
-curl "https://forex-setup-alerts.<your-subdomain>.workers.dev/?secret=<your WEBHOOK_SECRET>&ping=1"
+BASE="https://forex-setup-alerts.<your-subdomain>.workers.dev"
+S="<your WEBHOOK_SECRET>"
 
-# Manually run a full check right now (outside the cron schedule) and see the result per pair:
-curl "https://forex-setup-alerts.<your-subdomain>.workers.dev/?secret=<your WEBHOOK_SECRET>"
+# 1. Confirm Telegram delivery works at all:
+curl "$BASE/?secret=$S&ping=1"
+
+# 2. Confirm the chart image works, and that you like how it looks,
+#    WITHOUT waiting for a real signal:
+curl "$BASE/?secret=$S&testchart=AUD/USD"
+
+# 3. Evaluate every pair right now, ignoring the session gate, and see
+#    exactly which condition is blocking each one:
+curl "$BASE/?secret=$S&debug=1"
 ```
 
-The second command returns JSON showing, per pair, whether it alerted,
-skipped (and why — outside trading window, no setup, already alerted
-this candle), or errored.
+`debug=1` is the one to use when checking the bot against TradingView. For every
+pair it reports either the signal, or `blockedBy` naming the first failing gate
+along with the live ADX and RSI. Those gate names line up one-for-one with the
+rows of the confluence table in `pine/tma-trend-scalper.pine`, so you can put the
+two side by side and see whether they agree.
+
+Without `debug=1` the same endpoint respects the session window, which is what
+the cron does.
 
 ## Changing pairs, timeframe, or window
 

@@ -1,0 +1,241 @@
+// TMA Trend Scalper - verification build.
+//
+// Same rules as the vFinal reference, with three changes, all of them so you can
+// actually CHECK the thing on a chart before wiring it to a Telegram bot:
+//
+//   1. POSITION SIZING BUG FIXED. The reference passed `qty=1` to strategy.entry(),
+//      which overrides default_qty_type/default_qty_value in Pine - those only apply
+//      when qty is omitted. So it traded 1 unit of base currency (~$0.65 on AUDUSD)
+//      regardless of the "risk 1% of account" rule, and any Strategy Tester result
+//      from it was a near-flat line that did not test the documented strategy.
+//      Sizing is now derived from the stop distance, which is what "risk 1%" means
+//      when the stop is 2x a candle whose size changes every bar.
+//
+//   2. LIVE CONFLUENCE TABLE. Top-right of the chart, updating every bar: each of
+//      the seven conditions with a tick or a cross and, where there is one, the
+//      actual number. When a signal you expected does not fire, this tells you
+//      which condition blocked it instead of leaving you to guess.
+//
+//   3. ALERT MESSAGES CARRY THE LEVELS. The alerts emit side, pair, entry, stop,
+//      target and the candle size, so the same text can drive the Telegram relay
+//      later without re-deriving anything on the other side.
+//
+// Nothing about the entry logic itself is changed. The SMMA stack, minDist
+// separation, ADX, ATR, momentum, pattern and RSI conditions are the reference's,
+// comparison for comparison.
+
+//@version=6
+strategy(title="TMA Trend Scalper (verify)", shorttitle="TMA Scalp", overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     initial_capital=1000, currency=currency.USD,
+     commission_type=strategy.commission.percent, commission_value=0.03,
+     calc_on_every_tick=false, process_orders_on_close=true)
+
+// ============================================
+// INPUTS
+// ============================================
+
+riskPct   = input.float(1.0,   "Risk % per trade",           minval=0.1, maxval=10, step=0.1, group="Risk")
+stopMult  = input.float(2.0,   "Stop = N x candle size",     minval=0.5, step=0.5,  group="Risk")
+targetMult= input.float(4.0,   "Target = N x candle size",   minval=0.5, step=0.5,  group="Risk")
+
+sessStart = input.int(7,  "Session start hour (UTC)", minval=0, maxval=23, group="Session")
+sessEnd   = input.int(15, "Session end hour (UTC)",   minval=1, maxval=24, group="Session")
+
+minDist   = input.float(0.001, "Min SMMA separation", step=0.0001, tooltip="0.001 for EURUSD/GBPUSD/AUDUSD, 0.10 for JPY pairs, 100 for BTC/ETH", group="Filters")
+adxMin    = input.float(25.0,  "ADX minimum",   minval=0, group="Filters")
+atrMult   = input.float(0.7,   "ATR vs 50-bar average", minval=0, step=0.05, group="Filters")
+
+oneTradePerDay = input.bool(true, "One trade per day maximum", group="Filters", tooltip="The strategy's own golden rule. Off = allow re-entry after a trade closes the same day.")
+showTable      = input.bool(true, "Show confluence table", group="Display")
+
+// ============================================
+// SESSION (UTC hours, weekdays only)
+// ============================================
+
+isWeekday = dayofweek != dayofweek.saturday and dayofweek != dayofweek.sunday
+inSession = hour >= sessStart and hour < sessEnd and isWeekday
+bgcolor(inSession ? color.new(color.blue, 92) : na, title="Session")
+
+// ============================================
+// SMMA 21 / 50 / 200  (Wilder smoothing, seeded with an SMA)
+// ============================================
+
+smma(src, len) =>
+    s = 0.0
+    s := na(s[1]) ? ta.sma(src, len) : (s[1] * (len - 1) + src) / len
+    s
+
+smma21  = smma(close, 21)
+smma50  = smma(close, 50)
+smma200 = smma(close, 200)
+ema2    = ta.ema(close, 2)
+
+// ============================================
+// FILTERS
+// ============================================
+
+adxVal    = ta.adx(high, low, close, 14)
+isTrending= adxVal > adxMin
+
+atrVal        = ta.atr(14)
+atrAvg        = ta.sma(atrVal, 50)
+hasVolatility = atrVal > atrAvg * atrMult
+
+bullTrendClean = smma21 > smma50 + minDist and smma50 > smma200 + minDist
+bearTrendClean = smma21 < smma50 - minDist and smma50 < smma200 - minDist
+
+priceAbove200 = close > smma200
+priceBelow200 = close < smma200
+
+bullMomentum = close > ta.sma(close, 5) and close > close[5]
+bearMomentum = close < ta.sma(close, 5) and close < close[5]
+
+bullTrendQuality = bullTrendClean and isTrending and priceAbove200 and bullMomentum and hasVolatility
+bearTrendQuality = bearTrendClean and isTrending and priceBelow200 and bearMomentum and hasVolatility
+
+// ============================================
+// PATTERNS
+// ============================================
+
+bullSig = close[3] < open[3] and close[2] < open[2] and close[1] < open[1] and close > open[1]
+bearSig = close[3] > open[3] and close[2] > open[2] and close[1] > open[1] and close < open[1]
+
+bullishEngulfing = open <= close[1] and open < open[1] and close > open[1]
+bearishEngulfing = open >= close[1] and open > open[1] and close < open[1]
+
+bullPattern = bullSig or bullishEngulfing
+bearPattern = bearSig or bearishEngulfing
+patternName = bullSig or bearSig ? "3-Line Strike" : bullishEngulfing or bearishEngulfing ? "Engulfing" : ""
+
+// ============================================
+// RSI
+// ============================================
+
+osc      = ta.rsi(close, 14)
+smmaOsc  = smma(osc, 50)
+rsiBullish = osc > 50 and osc > smmaOsc
+rsiBearish = osc < 50 and osc < smmaOsc
+
+// ============================================
+// ONE TRADE PER DAY
+// ============================================
+
+var int tradesToday = 0
+if ta.change(time("D")) != 0
+    tradesToday := 0
+dayLimitOK = not oneTradePerDay or tradesToday < 1
+
+// ============================================
+// SIGNALS
+// ============================================
+
+buySignal  = inSession and bullTrendQuality and bullPattern and rsiBullish and dayLimitOK
+sellSignal = inSession and bearTrendQuality and bearPattern and rsiBearish and dayLimitOK
+
+// ============================================
+// EXECUTION
+// ============================================
+// Position size comes from the stop distance, not a fixed lot. Risking `riskPct`
+// of equity with a stop `stopDist` away means qty = (equity * riskPct/100) / stopDist
+// - a smaller candle produces a tighter stop and therefore a LARGER position, which
+// is the whole point of the rule and the thing fixed-qty sizing throws away.
+
+candleSize = high - low
+stopDist   = candleSize * stopMult
+riskCash   = strategy.equity * riskPct / 100
+qtyRaw     = stopDist > 0 ? riskCash / stopDist : 0
+
+var float entryPrice = na
+var float stopLoss   = na
+var float takeProfit = na
+var int   entryIndex = na
+var string tradeType = na
+
+if buySignal and strategy.position_size == 0 and qtyRaw > 0
+    entryPrice := close
+    stopLoss   := entryPrice - stopDist
+    takeProfit := entryPrice + candleSize * targetMult
+    entryIndex := bar_index
+    tradeType  := "Long"
+    tradesToday += 1
+    strategy.entry("Long", strategy.long, qty=qtyRaw)
+    strategy.exit("Exit Long", "Long", stop=stopLoss, limit=takeProfit)
+
+if sellSignal and strategy.position_size == 0 and qtyRaw > 0
+    entryPrice := close
+    stopLoss   := entryPrice + stopDist
+    takeProfit := entryPrice - candleSize * targetMult
+    entryIndex := bar_index
+    tradeType  := "Short"
+    tradesToday += 1
+    strategy.entry("Short", strategy.short, qty=qtyRaw)
+    strategy.exit("Exit Short", "Short", stop=stopLoss, limit=takeProfit)
+
+// ============================================
+// CONFLUENCE TABLE - the verification tool
+// ============================================
+// Every gate, every bar, with the number behind it where there is one. If a signal
+// you expected on the chart did not fire, exactly one row here is red.
+
+mark(bool ok) => ok ? "✔" : "✘"
+markCol(bool ok) => ok ? color.new(color.lime, 0) : color.new(color.red, 0)
+
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 3, 9, border_width=1)
+    dirBull = bullTrendQuality
+    dirLabel = dirBull ? "BULL" : bearTrendQuality ? "BEAR" : "none"
+
+    table.cell(t, 0, 0, "CONFLUENCE", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+    table.cell(t, 1, 0, dirLabel,     text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+    table.cell(t, 2, 0, "value",      text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+
+    stackOK = bullTrendClean or bearTrendClean
+    posOK   = dirBull ? priceAbove200 : priceBelow200
+    momOK   = dirBull ? bullMomentum  : bearMomentum
+    patOK   = dirBull ? bullPattern   : bearPattern
+    rsiOK   = dirBull ? rsiBullish    : rsiBearish
+
+    rows = array.from("Session 7-15 UTC", "SMMA stack + gap", "ADX > " + str.tostring(adxMin, "#.#"), "ATR volatility", "Price vs 200", "Momentum", "Pattern", "RSI")
+    oks  = array.from(inSession, stackOK, isTrending, hasVolatility, posOK, momOK, patOK, rsiOK)
+    vals = array.from(str.format("{0,time,HH:mm} UTC", time), str.tostring(math.abs(smma21 - smma50), format.mintick), str.tostring(adxVal, "#.#"), str.tostring(atrVal / atrAvg * 100, "#") + "%", str.tostring(close - smma200, format.mintick), str.tostring(close - ta.sma(close, 5), format.mintick), patternName == "" ? "-" : patternName, str.tostring(osc, "#.#"))
+
+    for i = 0 to array.size(rows) - 1
+        ok = array.get(oks, i)
+        table.cell(t, 0, i + 1, array.get(rows, i), text_color=color.silver, text_size=size.small)
+        table.cell(t, 1, i + 1, mark(ok), text_color=markCol(ok), text_size=size.small)
+        table.cell(t, 2, i + 1, array.get(vals, i), text_color=color.silver, text_size=size.small)
+
+// ============================================
+// PLOTTING
+// ============================================
+
+plot(smma21,  color=color.white, linewidth=2, title="21 SMMA")
+plot(smma50,  color=color.lime,  linewidth=2, title="50 SMMA")
+plot(smma200, color=color.red,   linewidth=2, title="200 SMMA")
+plot(ema2,    color=color.new(color.blue, 40), linewidth=1, title="EMA 2")
+
+plotshape(buySignal,  title="Buy Signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, text="BUY")
+plotshape(sellSignal, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, text="SELL")
+
+bgcolor(bullTrendQuality ? color.new(color.green, 92) : bearTrendQuality ? color.new(color.red, 92) : na, title="Trend quality")
+
+// ============================================
+// ALERTS - carry the levels so the relay does not re-derive them
+// ============================================
+
+alertMsg(string side) =>
+    st = side == "BUY" ? close - stopDist : close + stopDist
+    tp = side == "BUY" ? close + candleSize * targetMult : close - candleSize * targetMult
+    str.format("{0}|{1}|entry={2}|sl={3}|tp={4}|candle={5}|rsi={6}|adx={7}|pattern={8}",
+       side, syminfo.ticker, str.tostring(close, format.mintick), str.tostring(st, format.mintick),
+       str.tostring(tp, format.mintick), str.tostring(candleSize, format.mintick),
+       str.tostring(osc, "#.#"), str.tostring(adxVal, "#.#"), patternName)
+
+alertcondition(buySignal,  title="BUY Signal",  message="TMA BUY")
+alertcondition(sellSignal, title="SELL Signal", message="TMA SELL")
+
+if buySignal
+    alert(alertMsg("BUY"), alert.freq_once_per_bar_close)
+if sellSignal
+    alert(alertMsg("SELL"), alert.freq_once_per_bar_close)
