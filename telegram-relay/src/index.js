@@ -153,18 +153,28 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
   // a single triangle sitting on the signal candle - up under a BUY, down over a
   // SELL, matching the arrows the Pine indicator plots.
   const signalIdx = window.length - 1;
+  // Sit the arrow OUTSIDE the candle - below the low on a BUY, above the high on a
+  // SELL - the way the Pine indicator places its own. Drawn at the entry price it
+  // lands on the candle body in the same colour as an up-bar and disappears into it.
+  // Offset scales with the visible candle range so it clears the wick at any zoom.
+  const visibleRange =
+    Math.max(...window.map((c) => c.high)) - Math.min(...window.map((c) => c.low)) || 1;
+  const signalBar = window[signalIdx];
+  const markerY = side === "BUY"
+    ? signalBar.low - visibleRange * 0.08
+    : signalBar.high + visibleRange * 0.08;
   const marker = (pointed) => ({
     type: "line",
     label: `${side} signal`,
     data: pointed
-      ? [{ x: at[signalIdx], y: levels.entry }]
-      : window.map((_, i) => (i === signalIdx ? levels.entry : null)),
+      ? [{ x: at[signalIdx], y: markerY }]
+      : window.map((_, i) => (i === signalIdx ? markerY : null)),
     borderColor: "rgba(0,0,0,0)",
     backgroundColor: side === "BUY" ? "#00e6a0" : "#ff4d6a",
     pointStyle: side === "BUY" ? "triangle" : "triangle",
-    pointRadius: 9,
+    pointRadius: 11,
     pointRotation: side === "BUY" ? 0 : 180,
-    pointBorderColor: "#0a0e17",
+    pointBorderColor: "#e6edf3",
     pointBorderWidth: 2,
     showLine: false,
     fill: false,
