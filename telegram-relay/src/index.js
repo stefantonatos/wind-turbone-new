@@ -168,6 +168,8 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
     pointBorderWidth: 2,
     showLine: false,
     fill: false,
+    clip: false,
+    order: -1,
   });
 
   const asLine = (o, pointed) => ({
@@ -184,6 +186,10 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
 
 
   const common = {
+    // The signal is always the LAST bar, which lands hard against the right-hand
+    // y-axis. Without this padding its marker is drawn on top of the axis and reads
+    // as missing - the first attempt looked like the marker had not been added at all.
+    layout: { padding: { right: 28, top: 4 } },
     plugins: {
       title: { display: true, text: `${symbol} 5m — ${side}`, color: "#e6edf3", font: { size: 16 } },
       legend: { labels: { color: "#9aa7b8", boxWidth: 12, font: { size: 10 } } },
