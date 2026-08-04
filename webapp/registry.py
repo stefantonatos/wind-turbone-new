@@ -470,15 +470,35 @@ def _find_optimization_module(module_name):
     <backtest module name with '_backtest' replaced by '_optimization'>. Returns
     the module name string if research/<name>.py exists on disk, else None. Other
     agents are building these in parallel - this only detects them, it never
-    assumes a specific function signature beyond what optimization.py documents."""
+    assumes a specific function signature beyond what optimization.py documents.
+
+    SECOND SUFFIX, and why: research/orb_indices_optimization_and_ml.py is a real,
+    complete 4-step pipeline (grid search, Monte Carlo, cluster check, walk-forward,
+    12-month lockbox) that this detector silently missed for its entire existence,
+    because it is named '..._optimization_and_ml' rather than '..._optimization'. The
+    ORB strategy therefore rendered the lightweight random sweep instead of its own
+    hand-built pipeline, with nothing anywhere saying so.
+
+    That file differs from the convention on BOTH axes - it is
+    'orb_indices_optimization_and_ml.py' against a backtest named
+    'orb_indices_dukascopy_backtest.py', so it drops the '_dukascopy' segment as well
+    as taking an extra suffix. Both variations are tried, most-specific stem first, and
+    the first file that exists wins. Extend these lists rather than renaming a research
+    script: the scripts are also run standalone in Colab by filename, and the lockbox
+    ledger keys off strategy ids that appear in their headers."""
     import os
     if not module_name.endswith("_backtest"):
         return None
-    candidate = module_name[: -len("_backtest")] + "_optimization"
+    stem = module_name[: -len("_backtest")].split(".")[-1]
+    stems = [stem]
+    if stem.endswith("_dukascopy"):
+        stems.append(stem[: -len("_dukascopy")])
     research_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "research")
-    path = os.path.join(research_dir, candidate.split(".")[-1] + ".py")
-    if os.path.isfile(path):
-        return f"research.{candidate.split('.')[-1]}"
+    for candidate_stem in stems:
+        for suffix in ("_optimization", "_optimization_and_ml"):
+            candidate = candidate_stem + suffix
+            if os.path.isfile(os.path.join(research_dir, candidate + ".py")):
+                return f"research.{candidate}"
     return None
 
 

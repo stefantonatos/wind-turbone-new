@@ -1,0 +1,233 @@
+// TMA Trend Scalper - BASE strategy only.
+//
+// This is the original entry logic, nothing bolted on. Five conditions:
+//   1. Session   - 07:00-15:00 London, weekdays.
+//   2. Stack     - SMMA 21 > 50 > 200 (or the reverse for shorts).
+//   3. Position  - close on the correct side of the SMMA 200.
+//   4. Pattern   - 3-Line Strike OR Engulfing.
+//   5. RSI       - above 50 and above its own SMMA(50)  (below/below for shorts).
+//
+// Deliberately NOT here: the minimum SMMA separation, ADX > 25, the ATR volatility
+// floor, the momentum check vs SMA(5), and the one-signal-per-day cap. Those came
+// from the vFinal notes as chop filters and they cut the signal count hard - which
+// is why the chart looked empty. Removing them means many more arrows, and the
+// unfiltered version is the one that has never been cost-tested. That is a fair
+// trade for seeing the raw entries; it is not a claim that the raw entries are
+// better.
+//
+// An INDICATOR, not a strategy - no Strategy Tester machinery. Backtesting happens
+// in the webapp against Dukascopy data with real costs and a holdout.
+//
+// vs ArtyFXC's TMA Overlay: this should now line up closely. Any arrow he draws in
+// session, in-stack, on the right side of the 200, with RSI confirming, should have
+// one here too. If it does not, the pattern detection is wrong and that is a bug.
+
+//@version=6
+indicator(title="TMA Trend Scalper", shorttitle="TMA Scalp", overlay=true, max_labels_count=500)
+
+// ============================================
+// INPUTS
+// ============================================
+
+stopMult   = input.float(2.0, "Stop = N x candle size",   minval=0.5, step=0.5, group="Levels")
+targetMult = input.float(4.0, "Target = N x candle size", minval=0.5, step=0.5, group="Levels")
+showLevels = input.bool(true, "Draw entry/SL/TP on signals", group="Levels")
+
+sessWindow = input.session("0700-1500", "Session (London local time)", group="Session",
+     tooltip="London LOCAL, not UTC. The two agree only in winter: London runs UTC+1 under BST from late March to late October, so a UTC-pinned window slides an hour off the session every year.")
+// DEFAULT OFF, to match the live worker. tma-strategy.js currently runs
+// SESSION_START_HOUR=0 / SESSION_END_HOUR=24, so leaving this on made the chart
+// refuse signals the bot would happily alert on - the two disagreeing is the exact
+// failure this pairing exists to catch. Turn both back on together, never one.
+useSession = input.bool(false, "Restrict to session", group="Session")
+
+// The reference's written spec and its code disagree here. Spec: the fourth candle
+// closes beyond "the open of the 1st red candle" (open[3]) - i.e. one candle undoes
+// all three, which is the textbook pattern. Code: beyond open[1], the LAST of the
+// three, which only undoes the final candle and fires far more often. This follows
+// the CODE, because the code is what has been forward-tested.
+strictStrike = input.bool(false, "3-Line Strike must undo all three candles", group="Pattern",
+     tooltip="Off (default) = the original code: close beyond open[1]. On = the written spec and the textbook pattern: close beyond open[3]. Stricter, fires much less often.")
+
+showTable = input.bool(true, "Show confluence table", group="Display")
+
+// ============================================
+// SESSION (London local, weekdays only)
+// ============================================
+// ":23456" is Monday-Friday. Pine numbers days 1=Sunday..7=Saturday, so the original
+// script's `dayofweek >= 1 and dayofweek <= 5` was actually Sunday-Thursday - it
+// traded Sunday's opening hours and skipped Friday. Fixed here.
+inSession = not useSession or not na(time(timeframe.period, sessWindow + ":23456", "Europe/London"))
+bgcolor(useSession and inSession ? color.new(color.blue, 92) : na, title="Session")
+
+// ============================================
+// SMMA 21 / 50 / 200
+// ============================================
+// ta.sma is hoisted out of the ternary deliberately. Called inside it, it only
+// evaluates on the bars where the branch is taken, and a function carrying its own
+// history has to run every bar or that history is wrong.
+
+smma(src, len) =>
+    seed = ta.sma(src, len)
+    s = 0.0
+    s := na(s[1]) ? seed : (s[1] * (len - 1) + src) / len
+    s
+
+smma21  = smma(close, 21)
+smma50  = smma(close, 50)
+smma200 = smma(close, 200)
+ema2    = ta.ema(close, 2)
+
+// ============================================
+// TREND
+// ============================================
+
+bullStack = smma21 > smma50 and smma50 > smma200
+bearStack = smma21 < smma50 and smma50 < smma200
+
+priceAbove200 = close > smma200
+priceBelow200 = close < smma200
+
+bullTrend = bullStack and priceAbove200
+bearTrend = bearStack and priceBelow200
+
+// ============================================
+// PATTERNS
+// ============================================
+
+threeDown = close[3] < open[3] and close[2] < open[2] and close[1] < open[1]
+threeUp   = close[3] > open[3] and close[2] > open[2] and close[1] > open[1]
+strikeRef = strictStrike ? open[3] : open[1]
+
+bullSig = threeDown and close > strikeRef
+bearSig = threeUp   and close < strikeRef
+
+bullishEngulfing = open <= close[1] and open < open[1] and close > open[1]
+bearishEngulfing = open >= close[1] and open > open[1] and close < open[1]
+
+bullPattern = bullSig or bullishEngulfing
+bearPattern = bearSig or bearishEngulfing
+patternName = bullSig or bearSig ? "3-Line Strike" : bullishEngulfing or bearishEngulfing ? "Engulfing" : ""
+
+// ============================================
+// RSI
+// ============================================
+
+osc     = ta.rsi(close, 14)
+smmaOsc = smma(osc, 50)
+rsiBullish = osc > 50 and osc > smmaOsc
+rsiBearish = osc < 50 and osc < smmaOsc
+
+// ============================================
+// SIGNALS
+// ============================================
+
+buySignal  = inSession and bullTrend and bullPattern and rsiBullish
+sellSignal = inSession and bearTrend and bearPattern and rsiBearish
+
+// ============================================
+// LEVELS
+// ============================================
+// Computed once and shared by the labels and the alert text. The original recomputed
+// them inside its alert string, which is how two expressions for one number quietly
+// drift apart.
+//
+// pipSize: mintick x 10 gives 0.0001 on 5-decimal FX and 0.01 on 3-decimal JPY pairs,
+// which is what "pips" means on each.
+
+candleSize = high - low
+stopDist   = candleSize * stopMult
+targetDist = candleSize * targetMult
+pipSize    = syminfo.mintick * 10
+slPips     = stopDist / pipSize
+tpPips     = targetDist / pipSize
+
+longStop    = close - stopDist
+longTarget  = close + targetDist
+shortStop   = close + stopDist
+shortTarget = close - targetDist
+
+if showLevels and buySignal
+    label.new(bar_index, longTarget, "TP " + str.tostring(longTarget, format.mintick), style=label.style_label_down, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+    label.new(bar_index, longStop,   "SL " + str.tostring(longStop, format.mintick),   style=label.style_label_up,   color=color.new(color.red, 20),   textcolor=color.white, size=size.tiny)
+
+if showLevels and sellSignal
+    label.new(bar_index, shortStop,   "SL " + str.tostring(shortStop, format.mintick),   style=label.style_label_down, color=color.new(color.red, 20),   textcolor=color.white, size=size.tiny)
+    label.new(bar_index, shortTarget, "TP " + str.tostring(shortTarget, format.mintick), style=label.style_label_up,   color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+
+// ============================================
+// CONFLUENCE TABLE
+// ============================================
+// DIRECTION COMES FROM THE STACK. Keying the direction-dependent rows off the full
+// trend flag meant that as soon as one gate failed, both flags went false and every
+// row flipped to asking the OPPOSITE question - so a bullish setup showed "Price vs
+// 200" red while price sat correctly above the 200.
+
+mark(bool ok) => ok ? "✔" : "✘"
+markCol(bool ok) => ok ? color.new(color.lime, 0) : color.new(color.red, 0)
+
+if showTable and barstate.islast
+    var table t = table.new(position.top_right, 3, 6, border_width=1)
+    dirLabel = bullStack ? "BULL" : bearStack ? "BEAR" : "none"
+
+    table.cell(t, 0, 0, "CONFLUENCE", text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+    table.cell(t, 1, 0, dirLabel,     text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+    table.cell(t, 2, 0, "value",      text_color=color.white, bgcolor=color.new(color.blue, 40), text_size=size.small)
+
+    posOK = bullStack ? priceAbove200 : bearStack ? priceBelow200 : false
+    patOK = bullStack ? bullPattern   : bearStack ? bearPattern   : false
+    rsiOK = bullStack ? rsiBullish    : bearStack ? rsiBearish    : false
+
+    rows = array.from("Session " + sessWindow + " LDN", "SMMA stack", "Price vs 200", "Pattern", "RSI vs SMMA")
+    oks  = array.from(inSession, bullStack or bearStack, posOK, patOK, rsiOK)
+    vals = array.from(
+       str.format_time(time, "HH:mm", "Europe/London"),
+       str.tostring(smma21 - smma50, format.mintick) + " / " + str.tostring(smma50 - smma200, format.mintick),
+       str.tostring(close - smma200, format.mintick),
+       patternName == "" ? "-" : patternName,
+       str.tostring(osc, "#.#") + " / " + str.tostring(smmaOsc, "#.#"))
+
+    for i = 0 to array.size(rows) - 1
+        ok = array.get(oks, i)
+        table.cell(t, 0, i + 1, array.get(rows, i), text_color=color.silver, text_size=size.small)
+        table.cell(t, 1, i + 1, mark(ok), text_color=markCol(ok), text_size=size.small)
+        table.cell(t, 2, i + 1, array.get(vals, i), text_color=color.silver, text_size=size.small)
+
+// ============================================
+// PLOTTING
+// ============================================
+
+plot(smma21,  color=color.white, linewidth=2, title="21 SMMA")
+plot(smma50,  color=color.lime,  linewidth=2, title="50 SMMA")
+plot(smma200, color=color.red,   linewidth=2, title="200 SMMA")
+plot(ema2,    color=color.new(color.blue, 40), linewidth=1, title="EMA 2")
+
+plotshape(buySignal,  title="Buy Signal",  style=shape.triangleup,   location=location.belowbar, color=color.green, size=size.small, text="BUY")
+plotshape(sellSignal, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.red,   size=size.small, text="SELL")
+
+bgcolor(bullTrend ? color.new(color.green, 92) : bearTrend ? color.new(color.red, 92) : na, title="Trend")
+
+// ============================================
+// ALERTS
+// ============================================
+// Same fields, same order as the Telegram relay's message, so the two can be put side
+// by side. freq_once_per_bar_close is deliberate: the rule is defined on a CLOSED bar,
+// and firing intrabar would alert on setups that then evaporate before the candle
+// finishes.
+
+alertMsg(string side) =>
+    st = side == "BUY" ? longStop : shortStop
+    tp = side == "BUY" ? longTarget : shortTarget
+    str.format("{0} {1} 5m | entry {2} | SL {3} ({4} pips) | TP {5} ({6} pips) | {7} | RSI {8} vs {9}",
+       side, syminfo.ticker,
+       str.tostring(close, format.mintick), str.tostring(st, format.mintick), str.tostring(slPips, "#.#"),
+       str.tostring(tp, format.mintick), str.tostring(tpPips, "#.#"),
+       patternName, str.tostring(osc, "#.#"), str.tostring(smmaOsc, "#.#"))
+
+alertcondition(buySignal,  title="TMA BUY",  message="TMA BUY signal")
+alertcondition(sellSignal, title="TMA SELL", message="TMA SELL signal")
+
+if buySignal
+    alert(alertMsg("BUY"), alert.freq_once_per_bar_close)
+if sellSignal
+    alert(alertMsg("SELL"), alert.freq_once_per_bar_close)

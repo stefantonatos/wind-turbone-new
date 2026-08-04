@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import github_storage
 import optimization
+import optimization_viz
 import run_history
 import stats as stats_mod
 import style
@@ -683,30 +684,73 @@ def _render_optimization_result(result, opt_module_name):
                        "once one lands and webapp/optimization.py recognizes its function names.")
         return
 
+    # The pipeline rail, rendered from the finished result so the completed run reads the
+    # same way the live one did - which of the four steps produced output, and which the
+    # companion module didn't expose.
+    st.markdown(optimization_viz.render_pipeline(optimization_viz.states_from_result(result)),
+                unsafe_allow_html=True)
+
     if result.heatmap is not None:
-        st.markdown(eyebrow("PARAMETER STABILITY HEATMAP (AVG R/TRADE)"), unsafe_allow_html=True)
-        st.dataframe(style_diverging_heatmap(result.heatmap), width="stretch")
+        st.markdown(eyebrow("STEP 01 · PARAMETER GRID (AVG R/TRADE)"), unsafe_allow_html=True)
+        fig = optimization_viz.heatmap_figure(result.heatmap)
+        if fig is not None:
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+            st.caption("Zero is pinned to the neutral midpoint, so a grid with no profitable corner "
+                       "stays grey rather than rendering half-green. A broad warm or cool region is a "
+                       "plateau; a single bright cell surrounded by its opposite is the classic "
+                       "overfitting signature.")
+        with st.expander("Table view"):
+            st.dataframe(style_diverging_heatmap(result.heatmap), width="stretch")
     if result.monte_carlo is not None and not result.monte_carlo.empty:
-        st.markdown(eyebrow("MONTE CARLO PER CELL"), unsafe_allow_html=True)
-        # signed color+sign applies to R-multiple/P&L columns only - a probability column
-        # (P(total R<=0)) isn't a P&L figure, so "positive=good" coloring would be backwards
-        # (a HIGH probability of loss is bad news, not a green number)
-        non_signed = {"stop_buffer_pct", "fallback_reward_risk", "confirmation_candles", "n_trades"}
-        signed_cols = [c for c in result.monte_carlo.columns
-                       if c not in non_signed and "p_total_r" not in c and "p_le_0" not in c]
-        prob_cols = [c for c in result.monte_carlo.columns if "p_total_r" in c or "p_le_0" in c]
-        mc_styler = style_signed_columns(result.monte_carlo, signed_cols, fmt="{:+.4f}")
-        if prob_cols and hasattr(mc_styler, "format"):
-            mc_styler = mc_styler.format({c: "{:.1%}" for c in prob_cols})
-        st.dataframe(mc_styler, width="stretch", hide_index=True)
+        st.markdown(eyebrow("STEP 02 · MONTE CARLO"), unsafe_allow_html=True)
+        headline = optimization_viz.monte_carlo_headline(result.monte_carlo)
+        if headline:
+            hc = st.columns(3)
+            hc[0].metric("Cells clearing zero at p5", f"{headline['cleared']} / {headline['total']}")
+            hc[1].metric("Share", f"{headline['share']:.0%}")
+            hc[2].metric("Resampling", "bootstrap")
+            st.caption("The number that matters is how many cells' 5th percentile is still ABOVE zero. "
+                       "A bootstrap of a strategy's own winning trades returns almost all-positive paths "
+                       "for any profitable backtest - so 'every path was positive' restates that the "
+                       "backtest made money and is not out-of-sample evidence on its own.")
+        mc_fig = optimization_viz.monte_carlo_figure(result.monte_carlo)
+        if mc_fig is not None:
+            st.plotly_chart(mc_fig, width="stretch", config={"displayModeBar": False})
+        with st.expander("Table view"):
+            # signed color+sign applies to R-multiple/P&L columns only - a probability column
+            # (P(total R<=0)) isn't a P&L figure, so "positive=good" coloring would be backwards
+            # (a HIGH probability of loss is bad news, not a green number)
+            non_signed = {"stop_buffer_pct", "fallback_reward_risk", "confirmation_candles",
+                          "n_trades", "range_minutes", "reward_risk"}
+            signed_cols = [c for c in result.monte_carlo.columns
+                           if c not in non_signed and "p_total_r" not in c and "p_le_0" not in c]
+            prob_cols = [c for c in result.monte_carlo.columns if "p_total_r" in c or "p_le_0" in c]
+            mc_styler = style_signed_columns(result.monte_carlo, signed_cols, fmt="{:+.4f}")
+            if prob_cols and hasattr(mc_styler, "format"):
+                mc_styler = mc_styler.format({c: "{:.1%}" for c in prob_cols})
+            st.dataframe(mc_styler, width="stretch", hide_index=True)
     if result.cluster_verdict is not None:
-        st.markdown(eyebrow("CLUSTER / PLATEAU-VS-SPIKE VERDICT"), unsafe_allow_html=True)
+        st.markdown(eyebrow("STEP 03 · PLATEAU VS ISOLATED SPIKE"), unsafe_allow_html=True)
         st.write(result.cluster_verdict)
     if result.walk_forward is not None and not result.walk_forward.empty:
-        st.markdown(eyebrow("ROLLING WALK-FORWARD VALIDATION"), unsafe_allow_html=True)
-        wf_signed = [c for c in result.walk_forward.columns if "total_r" in c or "avg_r" in c]
-        st.dataframe(style_signed_columns(result.walk_forward, wf_signed, fmt="{:+.4f}"),
-                     width="stretch", hide_index=True)
+        st.markdown(eyebrow("STEP 04 · ROLLING WALK-FORWARD"), unsafe_allow_html=True)
+        wf_headline = optimization_viz.walk_forward_headline(result.walk_forward)
+        if wf_headline:
+            wc = st.columns(3)
+            wc[0].metric("Folds profitable out-of-sample",
+                         f"{wf_headline['positive']} / {wf_headline['total']}")
+            wc[1].metric("Share", f"{wf_headline['share']:.0%}")
+            wc[2].metric("Folds run", wf_headline["total"])
+        wf_fig = optimization_viz.walk_forward_figure(result.walk_forward)
+        if wf_fig is not None:
+            st.plotly_chart(wf_fig, width="stretch", config={"displayModeBar": False})
+            st.caption("In-sample is fitted by construction and proves nothing on its own - the gap "
+                       "between the two dots is the result. Folds where the out-of-sample dot sits "
+                       "left of the break-even line did not transfer forward.")
+        with st.expander("Table view"):
+            wf_signed = [c for c in result.walk_forward.columns if "total_r" in c or "avg_r" in c]
+            st.dataframe(style_signed_columns(result.walk_forward, wf_signed, fmt="{:+.4f}"),
+                         width="stretch", hide_index=True)
     if result.decay is not None:
         st.markdown(eyebrow("SIGNAL-DECAY DIAGNOSTIC"), unsafe_allow_html=True)
         d = result.decay
@@ -739,6 +783,10 @@ def render_lockbox_section(strategy_id):
     st.markdown(eyebrow("LOCKBOX CONFIRMATION - ONE-SHOT, EVER"), unsafe_allow_html=True)
 
     prior = optimization.lockbox_ledger_status(strategy_id)
+    # Sealed is the DEFAULT and the good state - an unopened lockbox is an asset, not an
+    # unfinished task. The panel says so visually before any of the copy below is read.
+    st.markdown(optimization_viz.lockbox_panel(sealed=prior is None, prior=prior),
+                unsafe_allow_html=True)
     if prior is not None:
         verdict = "PASSED" if prior.get("passed") else "DID NOT PASS"
         st.warning(f"This strategy's lockbox has already been used in this webapp - {verdict} on "
@@ -906,9 +954,31 @@ def _render_known_pipeline_section(strategy, known_module, key_suffix):
 
     cache_key = f"opt_result_{strategy_id}"
     if st.button("Run Deep Optimization (4-Step)", key=f"deep_opt_run_{strategy_id}_{key_suffix}"):
+        # A live pipeline rail instead of an undifferentiated spinner. The heavy pipeline
+        # runs synchronously, so this updates from inside it via progress_cb rather than on
+        # a Streamlit rerun - each step flips to RUNNING as it starts and COMPLETE with its
+        # own headline number as it finishes. Adapters that don't accept progress_cb simply
+        # never call it, and the rail stays on its initial all-pending render.
+        rail = st.empty()
+        states = {i: "pending" for i in range(len(optimization_viz.STAGES))}
+        states[4] = "sealed"
+        stats = {}
+
+        def render_rail():
+            rail.markdown(optimization_viz.render_pipeline(states, stats), unsafe_allow_html=True)
+
+        def progress_cb(stage, state, detail=""):
+            states[stage] = state
+            if detail:
+                stats[stage] = detail
+            render_rail()
+
+        render_rail()
         with st.spinner("Running the full 4-step optimization & robustness pass against real Dukascopy data - "
                          "this can take a long time..."):
-            st.session_state[cache_key] = optimization.run_known_pipeline(strategy_id)
+            st.session_state[cache_key] = optimization.run_known_pipeline(
+                strategy_id, progress_cb=progress_cb)
+        rail.empty()
 
     result = st.session_state.get(cache_key)
     if result is None:

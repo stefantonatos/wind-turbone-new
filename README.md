@@ -30,7 +30,7 @@ tables and are not otherwise distinguishable.
 | `webapp/` | the Streamlit backtesting app | **active — this is the product** |
 | `research/` | the strategy backtests + optimization pipelines the app runs | **active** |
 | `telegram-relay/`, `pine/` | the earlier Telegram/TradingView alert bot (documented below) | legacy |
-| `backtester/`, `quantconnect/`, `copier/` | earlier experiments — a JS backtester, QuantConnect ports, and an MT5 trade copier | legacy, not wired to anything |
+| `quantconnect/`, `copier/` | earlier experiments — QuantConnect ports and an MT5 trade copier | legacy, not wired to anything |
 
 Everything below this line documents the **legacy alert bot**, which was this
 repo's original purpose and is kept for reference. It is independent of the
@@ -47,47 +47,142 @@ place the trade manually in MetaTrader 5.
 
 ## The setup being detected
 
-- **Trend gate (must hold)**: 21/50/200 smoothed moving averages stacked
-  in trend order, with price on the matching side of the 200 — only
-  bullish signals count in an uptrend, only bearish in a downtrend.
-- **Arrow**: a 3 Line Strike or Engulfing Candle pattern, matching the
-  trend direction.
-- **RSI confirm**: RSI(14) above 50 for a buy, below 50 for a sell.
-- Fires **once per closed 5-minute candle**, only during your trading
-  window (08:00–02:30 Europe/London, covering your waking hours — edit
-  `isWithinTradingWindow` in `telegram-relay/src/index.js` if that
-  changes).
-- Monitors **EUR/USD, GBP/USD, USD/JPY** (edit the `PAIRS` array in the
-  same file to change the list — more pairs costs more of the free API
-  quota, see below).
-- The Telegram message includes a suggested SL (2× the signal candle's
-  range) and TP (2:1 reward:risk), per the strategy's rule — you still
-  decide and place the actual trade.
+The alerts run the **TMA Trend Scalper (vFinal)** — the strategy currently
+being forward-tested. All seven gates must hold on a closed 5-minute candle:
 
-`pine/combined-setup-alert.pine` mirrors the same logic as a TradingView
-indicator, purely so you can visually sanity-check the `BUY`/`SELL`
-labels against what the bot sends you. It is **not** wired to any
-TradingView alert — no paid plan needed anywhere in this setup.
+| Gate | Rule |
+|---|---|
+| Session | **temporarily all hours**, Monday–Friday (strategy's own rule is 07:00–15:00 London) |
+| Trend stack | SMMA 21/50/200 in order, each separated by at least `minDist` |
+| Trend strength | ADX(14) > 25 |
+| Volatility | ATR(14) > 70% of its own 50-bar average |
+| Position | price on the correct side of the 200 SMMA |
+| Momentum | close vs SMA(5) and vs close[5], agreeing with the trend |
+| Pattern | 3 Line Strike **or** Engulfing, matching the trend |
+| RSI | RSI(14) past 50 **and** past its own SMMA(50) |
 
-`pine/combined-setup-strategy.pine` is the same rules again, but declared
-as a `strategy()` so TradingView's own Strategy Tester (Performance
-Summary, List of Trades) can backtest it directly on the chart. Free-plan
-history is limited to ~5000 bars (~2-3 weeks on 5-min candles), and the
-dollar P&L it shows isn't precise for forex without proper lot sizing —
-treat win rate and trade count as the numbers worth comparing against
-`backtester/backtest.js`'s output, not the $ figures.
+Then: **one alert per instrument per day**, stop at 2× the signal candle's
+range, target at 4× (2:1).
+
+### Every alert carries a lot size
+
+Position size is derived from the stop distance, which is what "risk 1%" means
+when the stop is 2× a candle that changes size every bar — a tighter stop earns
+a *larger* position for the same money.
+
+```
+lots = risk_in_quote_currency / (stop_pips × value_per_pip_per_lot)
+```
+
+Worked: £10,000 at 1% = £100. At GBP/USD 1.27 that is $127. A 20-pip stop costs
+$200 per lot, so 127/200 = **0.635 → 0.63 lots** after rounding to the broker's
+0.01 step. Rounding is always *down*, so it risks slightly under budget, never
+over. The message shows what the rounded size actually risks rather than
+implying you got exactly 1%.
+
+Both watched pairs are USD-quoted while the account is in GBP, so the rate is
+fetched once a day and cached. **If it cannot be fetched, no lot size is shown**
+— skipping the conversion would silently undersize every trade by ~27%, and a
+confidently wrong lot is worse than a missing one.
+
+Configurable from the Cloudflare dashboard (Settings → Variables and Secrets,
+type **Text**, not Secret) so the balance keeps up with the account without a
+code change:
+
+| variable | default |
+|---|---|
+| `ACCOUNT_BALANCE` | `10000` |
+| `ACCOUNT_CURRENCY` | `GBP` |
+| `RISK_PCT` | `1` |
+
+`?health=1` echoes all three back, so a wrong balance is visible without waiting
+for a signal.
+
+### Two alerts per signal: a heads-up, then a verdict
+
+| | fires | says |
+|---|---|---|
+| ⏳ **FORMING** | :03, :08, :13 … — 2 min before the bar closes | the setup qualifies *right now*. Get to the screen. **Do not enter.** |
+| ✅ **CONFIRMED** | :00, :05, :10 … — just after it closes | it survived. Levels are final. |
+| ❌ **CANCELLED** | same pass | it did not, and which gate broke it. |
+
+The split exists because **mid-candle every input is provisional** — the bar's
+own high and low can still move, which changes the stop distance, and RSI, ADX
+and the pattern can all flip before the close. The strategy's rule is evaluated
+on a *closed* bar, so only the CONFIRMED message reflects it. The FORMING one is
+a timer, not a signal.
+
+The close pass only spends an API call on pairs the early pass actually flagged,
+which is what makes two passes per candle affordable on the free tier at all.
+
+### The session tracks London, not a fixed UTC offset
+
+The strategy doc writes the window as "7:00–15:00 UTC", but those are the same
+thing for only half the year — London runs UTC+1 under BST from late March to
+late October:
+
+| | 07:00–15:00 London is… |
+|---|---|
+| Winter (GMT) | 07:00–15:00 UTC |
+| Summer (BST) | 06:00–14:00 UTC |
+
+Pinned to UTC, the window would every summer start an hour after London opens
+and stop an hour before it closes — drifting off the session it is named after,
+twice a year, silently. Both the Worker (`Europe/London` via `Intl`) and
+`pine/tma-trend-scalper.pine` (a `time()` session string with the same zone)
+track the zone instead, so the chart and the bot stay in agreement year-round.
+
+> **Note on the earlier version of this bot.** It alerted on a simpler setup:
+> the same 21/50/200 stack, pattern and `RSI > 50`, over an 08:00–02:30 London
+> window. It had no ADX gate, no volatility gate, no momentum check, no minimum
+> SMMA separation, and it never compared RSI to its own average. It therefore
+> fired on setups the current strategy rejects. That logic has been deleted
+> along with the JS backtester that was its only remaining consumer — two files
+> both claiming to be "the strategy" is how you end up unsure which one is live.
+> The rules now live in one place: `telegram-relay/src/tma-strategy.js`.
+
+Monitors **2 pairs** — AUD/USD and EUR/USD. That number is set by the free
+TwelveData tier and the current all-hours window, not by preference:
+
+| hours | pairs | requests/day | |
+|---|---|---|---|
+| 07:00–15:00 | 6 | 576 | fits |
+| all hours | 2 | 576 | fits |
+| all hours | 3 | 864 | **over** |
+| all hours | 6 | 1,728 | **over by more than the cap** |
+
+Running all hours triples the cost, so all-hours and six pairs cannot both hold.
+Hours were the ask, so the pair list pays for it. Restoring the 07:00–15:00
+window frees the budget for six pairs again.
+
+Going over is the failure that matters: the quota runs out partway through the
+day and the bot simply stops alerting, with nothing to say it has.
+
+**Alerts fired outside 07:00–15:00 London are tagged in the message** as ones the
+strategy would not take — the live gate is open for testing, but that does not
+make a 3am signal strategy-sanctioned.
+
+JPY pairs use `minDist: 0.10` rather than `0.001` — it is an absolute price
+distance, so it does not scale across quote currencies.
+
+The Worker counts its own API calls per UTC day into KV and reports
+`quotaUsedToday` from `?debug=1`, so you can check real usage rather than trust
+the arithmetic above.
+
+`pine/tma-trend-scalper.pine` is the same rules as a TradingView **indicator**,
+with a live confluence table so you can see which gate is blocking a signal and
+check the bot against the chart row by row. Deliberately not a `strategy()`:
+its job is alerts and eyeballing signals, and backtesting properly happens in
+`webapp/` against real costs and a holdout rather than on ~5000 free-plan bars.
 
 ## Backtesting on QuantConnect (free, real historical data)
 
 `quantconnect/main.py` is the same strategy again, ported to QuantConnect's
-free cloud backtester (Python/LEAN). This is worth using instead of (or
-alongside) `backtester/backtest.js` because QuantConnect has real forex
-history going back years — our own backtester has only tested 17 days of
-manually-copied EUR/USD data so far, which is a small sample. The indicator
-math was checked line-for-line against `strategy.js` on the same real
-EUR/USD data and produced byte-identical signals (128/128 matching
-timestamps, sides, and RSI values) before being shipped here, so this
-isn't a re-derived guess — it's a verified port.
+free cloud backtester (Python/LEAN), covering real forex history going back
+years. Its indicator math was checked line-for-line against the JS
+implementation of the day on the same real EUR/USD data and produced
+byte-identical signals (128/128 matching timestamps, sides, and RSI values),
+so this isn't a re-derived guess — it was a verified port at the time.
 
 1. Sign up free at https://www.quantconnect.com (email only, no card).
 2. Create a new Algorithm Project (Python).
@@ -97,10 +192,8 @@ isn't a re-derived guess — it's a verified port.
    on our own 17-day sample — see git history for that result), change
    `self.REVERSE_SIGNALS = False` to `True` near the top and re-run.
 
-Only one trade is held at a time in this version (a new signal is ignored
-while a previous trade is still open) — slightly different from
-`backtester/backtest.js`, which opens an independent trade on every
-qualifying bar even if overlapping. This is closer to how a real account
+Only one trade is held at a time in this version — a new signal is ignored
+while a previous trade is still open, which is closer to how a real account
 would actually be managed.
 
 ## 1. Get a free TwelveData API key
@@ -128,6 +221,28 @@ would actually be managed.
 
 ## 3. Deploy the relay (Cloudflare Worker, free tier)
 
+**This worker deploys itself from GitHub.** Cloudflare Workers Builds is connected
+to this repo, so a push to the deploy branch builds and ships automatically - no
+terminal, which matters because the account is driven from an iPhone.
+
+| setting | value | why |
+|---|---|---|
+| Worker name | `tmarsi` | must match the existing worker, or wrangler creates a second one and the old bot keeps alerting alongside the new one |
+| Root directory | `telegram-relay` | `wrangler.toml` lives in this subfolder, not at the repo root |
+| Branch | `claude/hello-k2yenv` | where the code is; `main` does not have it |
+| Deploy command | `npx wrangler deploy` | default, no build step needed |
+
+Two things that are easy to get wrong:
+
+- **Connecting the repo does not trigger a build.** Workers Builds fires on the next
+  push after connecting; it does not backfill. If the Deployments tab says "No builds
+  exist yet", push any commit.
+- **Secrets are not in the repo and are not touched by a deploy.** They live in
+  Cloudflare and survive redeploys, so they are set once. `wrangler.toml` carries only
+  non-secret config - the KV namespace id is an identifier, not a credential.
+
+### Setting the secrets (one time)
+
 ```bash
 cd telegram-relay
 npm install
@@ -143,6 +258,20 @@ npx wrangler secret put WEBHOOK_SECRET    # any random string you make up, for t
 npx wrangler deploy
 ```
 
+The chart image on each alert is rendered by **QuickChart**, which needs no
+account and no API key — so there is no secret to set for it. That was not the
+first choice: chart-img.com would have produced a real TradingView-style image,
+but its only sign-in path is Google OAuth, which loops endlessly on iOS Safari,
+and this account is driven from a phone. An image source you cannot get a key for
+is not an image source.
+
+The picture is best-effort regardless: if the render fails for any reason the
+alert still goes out as text. A missing image must never cost you the signal.
+
+**Never paste any of these tokens into a chat, a commit, or a code file.**
+`wrangler secret put` prompts for the value and stores it encrypted with
+Cloudflare — it never touches the repo.
+
 The Cron Trigger (`*/5 * * * *`, every 5 minutes) is defined in
 `wrangler.toml` and starts running automatically once deployed — nothing
 else to wire up.
@@ -150,16 +279,33 @@ else to wire up.
 ## 4. Test it
 
 ```bash
-# Confirm Telegram delivery works at all:
-curl "https://forex-setup-alerts.<your-subdomain>.workers.dev/?secret=<your WEBHOOK_SECRET>&ping=1"
+BASE="https://forex-setup-alerts.<your-subdomain>.workers.dev"
+S="<your WEBHOOK_SECRET>"
 
-# Manually run a full check right now (outside the cron schedule) and see the result per pair:
-curl "https://forex-setup-alerts.<your-subdomain>.workers.dev/?secret=<your WEBHOOK_SECRET>"
+# 1. Confirm Telegram delivery works at all:
+curl "$BASE/?secret=$S&ping=1"
+
+# 2. Confirm the chart image works, and that you like how it looks,
+#    WITHOUT waiting for a real signal:
+curl "$BASE/?secret=$S&testchart=AUD/USD"
+
+# 3. Evaluate every pair right now, ignoring the session gate, and see
+#    exactly which condition is blocking each one (also reports quota used):
+curl "$BASE/?secret=$S&debug=1"
+
+# 4. Drive either pass by hand. force=1 ignores the session window.
+curl "$BASE/?secret=$S&pass=early&force=1"
+curl "$BASE/?secret=$S&pass=close&force=1"
 ```
 
-The second command returns JSON showing, per pair, whether it alerted,
-skipped (and why — outside trading window, no setup, already alerted
-this candle), or errored.
+`debug=1` is the one to use when checking the bot against TradingView. For every
+pair it reports either the signal, or `blockedBy` naming the first failing gate
+along with the live ADX and RSI. Those gate names line up one-for-one with the
+rows of the confluence table in `pine/tma-trend-scalper.pine`, so you can put the
+two side by side and see whether they agree.
+
+Without `debug=1` the same endpoint respects the session window, which is what
+the cron does.
 
 ## Changing pairs, timeframe, or window
 
@@ -168,10 +314,11 @@ Most of this lives in `telegram-relay/src/index.js`:
 - `PAIRS` — symbol list and pip size per symbol
 - `INTERVAL` — candle timeframe (must be a value TwelveData supports:
   `1min`, `5min`, `15min`, `30min`, `1h`, `4h`, ...)
-- `isWithinTradingWindow` — active hours
+- `sessWindow` / `SESSION_START_HOUR` / `SESSION_END_HOUR` — active hours
 
-Indicator periods (`RSI_LEN`, `MA_LENS`, `CONFIRM_BARS`) live in
-`telegram-relay/src/strategy.js` instead, since that file is shared
-with the backtester.
+Indicator periods and gate thresholds (`SMMA_*`, `RSI_LEN`, `ADX_MIN`,
+`ATR_MIN_MULT`, `MOMENTUM_*`) live in `telegram-relay/src/tma-strategy.js`.
+Change them there and in `research/tma_trend_scalper_forex_dukascopy_backtest.py`
+together — the two are kept numerically identical on purpose.
 
 Redeploy with `npx wrangler deploy` after any change.
