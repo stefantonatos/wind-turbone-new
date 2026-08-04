@@ -16,13 +16,11 @@
 // "be ready", never an entry. Only the CLOSE pass reflects the strategy's real rule,
 // which is evaluated on a closed bar.
 //
-// WHAT REPLACED WHAT: this used to alert on the ORIGINAL, simpler setup - a 21/50/200
-// stack + pattern + RSI>50 over an 08:00-02:30 London window, with no ADX gate, no ATR
-// volatility gate, no momentum check, no minimum SMMA separation, and RSI compared to
-// 50 rather than to its own SMMA(50). Those alerts fired on setups the current
-// strategy rejects. That logic has since been deleted outright rather than left beside
-// this one, so there is no second file in the repo that could be mistaken for the
-// rules the bot actually runs.
+// WHICH RULES: the BASE strategy - 21/50/200 SMMA stack, close on the right side of
+// the 200, 3-Line Strike or Engulfing, RSI above 50 and above its own SMMA(50). The
+// chop filters (ADX, ATR, momentum, SMMA separation) are off; see EXTRA_FILTERS in
+// tma-strategy.js. pine/tma-trend-scalper.pine draws exactly this, so the chart and
+// the alerts should agree bar for bar. If either is changed, change both.
 
 import {
   LONDON_END, LONDON_START, MIN_BARS, SESSION_END_HOUR, SESSION_START_HOUR,
@@ -53,6 +51,12 @@ const PAIRS = [
   { symbol: "AUD/USD", pip: 0.0001, minDist: 0.001 },
   { symbol: "EUR/USD", pip: 0.0001, minDist: 0.001 },
 ];
+
+// The base strategy has no daily cap - that was one of the added rules, so it comes
+// off with the rest of them. Expect more than one alert per pair per day now; that is
+// the intended effect, not a dedupe bug. The per-BAR dedupe (`warned:` keys) stays
+// either way, so a single bar still cannot alert twice.
+const ONE_TRADE_PER_DAY = false;
 
 const INTERVAL = "5min";
 const OUTPUT_SIZE = 400; // > MIN_BARS (200 SMMA + 50-period RSI SMMA + slack)
@@ -538,7 +542,7 @@ async function earlyPass(env) {
       const dayKey = `${pair.symbol}:day:${dayStamp(forming.time)}`;
       const warnKey = `${pair.symbol}:warned:${forming.time}`;
       if (env.ALERT_STATE) {
-        if (await env.ALERT_STATE.get(dayKey)) {
+        if (ONE_TRADE_PER_DAY && (await env.ALERT_STATE.get(dayKey))) {
           results.push({ symbol: pair.symbol, skipped: "one trade per day already sent" });
           continue;
         }

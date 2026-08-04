@@ -12,7 +12,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  MIN_BARS, adxSeries, atrSeries, evaluateTMA, firstBlockingGate,
+  EXTRA_FILTERS, MIN_BARS, adxSeries, atrSeries, evaluateTMA, firstBlockingGate,
   inLondonSession, inSession, isForming, londonTimeParts, minutesToClose, rmaSeries, rsiSeries, smaSeries, splitCandles,
 } from "../src/tma-strategy.js";
 
@@ -242,12 +242,19 @@ test("RSI must beat its own SMMA, not merely sit above 50", () => {
   assert.equal(r.side, null);
 });
 
-test("a separation requirement wider than the actual gap blocks the stack gate", () => {
+// minDist is one of the EXTRA_FILTERS, so this asserts the OPPOSITE thing in each
+// mode rather than being skipped in one of them. Written this way, flipping the flag
+// cannot leave a filter silently doing nothing (or silently still applying) with the
+// suite still green.
+test("the SMMA separation requirement applies only when the extra filters are on", () => {
   const c = series(1);
   const loose = evaluateTMA(c, { minDist: 0.0001 });
   const strict = evaluateTMA(c, { minDist: 10 });
   assert.equal(loose.gates.stack, true);
-  assert.equal(strict.gates.stack, false);
+  assert.equal(strict.gates.stack, EXTRA_FILTERS ? false : true,
+    EXTRA_FILTERS
+      ? "with filters on, a gap requirement wider than the actual gap must block the stack"
+      : "with filters off, minDist must be ignored entirely - the stack is plain 21 > 50 > 200");
 });
 
 test("stop is 2x and target 4x the signal candle, giving 2:1 both ways", () => {
@@ -274,8 +281,16 @@ test("a SELL mirrors the levels rather than recomputing them in one direction", 
 
 test("gate breakdown is always returned so an alert can explain a rejection", () => {
   const r = evaluateTMA(series(1), { minDist: 0.0001 });
-  for (const key of ["session", "stack", "adx", "volatility", "priceVs200", "momentum", "pattern", "rsi"]) {
+  const base = ["session", "stack", "priceVs200", "pattern", "rsi"];
+  const extra = ["adx", "volatility", "momentum"];
+  for (const key of base) {
     assert.equal(typeof r.gates[key], "boolean", `missing gate: ${key}`);
+  }
+  // The extra rows must be ABSENT when the filters are off, not present-and-false.
+  // firstBlockingGate() walks this object in order, so a false `adx` sitting in a
+  // breakdown where ADX is not consulted would name it as the reason for no signal.
+  for (const key of extra) {
+    assert.equal(key in r.gates, EXTRA_FILTERS, `gate ${key} should be ${EXTRA_FILTERS ? "present" : "absent"}`);
   }
 });
 

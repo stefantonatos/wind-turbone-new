@@ -39,6 +39,22 @@ export const MOMENTUM_LOOKBACK = 5;
 export const STOP_CANDLE_MULT = 2.0;
 export const TARGET_CANDLE_MULT = 4.0;
 
+// BASE STRATEGY ONLY.
+//
+// false = the original entry logic and nothing else: stack, price vs 200, pattern,
+// RSI vs its SMMA, session. This is what pine/tma-trend-scalper.pine now draws, and
+// the two have to agree or the whole point of comparing them is lost.
+//
+// true = additionally require ADX > 25, ATR above 0.7x its 50-bar average, momentum
+// agreeing with the trend, and a minimum absolute SMMA separation. Those came from
+// the vFinal notes as chop filters. They are real filters, not noise - they cut the
+// signal count by roughly an order of magnitude - but they are also why the chart
+// looked empty, and the unfiltered version is what is being watched right now.
+//
+// ADX and ATR are still COMPUTED either way, so ?debug=1 keeps reporting them; they
+// just do not veto a signal while this is false.
+export const EXTRA_FILTERS = false;
+
 // SESSION WINDOW - currently WIDE OPEN, deliberately.
 //
 // The strategy's own rule is 07:00-15:00 London. That is still what the backtest and
@@ -296,15 +312,22 @@ export function evaluateTMA(candles, { minDist = 0.001 } = {}) {
   const sessionOK = inSession(c.time);
   const londonOK = inLondonSession(c.time);
 
-  const bullStack = smmaFast[i] > smmaMed[i] + minDist && smmaMed[i] > smmaSlow[i] + minDist;
-  const bearStack = smmaFast[i] < smmaMed[i] - minDist && smmaMed[i] < smmaSlow[i] - minDist;
+  // The separation requirement is itself one of the extra filters, so with them off
+  // the stack is the plain 21 > 50 > 200 the original script used.
+  const gap = EXTRA_FILTERS ? minDist : 0;
+  const bullStack = smmaFast[i] > smmaMed[i] + gap && smmaMed[i] > smmaSlow[i] + gap;
+  const bearStack = smmaFast[i] < smmaMed[i] - gap && smmaMed[i] < smmaSlow[i] - gap;
+
   const trending = adx[i] > ADX_MIN;
   const volatile_ = atr[i] > atrAvg[i] * ATR_MIN_MULT;
   const bullMom = closes[i] > momSma[i] && closes[i] > closes[i - MOMENTUM_LOOKBACK];
   const bearMom = closes[i] < momSma[i] && closes[i] < closes[i - MOMENTUM_LOOKBACK];
 
-  const bullQuality = bullStack && trending && closes[i] > smmaSlow[i] && bullMom && volatile_;
-  const bearQuality = bearStack && trending && closes[i] < smmaSlow[i] && bearMom && volatile_;
+  // Written as `!EXTRA_FILTERS || x` rather than dropping the terms, so turning the
+  // flag back on restores the exact previous expression with nothing to re-derive.
+  const extras = (mom) => !EXTRA_FILTERS || (trending && volatile_ && mom);
+  const bullQuality = bullStack && closes[i] > smmaSlow[i] && extras(bullMom);
+  const bearQuality = bearStack && closes[i] < smmaSlow[i] && extras(bearMom);
 
   const threeUp = closes[i - 3] > opens[i - 3] && closes[i - 2] > opens[i - 2] && closes[i - 1] > opens[i - 1];
   const threeDown = closes[i - 3] < opens[i - 3] && closes[i - 2] < opens[i - 2] && closes[i - 1] < opens[i - 1];
@@ -356,13 +379,16 @@ export function evaluateTMA(candles, { minDist = 0.001 } = {}) {
     gates: (() => {
       const dir = bullStack ? "bull" : bearStack ? "bear" : null;
       const pick = (bull, bear) => (dir === "bull" ? bull : dir === "bear" ? bear : false);
+      // The extra-filter rows are OMITTED, not reported as false, when the filters are
+      // off. Leaving them in would make firstBlockingGate() name "adx" as the reason
+      // for no signal on a bar where ADX is not consulted at all, and would put rows
+      // in this table that the Pine no longer has.
       return {
         session: sessionOK,
         stack: dir !== null,
-        adx: trending,
-        volatility: volatile_,
+        ...(EXTRA_FILTERS ? { adx: trending, volatility: volatile_ } : {}),
         priceVs200: pick(closes[i] > smmaSlow[i], closes[i] < smmaSlow[i]),
-        momentum: pick(bullMom, bearMom),
+        ...(EXTRA_FILTERS ? { momentum: pick(bullMom, bearMom) } : {}),
         pattern: pick(bullStrike || bullEngulf, bearStrike || bearEngulf),
         rsi: pick(rsiBull, rsiBear),
       };
