@@ -23,7 +23,7 @@
 // the alerts should agree bar for bar. If either is changed, change both.
 
 import {
-  LONDON_END, LONDON_START, MIN_BARS, SESSION_END_HOUR, SESSION_START_HOUR,
+  BAR_MINUTES, LONDON_END, LONDON_START, MIN_BARS, SESSION_END_HOUR, SESSION_START_HOUR,
   evaluateTMA, firstBlockingGate, inSession, minutesToClose, parseUTC, rmaSeries, splitCandles,
 } from "./tma-strategy.js";
 
@@ -91,7 +91,7 @@ const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 // a marker like this there is no way to tell a Worker running new code from one still
 // serving a stale deployment - the dashboard shows a version hash that means nothing
 // against a git commit.
-const BUILD = "tma-base-2026-08-04-sizing-guards";
+const BUILD = "tma-base-2026-08-04-text-first";
 
 // QuickChart renders the chart server-side. No account and no API key, which is the
 // whole reason it is here rather than chart-img - see fetchChartImage below. If the
@@ -454,20 +454,35 @@ async function sendPhoto(env, imageBuffer, caption) {
   if (!resp.ok) throw new Error(`Telegram sendPhoto: ${await resp.text()}`);
 }
 
-/** Sends the picture when it is available, and the words regardless. */
+/**
+ * WORDS FIRST, PICTURE SECOND. This used to render the chart and then send it with
+ * the alert as its caption, which put a QuickChart render and a PNG upload - 3 to 5
+ * seconds - in front of the only thing you can act on. On a warning whose entire
+ * value is a two-minute head start, that was spending 3% of the window on a picture.
+ *
+ * It also made the countdown wrong. "1.7 min to close" was computed before the
+ * render, so it arrived reading 1.7 when the truth was nearer 1.4 - the one number
+ * the message exists to give you, quietly stale.
+ *
+ * So the text is sent the moment the evaluation is done, and the chart follows as a
+ * second message. Two notifications instead of one is the price; the alternative was
+ * a slow single one. A failed render now costs only the picture - the words have
+ * already gone.
+ */
 async function deliver(env, caption, levels, symbol, candles, side) {
+  const startedAt = Date.now();
+  await sendText(env, caption);
+  const textMs = Date.now() - startedAt;
+
   try {
     const image = await fetchChartImage(env, symbol, candles, levels, side);
-    if (image) {
-      await sendPhoto(env, image, caption);
-      return { imageSent: true };
-    }
+    await sendPhoto(env, image, `\u{1F4C8} ${symbol} — ${side}`);
+    return { imageSent: true, textMs, totalMs: Date.now() - startedAt };
   } catch (err) {
-    await sendText(env, `${caption}\n\n_(chart image unavailable)_`);
-    return { imageSent: false, imageError: String(err) };
+    // Deliberately silent to Telegram. The alert is already delivered, and a second
+    // message saying a picture failed is noise on top of the thing that matters.
+    return { imageSent: false, imageError: String(err), textMs, totalMs: Date.now() - startedAt };
   }
-  await sendText(env, caption);
-  return { imageSent: false };
 }
 
 const round = (v, pip) => Number(v).toFixed(pip === 0.01 ? 3 : 5);
@@ -526,11 +541,18 @@ const outsideLondonNote = (result) => (result.inLondonSession ? [] : [
   `\u{26A0}\uFE0F _Outside ${LONDON_START}:00-${LONDON_END}:00 London. The strategy would NOT take this - session filter is open for testing._`,
 ]);
 
-function formingMessage(pair, result, minsLeft, sizing, cfg) {
+function formingMessage(pair, result, minsLeft, closeAt, sizing, cfg) {
   const arrow = result.side === "BUY" ? "\u{1F7E2}" : "\u{1F534}";
+  // A countdown starts ageing the moment it is sent - by the time the notification is
+  // read it is already wrong, and there is no way to tell by how much. The absolute
+  // close time does not age, so it is the one to act on; the countdown stays only
+  // because it reads faster at a glance. London, because that is the clock you are on.
+  const closeLondon = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  }).format(closeAt);
   return [
     `\u{23F3} *FORMING — ${result.side}* ${arrow} ${pair.symbol}`,
-    `*${minsLeft.toFixed(1)} min to close.* Get ready — do not enter yet.`,
+    `*Closes ${closeLondon} London* (~${minsLeft.toFixed(1)} min). Get ready — do not enter yet.`,
     "",
     ...levelLines(pair, result.levels),
     "",
@@ -611,7 +633,6 @@ async function earlyPass(env) {
         }
       }
 
-      const minsLeft = minutesToClose(forming);
       const cfg = sizingConfig(env);
       cfg.toUsd = await accountToUsd(env, apiKey, cfg.currency);
       const sizing = computeLots({
@@ -619,7 +640,12 @@ async function earlyPass(env) {
         stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
         price: result.levels.entry, spreadPips: pair.spreadPips,
       });
-      const delivery = await deliver(env, formingMessage(pair, result, minsLeft, sizing, cfg), result.levels, pair.symbol, candles, result.side);
+      // Read the clock HERE, after the FX lookup, not before it. accountToUsd can hit
+      // the network on the first call of the day, and a countdown measured before a
+      // network call is a countdown that ships already wrong.
+      const minsLeft = minutesToClose(forming);
+      const closeAt = new Date(parseUTC(forming.time).getTime() + BAR_MINUTES * 60000);
+      const delivery = await deliver(env, formingMessage(pair, result, minsLeft, closeAt, sizing, cfg), result.levels, pair.symbol, candles, result.side);
 
       if (env.ALERT_STATE) {
         await env.ALERT_STATE.put(warnKey, "1", { expirationTtl: 60 * 30 });
@@ -688,19 +714,38 @@ async function closePass(env) {
   return results;
 }
 
-async function runPass(env, which, { force = false } = {}) {
+/**
+ * `scheduledTime` is when Cloudflare INTENDED to fire, which is not when it did.
+ * Cron Triggers are best-effort and drift by seconds to minutes, and that drift comes
+ * straight off a two-minute head start. Recorded here so "the alert was late" is a
+ * measurement with a number on it rather than an argument - cronDriftMs separates a
+ * late trigger from slow work inside the pass, and they have completely different
+ * fixes. Every KV write and Telegram call in this worker is instrumented the same way
+ * for the same reason.
+ */
+async function runPass(env, which, { force = false, scheduledTime = null } = {}) {
+  const startedAt = Date.now();
   const nowIso = new Date().toISOString().replace("T", " ").slice(0, 19);
+  const cronDriftMs = scheduledTime ? startedAt - scheduledTime : null;
+
   if (!force && !inSession(nowIso)) {
-    return { pass: which, skipped: `outside session (${SESSION_START_HOUR}:00-${SESSION_END_HOUR}:00 UTC, Mon-Fri)`, now: `${nowIso} UTC` };
+    return { pass: which, skipped: `outside session (${SESSION_START_HOUR}:00-${SESSION_END_HOUR}:00 UTC, Mon-Fri)`, now: `${nowIso} UTC`, cronDriftMs };
   }
   const results = which === "early" ? await earlyPass(env) : await closePass(env);
-  return { pass: which, now: `${nowIso} UTC`, quotaUsedToday: await quotaUsed(env), results };
+  return {
+    pass: which,
+    now: `${nowIso} UTC`,
+    cronDriftMs,
+    passMs: Date.now() - startedAt,
+    quotaUsedToday: await quotaUsed(env),
+    results,
+  };
 }
 
 export default {
   async scheduled(event, env, ctx) {
     const which = event.cron === CRON_EARLY ? "early" : "close";
-    ctx.waitUntil(runPass(env, which));
+    ctx.waitUntil(runPass(env, which, { scheduledTime: event.scheduledTime }));
   },
 
   async fetch(request, env) {
