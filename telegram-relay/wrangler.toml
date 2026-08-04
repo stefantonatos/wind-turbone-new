@@ -1,4 +1,9 @@
-name = "forex-setup-alerts"
+# NAME MUST MATCH THE DEPLOYED WORKER. It is "tmarsi", not the "forex-setup-alerts"
+# this file used to say - the worker was created under a different name than the
+# config assumed. Deploying under the old name would have stood up a SECOND worker
+# and left the original running, so two bots would have been alerting at once, the
+# old one still on the superseded strategy.
+name = "tmarsi"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
@@ -15,8 +20,14 @@ crons = [
   "0,5,10,15,20,25,30,35,40,45,50,55 * * * *",
 ]
 
-# Create with: npx wrangler kv namespace create ALERT_STATE
-# then paste the returned id below.
+# The live namespace this worker already uses. A KV namespace id is an identifier,
+# not a credential - it is useless without account auth, which is why Cloudflare's own
+# workflow has it committed here. The SECRETS (bot token, chat id, API keys) are set
+# separately via the dashboard or `wrangler secret put` and never appear in this file.
+#
+# This is load-bearing, not optional: KV dedupes alerts per bar, enforces one signal
+# per day, carries the pending list from the early pass to the close pass, and counts
+# the daily API quota. Deploying with a wrong or placeholder id breaks all four.
 [[kv_namespaces]]
 binding = "ALERT_STATE"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "68f5be9ec3a54af2b7bbcbde75d7a9f1"
