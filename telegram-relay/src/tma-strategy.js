@@ -169,6 +169,35 @@ export function parseUTC(timeStr) {
   return new Date(`${timeStr.replace(" ", "T")}Z`);
 }
 
+export const BAR_MINUTES = 5;
+
+// TwelveData stamps a bar with its OPEN time and returns the in-progress bar as the
+// most recent value. So the newest candle is still forming until open + 5 minutes.
+// This matters twice over: an early-warning pass must evaluate the forming bar (that
+// is the whole point), and a confirmation pass must NOT - it has to score the bar
+// that actually closed, or it re-reads a provisional bar and calls it confirmed.
+export function minutesToClose(candle, now = new Date()) {
+  const closeMs = parseUTC(candle.time).getTime() + BAR_MINUTES * 60000;
+  return (closeMs - now.getTime()) / 60000;
+}
+
+export function isForming(candle, now = new Date()) {
+  return minutesToClose(candle, now) > 0;
+}
+
+/**
+ * Splits a series into the bars that have definitely closed and the one still
+ * forming, if any. `closed` is always safe to evaluate as a finished signal.
+ */
+export function splitCandles(candles, now = new Date()) {
+  if (candles.length === 0) return { closed: [], forming: null };
+  const last = candles[candles.length - 1];
+  if (isForming(last, now)) {
+    return { closed: candles.slice(0, -1), forming: last };
+  }
+  return { closed: candles, forming: null };
+}
+
 export function inSession(timeStr) {
   const d = parseUTC(timeStr);
   const day = d.getUTCDay(); // 0=Sunday .. 6=Saturday
@@ -264,18 +293,29 @@ export function evaluateTMA(candles, { minDist = 0.001 } = {}) {
     side,
     pattern,
     levels,
-    // Full breakdown, in the same order as the Pine confluence table, so the two
-    // can be compared row by row when verifying signals against TradingView.
-    gates: {
-      session: sessionOK,
-      stack: bullStack || bearStack,
-      adx: trending,
-      volatility: volatile_,
-      priceVs200: bullQuality || bearQuality ? true : bullStack ? closes[i] > smmaSlow[i] : bearStack ? closes[i] < smmaSlow[i] : false,
-      momentum: bullStack ? bullMom : bearStack ? bearMom : false,
-      pattern: bullStrike || bearStrike || bullEngulf || bearEngulf,
-      rsi: bullStack ? rsiBull : bearStack ? rsiBear : false,
-    },
+    // Full breakdown, in the same order and with the same direction-awareness as the
+    // confluence table in pine/tma-trend-scalper.pine, so the two can be read side by
+    // side row for row when checking the bot against the chart.
+    //
+    // DIRECTION-AWARE ON PURPOSE. Every gate below the stack is asked about the side
+    // the stack actually permits - "did a BULLISH pattern fire", not "did any pattern
+    // fire". A bearish 3-Line Strike inside a bullish stack is not a pass; reporting
+    // it as one made this table disagree with the Pine's, which is exactly the
+    // comparison it exists to support.
+    gates: (() => {
+      const dir = bullStack ? "bull" : bearStack ? "bear" : null;
+      const pick = (bull, bear) => (dir === "bull" ? bull : dir === "bear" ? bear : false);
+      return {
+        session: sessionOK,
+        stack: dir !== null,
+        adx: trending,
+        volatility: volatile_,
+        priceVs200: pick(closes[i] > smmaSlow[i], closes[i] < smmaSlow[i]),
+        momentum: pick(bullMom, bearMom),
+        pattern: pick(bullStrike || bullEngulf, bearStrike || bearEngulf),
+        rsi: pick(rsiBull, rsiBear),
+      };
+    })(),
     values: {
       adx: adx[i],
       rsi: rsi[i],

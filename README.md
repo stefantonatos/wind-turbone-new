@@ -65,6 +65,23 @@ Then: **one alert per instrument per day**, stop at 2× the signal candle's
 range, target at 4× (2:1). Position size comes from the stop distance, not a
 fixed lot — that is what "risk 1%" means when the stop moves every bar.
 
+### Two alerts per signal: a heads-up, then a verdict
+
+| | fires | says |
+|---|---|---|
+| ⏳ **FORMING** | :03, :08, :13 … — 2 min before the bar closes | the setup qualifies *right now*. Get to the screen. **Do not enter.** |
+| ✅ **CONFIRMED** | :00, :05, :10 … — just after it closes | it survived. Levels are final. |
+| ❌ **CANCELLED** | same pass | it did not, and which gate broke it. |
+
+The split exists because **mid-candle every input is provisional** — the bar's
+own high and low can still move, which changes the stop distance, and RSI, ADX
+and the pattern can all flip before the close. The strategy's rule is evaluated
+on a *closed* bar, so only the CONFIRMED message reflects it. The FORMING one is
+a timer, not a signal.
+
+The close pass only spends an API call on pairs the early pass actually flagged,
+which is what makes two passes per candle affordable on the free tier at all.
+
 > **Note on the earlier version of this bot.** It alerted on a simpler setup:
 > the same 21/50/200 stack, pattern and `RSI > 50`, over an 08:00–02:30 London
 > window. It had no ADX gate, no volatility gate, no momentum check, no minimum
@@ -73,13 +90,25 @@ fixed lot — that is what "risk 1%" means when the stop moves every bar.
 > `telegram-relay/src/strategy.js` because `backtester/backtest.js` imports it;
 > the live alerts now use `telegram-relay/src/tma-strategy.js` instead.
 
-Monitors **8 pairs** — AUD/USD, EUR/USD, GBP/USD, NZD/USD, USD/CAD, USD/CHF,
-USD/JPY, EUR/JPY. Eight is the ceiling on the free TwelveData tier, not an
-arbitrary choice: 8 session hours × 12 fires/hour × 8 pairs = 768 requests/day
-against an 800/day cap, and one fire calls every pair back to back against an
-8-requests-per-minute limit. Adding a ninth breaks both. JPY pairs use
-`minDist: 0.10` rather than `0.001` — it is an absolute price distance, so it
-does not scale across quote currencies.
+Monitors **6 pairs** — AUD/USD, EUR/USD, GBP/USD, NZD/USD, USD/CAD, USD/JPY.
+That number is set by the free TwelveData tier, not by preference:
+
+| pairs | requests/day | headroom under the 800 cap |
+|---|---|---|
+| 6 | ~600 | ~200 |
+| 8 | ~793 | **7** |
+
+Eight fits on paper, but seven spare calls means a single manual `?debug=1`
+(one call per pair) tips it over and the alerts then fail silently for the rest
+of the day. Six leaves real room. The 8-requests-per-minute limit caps it at 8
+regardless, since one fire calls every pair back to back.
+
+JPY pairs use `minDist: 0.10` rather than `0.001` — it is an absolute price
+distance, so it does not scale across quote currencies.
+
+The Worker counts its own API calls per UTC day into KV and reports
+`quotaUsedToday` from `?debug=1`, so you can check real usage rather than trust
+the arithmetic above.
 
 `pine/tma-trend-scalper.pine` is the same rules as a TradingView strategy, with
 a live confluence table so you can see which gate is blocking a signal and
@@ -192,8 +221,12 @@ curl "$BASE/?secret=$S&ping=1"
 curl "$BASE/?secret=$S&testchart=AUD/USD"
 
 # 3. Evaluate every pair right now, ignoring the session gate, and see
-#    exactly which condition is blocking each one:
+#    exactly which condition is blocking each one (also reports quota used):
 curl "$BASE/?secret=$S&debug=1"
+
+# 4. Drive either pass by hand. force=1 ignores the session window.
+curl "$BASE/?secret=$S&pass=early&force=1"
+curl "$BASE/?secret=$S&pass=close&force=1"
 ```
 
 `debug=1` is the one to use when checking the bot against TradingView. For every

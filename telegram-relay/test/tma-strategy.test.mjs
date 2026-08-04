@@ -10,7 +10,7 @@ import { test } from "node:test";
 
 import {
   MIN_BARS, adxSeries, atrSeries, evaluateTMA, firstBlockingGate,
-  inSession, rmaSeries, rsiSeries, smaSeries,
+  inSession, isForming, minutesToClose, rmaSeries, rsiSeries, smaSeries, splitCandles,
 } from "../src/tma-strategy.js";
 
 // --- helpers ---------------------------------------------------------------
@@ -217,4 +217,80 @@ test("gate breakdown is always returned so an alert can explain a rejection", ()
   for (const key of ["session", "stack", "adx", "volatility", "priceVs200", "momentum", "pattern", "rsi"]) {
     assert.equal(typeof r.gates[key], "boolean", `missing gate: ${key}`);
   }
+});
+
+// --- forming vs closed bars ------------------------------------------------
+// The two-pass alerting rests entirely on telling these apart. If a "confirmation"
+// ever re-reads the still-forming bar it reports a provisional setup as confirmed,
+// which is the one failure mode that would make the alerts actively misleading.
+
+test("a bar is forming until exactly 5 minutes after its open stamp", () => {
+  const c = bar("2026-01-05 09:35:00", 1, 1, 1, 1);
+  assert.equal(isForming(c, new Date("2026-01-05T09:36:00Z")), true);
+  assert.equal(isForming(c, new Date("2026-01-05T09:39:59Z")), true);
+  assert.equal(isForming(c, new Date("2026-01-05T09:40:00Z")), false);
+  assert.equal(isForming(c, new Date("2026-01-05T09:41:00Z")), false);
+});
+
+test("minutesToClose counts down and goes negative once closed", () => {
+  const c = bar("2026-01-05 09:35:00", 1, 1, 1, 1);
+  assert.equal(minutesToClose(c, new Date("2026-01-05T09:38:00Z")), 2);
+  assert.ok(minutesToClose(c, new Date("2026-01-05T09:42:00Z")) < 0);
+});
+
+test("splitCandles withholds the forming bar from the closed set", () => {
+  const candles = [
+    bar("2026-01-05 09:30:00", 1, 1, 1, 1),
+    bar("2026-01-05 09:35:00", 1, 1, 1, 1),
+  ];
+  const at = new Date("2026-01-05T09:38:00Z"); // second bar still forming
+  const { closed, forming } = splitCandles(candles, at);
+  assert.equal(closed.length, 1);
+  assert.equal(closed.at(-1).time, "2026-01-05 09:30:00");
+  assert.equal(forming.time, "2026-01-05 09:35:00");
+});
+
+test("splitCandles returns everything once the last bar has closed", () => {
+  const candles = [
+    bar("2026-01-05 09:30:00", 1, 1, 1, 1),
+    bar("2026-01-05 09:35:00", 1, 1, 1, 1),
+  ];
+  const { closed, forming } = splitCandles(candles, new Date("2026-01-05T09:40:30Z"));
+  assert.equal(closed.length, 2);
+  assert.equal(forming, null);
+});
+
+test("splitCandles on an empty series does not throw", () => {
+  assert.deepEqual(splitCandles([], new Date()), { closed: [], forming: null });
+});
+
+test("a forming bar can qualify and the closed bar then not - the case the two passes exist for", () => {
+  // Same setup, but the bar closes having given back its gains: the engulfing no
+  // longer engulfs, so the early warning must be followed by a cancel, not a confirm.
+  const base = series(1);
+  const prev = base.at(-1);
+
+  const formingBar = bar("2026-01-05 09:59:00", prev.open - 0.0002, prev.open + 0.0012, prev.open - 0.0003, prev.open + 0.0010);
+  const withForming = [...base, formingBar];
+  assert.equal(evaluateTMA(withForming, { minDist: 0.0001 }).side, "BUY");
+
+  // ...and the same bar, closed weakly back below the previous open.
+  const closedBar = bar("2026-01-05 09:59:00", prev.open - 0.0002, prev.open + 0.0012, prev.open - 0.0005, prev.open - 0.0004);
+  const withClosed = [...base, closedBar];
+  const after = evaluateTMA(withClosed, { minDist: 0.0001 });
+  assert.equal(after.side, null, "the weak close must not still read as a BUY");
+  assert.equal(after.gates.pattern, false);
+});
+
+test("gates are direction-aware: a bearish pattern inside a bullish stack is not a pass", () => {
+  // Regression. This gate used to be `any pattern fired`, which made the JSON from
+  // ?debug=1 disagree with the Pine confluence table it is meant to be compared to.
+  const base = series(1);
+  const prev = base.at(-1);
+  // Three rising bars precede this one, and it closes back through the previous
+  // open - a BEARISH 3-Line Strike, sitting inside a bullish stack.
+  const bearish = bar("2026-01-05 09:59:00", prev.open - 0.0002, prev.open + 0.0012, prev.open - 0.0005, prev.open - 0.0004);
+  const r = evaluateTMA([...base, bearish], { minDist: 0.0001 });
+  assert.equal(r.side, null, "no trade: the pattern opposes the trend");
+  assert.equal(r.gates.pattern, false, "and the gate must report that, not 'a pattern exists'");
 });

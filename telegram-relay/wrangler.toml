@@ -2,8 +2,18 @@ name = "forex-setup-alerts"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# Two passes per 5-minute candle. ORDER MATTERS: src/index.js identifies which pass
+# fired by matching event.cron against the first string here, so the early pass must
+# stay first.
+#   :03 etc - EARLY, 2 minutes before the bar closes, evaluates the forming bar and
+#             sends a "get ready" heads-up.
+#   :00 etc - CLOSE, evaluates the bar that just closed, but only for pairs the early
+#             pass flagged, so it costs API calls only when something actually formed.
 [triggers]
-crons = ["*/5 * * * *"]
+crons = [
+  "3,8,13,18,23,28,33,38,43,48,53,58 * * * *",
+  "0,5,10,15,20,25,30,35,40,45,50,55 * * * *",
+]
 
 # Create with: npx wrangler kv namespace create ALERT_STATE
 # then paste the returned id below.
