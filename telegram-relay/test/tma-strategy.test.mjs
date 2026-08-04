@@ -10,7 +10,7 @@ import { test } from "node:test";
 
 import {
   MIN_BARS, adxSeries, atrSeries, evaluateTMA, firstBlockingGate,
-  inSession, isForming, londonTimeParts, minutesToClose, rmaSeries, rsiSeries, smaSeries, splitCandles,
+  inLondonSession, inSession, isForming, londonTimeParts, minutesToClose, rmaSeries, rsiSeries, smaSeries, splitCandles,
 } from "../src/tma-strategy.js";
 
 // --- helpers ---------------------------------------------------------------
@@ -117,28 +117,28 @@ test("atrSeries and adxSeries produce finite values on a real-shaped series", ()
 
 // --- session ---------------------------------------------------------------
 
-test("in WINTER (GMT) the window is 07:00-15:00 UTC, because London is UTC+0", () => {
-  assert.equal(inSession("2026-01-05 07:00:00"), true); // Monday, 07:00 London
-  assert.equal(inSession("2026-01-05 14:55:00"), true);
-  assert.equal(inSession("2026-01-05 06:55:00"), false);
-  assert.equal(inSession("2026-01-05 15:00:00"), false);
+test("in WINTER (GMT) the London window is 07:00-15:00 UTC, because London is UTC+0", () => {
+  assert.equal(inLondonSession("2026-01-05 07:00:00"), true); // Monday, 07:00 London
+  assert.equal(inLondonSession("2026-01-05 14:55:00"), true);
+  assert.equal(inLondonSession("2026-01-05 06:55:00"), false);
+  assert.equal(inLondonSession("2026-01-05 15:00:00"), false);
 });
 
-test("in SUMMER (BST) the same window is 06:00-14:00 UTC, because London is UTC+1", () => {
+test("in SUMMER (BST) the same London window is 06:00-14:00 UTC, because London is UTC+1", () => {
   // THE REASON THIS TRACKS A TIMEZONE RATHER THAN A FIXED UTC OFFSET. Pinning the
   // gate to 07:00-15:00 UTC would, every summer, start an hour after London opens
   // and stop an hour before it closes - drifting off the session it is named after.
-  assert.equal(inSession("2026-08-03 06:00:00"), true, "06:00Z = 07:00 London in BST");
-  assert.equal(inSession("2026-08-03 13:55:00"), true, "13:55Z = 14:55 London in BST");
-  assert.equal(inSession("2026-08-03 05:55:00"), false);
-  assert.equal(inSession("2026-08-03 14:00:00"), false, "14:00Z = 15:00 London, window closed");
+  assert.equal(inLondonSession("2026-08-03 06:00:00"), true, "06:00Z = 07:00 London in BST");
+  assert.equal(inLondonSession("2026-08-03 13:55:00"), true, "13:55Z = 14:55 London in BST");
+  assert.equal(inLondonSession("2026-08-03 05:55:00"), false);
+  assert.equal(inLondonSession("2026-08-03 14:00:00"), false, "14:00Z = 15:00 London, window closed");
 });
 
 test("the same UTC instant is in session in summer and out of it in winter", () => {
   // 06:30Z: 07:30 London under BST (in), 06:30 London under GMT (out). One assertion
   // that would be impossible to satisfy with a fixed-UTC window.
-  assert.equal(inSession("2026-08-03 06:30:00"), true);
-  assert.equal(inSession("2026-01-05 06:30:00"), false);
+  assert.equal(inLondonSession("2026-08-03 06:30:00"), true);
+  assert.equal(inLondonSession("2026-01-05 06:30:00"), false);
 });
 
 test("session rejects weekends", () => {
@@ -161,8 +161,24 @@ test("midnight in London reads as hour 0, never 24", () => {
   assert.equal(londonTimeParts(new Date("2026-01-05T00:30:00Z")).hour, 0);
 });
 
-test("session is evaluated against a timezone, not the worker's own locale", () => {
-  assert.equal(inSession("2026-01-05 23:30:00"), false);
+test("the LIVE gate is currently wide open, but still excludes weekends", () => {
+  // SESSION_START_HOUR/END are temporarily 0-24 so signals can be seen without
+  // waiting for a London morning. Weekends stay shut regardless: forex is closed, so
+  // any "signal" would be assembled from Friday's last bars.
+  assert.equal(inSession("2026-01-05 23:30:00"), true, "23:30 on a Monday now passes");
+  assert.equal(inSession("2026-01-05 03:00:00"), true, "03:00 on a Monday now passes");
+  assert.equal(inSession("2026-01-03 10:00:00"), false, "Saturday still blocked");
+  assert.equal(inSession("2026-01-04 10:00:00"), false, "Sunday still blocked");
+});
+
+test("the strategy's real window is still recorded, so alerts can be tagged against it", () => {
+  // Both are true inside 07:00-15:00 London; outside it the live gate passes and the
+  // London one does not, which is exactly the pair the alert text uses to warn that a
+  // signal is not one the strategy would take.
+  assert.equal(inSession("2026-01-05 10:00:00"), true);
+  assert.equal(inLondonSession("2026-01-05 10:00:00"), true);
+  assert.equal(inSession("2026-01-05 03:00:00"), true);
+  assert.equal(inLondonSession("2026-01-05 03:00:00"), false);
 });
 
 // --- setup evaluation ------------------------------------------------------
@@ -188,11 +204,21 @@ test("a bullish engulfing at the end of a clean uptrend fires a BUY", () => {
   assert.equal(r.pattern, "Engulfing");
 });
 
-test("the same setup outside the session window produces no signal", () => {
-  const c = addEngulfing(series(1, { hour: 3 }), 1, 3); // 03:xx UTC
+test("a weekend setup produces no signal even with the hours wide open", () => {
+  // 2026-01-03 is a Saturday. The hours gate no longer blocks anything, so the
+  // weekday check is the only thing standing between a stale Friday bar and an alert.
+  const c = addEngulfing(series(1), 1).map((bar) => ({ ...bar, time: bar.time.replace("2026-01-05", "2026-01-03") }));
   const r = evaluateTMA(c, { minDist: 0.0001 });
   assert.equal(r.side, null);
   assert.equal(r.gates.session, false);
+});
+
+test("evaluateTMA reports whether the bar was inside the real London window", () => {
+  const inside = evaluateTMA(addEngulfing(series(1, { hour: 9 }), 1, 9), { minDist: 0.0001 });
+  const outside = evaluateTMA(addEngulfing(series(1, { hour: 3 }), 1, 3), { minDist: 0.0001 });
+  assert.equal(inside.inLondonSession, true);
+  assert.equal(outside.inLondonSession, false);
+  assert.equal(outside.side, "BUY", "still a signal - the live gate is open");
 });
 
 test("RSI must beat its own SMMA, not merely sit above 50", () => {

@@ -39,15 +39,26 @@ export const MOMENTUM_LOOKBACK = 5;
 export const STOP_CANDLE_MULT = 2.0;
 export const TARGET_CANDLE_MULT = 4.0;
 
-// Session hours in LONDON LOCAL time, not UTC. The strategy doc writes the window as
-// "7:00-15:00 UTC", but those are only the same thing for half the year: London runs
-// UTC+1 under BST from late March to late October and UTC+0 the rest of the time. A
-// window pinned to UTC therefore slides an hour against the market it is named after
-// every October - it would start an hour before London opens and stop 1.5 hours
-// before it closes. Tracking the zone keeps the window on the session all year.
+// SESSION WINDOW - currently WIDE OPEN, deliberately.
+//
+// The strategy's own rule is 07:00-15:00 London. That is still what the backtest and
+// the Pine indicator use, and it is what LONDON_START/LONDON_END below record. The
+// live alerts are temporarily running all hours so signals can actually be seen
+// without waiting for the next London morning.
+//
+// Consequence, stated plainly: an alert outside 07:00-15:00 London is NOT a signal
+// the strategy would take. evaluateTMA still reports whether the bar fell inside the
+// real window (`inLondonSession`) so the alert can say so rather than quietly
+// implying every ping is strategy-sanctioned.
+//
+// To put it back: set SESSION_START_HOUR/SESSION_END_HOUR to 7 and 15.
 export const SESSION_TZ = "Europe/London";
-export const SESSION_START_HOUR = 7; // London local, inclusive
-export const SESSION_END_HOUR = 15; // London local, exclusive
+export const SESSION_START_HOUR = 0;  // London local, inclusive
+export const SESSION_END_HOUR = 24;   // London local, exclusive
+
+// The strategy's real window, kept separate so alerts can be tagged against it.
+export const LONDON_START = 7;
+export const LONDON_END = 15;
 
 // Bars of history needed before the first evaluable signal: the 200 SMMA plus the
 // 50-period RSI SMMA stacked on top of a 14-period RSI, plus slack.
@@ -232,8 +243,17 @@ export function londonTimeParts(date) {
 
 export function inSession(timeStr) {
   const { hour, weekday } = londonTimeParts(parseUTC(timeStr));
+  // Weekends stay excluded whatever the hours are - forex is closed, so there is no
+  // fresh data to act on and any "signal" would be built from Friday's last bars.
   if (weekday === 0 || weekday === 6) return false;
   return hour >= SESSION_START_HOUR && hour < SESSION_END_HOUR;
+}
+
+/** Whether a bar falls inside the strategy's REAL 07:00-15:00 London window. */
+export function inLondonSession(timeStr) {
+  const { hour, weekday } = londonTimeParts(parseUTC(timeStr));
+  if (weekday === 0 || weekday === 6) return false;
+  return hour >= LONDON_START && hour < LONDON_END;
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +294,7 @@ export function evaluateTMA(candles, { minDist = 0.001 } = {}) {
 
   const c = candles[i];
   const sessionOK = inSession(c.time);
+  const londonOK = inLondonSession(c.time);
 
   const bullStack = smmaFast[i] > smmaMed[i] + minDist && smmaMed[i] > smmaSlow[i] + minDist;
   const bearStack = smmaFast[i] < smmaMed[i] - minDist && smmaMed[i] < smmaSlow[i] - minDist;
@@ -358,6 +379,7 @@ export function evaluateTMA(candles, { minDist = 0.001 } = {}) {
       time: c.time,
     },
     direction: bullQuality ? "bull" : bearQuality ? "bear" : "none",
+    inLondonSession: londonOK,
   };
 }
 

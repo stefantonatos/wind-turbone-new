@@ -25,32 +25,33 @@
 // rules the bot actually runs.
 
 import {
-  MIN_BARS, SESSION_END_HOUR, SESSION_START_HOUR,
+  LONDON_END, LONDON_START, MIN_BARS, SESSION_END_HOUR, SESSION_START_HOUR,
   evaluateTMA, firstBlockingGate, inSession, minutesToClose, parseUTC, rmaSeries, splitCandles,
 } from "./tma-strategy.js";
 
 // TwelveData free tier: 800 requests/day, 8/minute.
 //
-// BUDGET, with the early pass running every 5 minutes across an 8-hour session:
-//   8h x 12 fires/h = 96 early fires/day, x 6 pairs = 576 requests/day.
-//   The CLOSE pass only spends a call for a pair the early pass actually flagged -
-//   a handful a day - so the realistic total is ~600/day against the 800 cap.
+// BUDGET. The session gate is currently WIDE OPEN (all hours, see tma-strategy.js),
+// which triples what the 07:00-15:00 window cost and forces the pair count down:
 //
-// Six pairs rather than eight is deliberate. Eight comes to ~793/day, which fits on
-// paper but leaves seven spare calls: a single manual ?debug=1 (one call per pair)
-// would tip it over the cap and the alerts would then fail silently for the rest of
-// the day. Six leaves ~200 spare. The per-minute limit caps this at 8 regardless,
-// since one fire calls every pair back to back.
+//   24h x 12 fires/h = 288 early fires/day
+//     x 2 pairs =   576/day  fits, ~200 spare
+//     x 3 pairs =   864/day  OVER - goes silent partway through the day
+//     x 6 pairs = 1,728/day  OVER by more than the entire cap
+//
+// So all-hours and six pairs cannot both hold. Hours were the explicit ask, so the
+// pair list pays for it: AUD/USD (the strategy's own recommended pair) and EUR/USD.
+// Restoring the 07:00-15:00 window frees the budget for six again.
+//
+// Going silent is the failure that matters here - the quota runs out mid-morning and
+// the bot simply stops alerting, with nothing to say it has. ?debug=1 reports
+// quotaUsedToday against the cap so that state is visible rather than inferred.
 //
 // `minDist` is the strategy's own per-pair SMMA separation. It is an ABSOLUTE price
 // distance, so JPY pairs need a different number, not a scaled one.
 const PAIRS = [
   { symbol: "AUD/USD", pip: 0.0001, minDist: 0.001 },
   { symbol: "EUR/USD", pip: 0.0001, minDist: 0.001 },
-  { symbol: "GBP/USD", pip: 0.0001, minDist: 0.001 },
-  { symbol: "NZD/USD", pip: 0.0001, minDist: 0.001 },
-  { symbol: "USD/CAD", pip: 0.0001, minDist: 0.001 },
-  { symbol: "USD/JPY", pip: 0.01, minDist: 0.10 },
 ];
 
 const INTERVAL = "5min";
@@ -311,6 +312,11 @@ function levelLines(pair, levels) {
   ];
 }
 
+const outsideLondonNote = (result) => (result.inLondonSession ? [] : [
+  "",
+  `\u{26A0}\uFE0F _Outside ${LONDON_START}:00-${LONDON_END}:00 London. The strategy would NOT take this - session filter is open for testing._`,
+]);
+
 function formingMessage(pair, result, minsLeft) {
   const arrow = result.side === "BUY" ? "\u{1F7E2}" : "\u{1F534}";
   return [
@@ -323,6 +329,7 @@ function formingMessage(pair, result, minsLeft) {
     `RSI ${result.values.rsi.toFixed(1)} (vs SMMA ${result.values.rsiSmma.toFixed(1)})  ·  ADX ${result.values.adx.toFixed(1)}`,
     "",
     `_Provisional. The bar's high/low can still move, which changes the stop, and RSI/ADX/the pattern can all flip before it closes. You'll get a confirm or a cancel at the close._`,
+    ...outsideLondonNote(result),
   ].join("\n");
 }
 
@@ -340,6 +347,7 @@ function confirmedMessage(pair, result) {
     `Candle ${result.values.time} UTC (~${ageMin} min ago)`,
     "",
     `_Risk 1%. Stop is 2x the signal candle — size from the stop distance, not a fixed lot._`,
+    ...outsideLondonNote(result),
   ].join("\n");
 }
 

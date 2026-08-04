@@ -52,7 +52,7 @@ being forward-tested. All seven gates must hold on a closed 5-minute candle:
 
 | Gate | Rule |
 |---|---|
-| Session | 07:00–15:00 **London local**, Monday–Friday |
+| Session | **temporarily all hours**, Monday–Friday (strategy's own rule is 07:00–15:00 London) |
 | Trend stack | SMMA 21/50/200 in order, each separated by at least `minDist` |
 | Trend strength | ADX(14) > 25 |
 | Volatility | ATR(14) > 70% of its own 50-bar average |
@@ -108,18 +108,26 @@ track the zone instead, so the chart and the bot stay in agreement year-round.
 > both claiming to be "the strategy" is how you end up unsure which one is live.
 > The rules now live in one place: `telegram-relay/src/tma-strategy.js`.
 
-Monitors **6 pairs** — AUD/USD, EUR/USD, GBP/USD, NZD/USD, USD/CAD, USD/JPY.
-That number is set by the free TwelveData tier, not by preference:
+Monitors **2 pairs** — AUD/USD and EUR/USD. That number is set by the free
+TwelveData tier and the current all-hours window, not by preference:
 
-| pairs | requests/day | headroom under the 800 cap |
-|---|---|---|
-| 6 | ~600 | ~200 |
-| 8 | ~793 | **7** |
+| hours | pairs | requests/day | |
+|---|---|---|---|
+| 07:00–15:00 | 6 | 576 | fits |
+| all hours | 2 | 576 | fits |
+| all hours | 3 | 864 | **over** |
+| all hours | 6 | 1,728 | **over by more than the cap** |
 
-Eight fits on paper, but seven spare calls means a single manual `?debug=1`
-(one call per pair) tips it over and the alerts then fail silently for the rest
-of the day. Six leaves real room. The 8-requests-per-minute limit caps it at 8
-regardless, since one fire calls every pair back to back.
+Running all hours triples the cost, so all-hours and six pairs cannot both hold.
+Hours were the ask, so the pair list pays for it. Restoring the 07:00–15:00
+window frees the budget for six pairs again.
+
+Going over is the failure that matters: the quota runs out partway through the
+day and the bot simply stops alerting, with nothing to say it has.
+
+**Alerts fired outside 07:00–15:00 London are tagged in the message** as ones the
+strategy would not take — the live gate is open for testing, but that does not
+make a 3am signal strategy-sanctioned.
 
 JPY pairs use `minDist: 0.10` rather than `0.001` — it is an absolute price
 distance, so it does not scale across quote currencies.
