@@ -84,7 +84,11 @@ ema2    = ta.ema(close, 2)
 // FILTERS
 // ============================================
 
-adxVal     = ta.adx(high, low, close, 14)
+// ta.adx() does not exist in Pine - the reference script this was ported from calls
+// it and therefore never compiled. The real function is ta.dmi(diLength, adxSmoothing),
+// which returns [+DI, -DI, ADX]. ta.dmi(14, 14) is also exactly what the Python and JS
+// ports implement, so all three now agree by construction rather than by coincidence.
+[diPlus, diMinus, adxVal] = ta.dmi(14, 14)
 isTrending = adxVal > adxMin
 
 atrVal        = ta.atr(14)
