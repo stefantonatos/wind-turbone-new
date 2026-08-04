@@ -1,4 +1,7 @@
-// Run with: node --test telegram-relay/test/
+// Run with: cd telegram-relay && npm test
+//
+// (`node --test <dir>` is not valid in Node 22 - it tries to resolve the directory as
+// a module. Bare `node --test` discovers test/*.test.mjs itself.)
 //
 // The indicator maths is verified against the Python reference separately (see the
 // PR description); these tests cover the SETUP LOGIC - the gates, the session

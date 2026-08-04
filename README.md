@@ -62,8 +62,41 @@ being forward-tested. All seven gates must hold on a closed 5-minute candle:
 | RSI | RSI(14) past 50 **and** past its own SMMA(50) |
 
 Then: **one alert per instrument per day**, stop at 2× the signal candle's
-range, target at 4× (2:1). Position size comes from the stop distance, not a
-fixed lot — that is what "risk 1%" means when the stop moves every bar.
+range, target at 4× (2:1).
+
+### Every alert carries a lot size
+
+Position size is derived from the stop distance, which is what "risk 1%" means
+when the stop is 2× a candle that changes size every bar — a tighter stop earns
+a *larger* position for the same money.
+
+```
+lots = risk_in_quote_currency / (stop_pips × value_per_pip_per_lot)
+```
+
+Worked: £10,000 at 1% = £100. At GBP/USD 1.27 that is $127. A 20-pip stop costs
+$200 per lot, so 127/200 = **0.635 → 0.63 lots** after rounding to the broker's
+0.01 step. Rounding is always *down*, so it risks slightly under budget, never
+over. The message shows what the rounded size actually risks rather than
+implying you got exactly 1%.
+
+Both watched pairs are USD-quoted while the account is in GBP, so the rate is
+fetched once a day and cached. **If it cannot be fetched, no lot size is shown**
+— skipping the conversion would silently undersize every trade by ~27%, and a
+confidently wrong lot is worse than a missing one.
+
+Configurable from the Cloudflare dashboard (Settings → Variables and Secrets,
+type **Text**, not Secret) so the balance keeps up with the account without a
+code change:
+
+| variable | default |
+|---|---|
+| `ACCOUNT_BALANCE` | `10000` |
+| `ACCOUNT_CURRENCY` | `GBP` |
+| `RISK_PCT` | `1` |
+
+`?health=1` echoes all three back, so a wrong balance is visible without waiting
+for a signal.
 
 ### Two alerts per signal: a heads-up, then a verdict
 

@@ -72,6 +72,29 @@ const BUILD = "tma-vfinal-2026-08-04-two-pass";
 // never cost you the signal.
 const QUICKCHART_ENDPOINT = "https://quickchart.io/chart";
 
+// POSITION SIZING. Overridable from the Cloudflare dashboard as plain text variables
+// (Settings -> Variables and Secrets, type Text) so the balance keeps up with the
+// account without a code change.
+const DEFAULT_ACCOUNT_BALANCE = 10000;
+const DEFAULT_ACCOUNT_CURRENCY = "GBP";
+const DEFAULT_RISK_PCT = 1.0;
+const MIN_LOT = 0.01;   // smallest size most brokers accept
+const LOT_UNITS = 100000;
+
+function sizingConfig(env) {
+  const num = (v, fallback) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  const currency = (env.ACCOUNT_CURRENCY || DEFAULT_ACCOUNT_CURRENCY).toUpperCase();
+  return {
+    balance: num(env.ACCOUNT_BALANCE, DEFAULT_ACCOUNT_BALANCE),
+    riskPct: num(env.RISK_PCT, DEFAULT_RISK_PCT),
+    currency,
+    symbolCcy: { GBP: "£", EUR: "€", USD: "$" }[currency] || `${currency} `,
+  };
+}
+
 async function resolveSecret(binding) {
   if (binding == null) return undefined;
   if (typeof binding === "string") return binding;
@@ -80,6 +103,67 @@ async function resolveSecret(binding) {
 }
 
 const tvSymbol = (symbol) => `FX:${symbol.replace("/", "")}`;
+
+/**
+ * Account currency -> USD, cached for a day in KV.
+ *
+ * Both watched pairs are USD-quoted, so a pip is worth USD while the risk budget is
+ * in pounds. Skipping the conversion would undersize every trade by ~27% and, worse,
+ * do it silently - the number would look perfectly reasonable.
+ *
+ * Returns null rather than guessing if the rate cannot be had. A missing lot size is
+ * an inconvenience; a confidently wrong one is a bad trade.
+ */
+async function accountToUsd(env, apiKey, currency) {
+  if (currency === "USD") return 1;
+  const key = `fx:${currency}USD:${new Date().toISOString().slice(0, 10)}`;
+  if (env.ALERT_STATE) {
+    const cached = await env.ALERT_STATE.get(key);
+    if (cached) return Number(cached);
+  }
+  try {
+    const resp = await fetch(
+      `https://api.twelvedata.com/price?symbol=${currency}/USD&apikey=${apiKey}`);
+    const data = await resp.json();
+    await countCall(env);
+    const rate = Number(data.price);
+    if (!Number.isFinite(rate) || rate <= 0) return null;
+    if (env.ALERT_STATE) await env.ALERT_STATE.put(key, String(rate), { expirationTtl: 60 * 60 * 25 });
+    return rate;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lots to risk `riskPct` of `balance` given the stop distance.
+ *
+ * lots = risk_in_quote_ccy / (stop_pips x value_per_pip_per_lot)
+ * where a standard lot is 100,000 units, so on a USD-quoted pair one pip per lot is
+ * 100,000 x 0.0001 = $10.
+ *
+ * Rounded DOWN to the broker's 0.01 step, so the rounding always risks slightly less
+ * than intended rather than slightly more.
+ */
+function computeLots({ balance, riskPct, toUsd, stopDistance, pip }) {
+  if (!toUsd || !(stopDistance > 0)) return null;
+  const riskAccount = balance * (riskPct / 100);
+  const riskUsd = riskAccount * toUsd;
+  const stopPips = stopDistance / pip;
+  const usdPerPipPerLot = LOT_UNITS * pip;
+  const raw = riskUsd / (stopPips * usdPerPipPerLot);
+  const lots = Math.floor(raw / MIN_LOT) * MIN_LOT;
+  return {
+    lots: Number(lots.toFixed(2)),
+    rawLots: raw,
+    stopPips,
+    riskAccount,
+    riskUsd,
+    // What the rounded-down size actually risks - not what was asked for.
+    actualRiskUsd: lots * stopPips * usdPerPipPerLot,
+    belowMinimum: raw < MIN_LOT,
+  };
+}
 
 async function fetchCandles(symbol, apiKey, env, outputSize = OUTPUT_SIZE) {
   const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${INTERVAL}&outputsize=${outputSize}&timezone=UTC&apikey=${apiKey}`;
@@ -353,12 +437,33 @@ function levelLines(pair, levels) {
   ];
 }
 
+// The lot size, plus what it ACTUALLY risks after rounding to the broker's step -
+// which is never exactly the 1% asked for, and is worth showing rather than implying.
+function sizeLines(sizing, cfg) {
+  if (!sizing) {
+    return ["", `_Lot size unavailable - could not convert ${cfg.currency} to USD._`];
+  }
+  if (sizing.belowMinimum) {
+    return [
+      "",
+      `\u{26A0}\uFE0F *Lot ${sizing.rawLots.toFixed(3)} is below the ${MIN_LOT} minimum.*`,
+      `Trading ${MIN_LOT} would risk ~${cfg.symbolCcy}${(sizing.actualRiskUsd / cfg.toUsd).toFixed(2)}, more than your ${cfg.riskPct}%.`,
+    ];
+  }
+  const actualPct = (sizing.actualRiskUsd / cfg.toUsd / cfg.balance) * 100;
+  return [
+    "",
+    `*Lot size* \`${sizing.lots.toFixed(2)}\`  (${sizing.stopPips.toFixed(1)} pip stop)`,
+    `Risks ${cfg.symbolCcy}${(sizing.actualRiskUsd / cfg.toUsd).toFixed(2)} of ${cfg.symbolCcy}${cfg.balance.toLocaleString()} = ${actualPct.toFixed(2)}%`,
+  ];
+}
+
 const outsideLondonNote = (result) => (result.inLondonSession ? [] : [
   "",
   `\u{26A0}\uFE0F _Outside ${LONDON_START}:00-${LONDON_END}:00 London. The strategy would NOT take this - session filter is open for testing._`,
 ]);
 
-function formingMessage(pair, result, minsLeft) {
+function formingMessage(pair, result, minsLeft, sizing, cfg) {
   const arrow = result.side === "BUY" ? "\u{1F7E2}" : "\u{1F534}";
   return [
     `\u{23F3} *FORMING — ${result.side}* ${arrow} ${pair.symbol}`,
@@ -369,12 +474,14 @@ function formingMessage(pair, result, minsLeft) {
     `Pattern: ${result.pattern}`,
     `RSI ${result.values.rsi.toFixed(1)} (vs SMMA ${result.values.rsiSmma.toFixed(1)})  ·  ADX ${result.values.adx.toFixed(1)}`,
     "",
-    `_Provisional. The bar's high/low can still move, which changes the stop, and RSI/ADX/the pattern can all flip before it closes. You'll get a confirm or a cancel at the close._`,
+    ...sizeLines(sizing, cfg),
+    "",
+    `_Provisional — the bar's high/low can still move, which changes the stop AND therefore this lot size. Final numbers come at the close._`,
     ...outsideLondonNote(result),
   ].join("\n");
 }
 
-function confirmedMessage(pair, result) {
+function confirmedMessage(pair, result, sizing, cfg) {
   const arrow = result.side === "BUY" ? "\u{1F7E2}" : "\u{1F534}";
   const ageMin = Math.round((Date.now() - parseUTC(result.values.time).getTime()) / 60000);
   return [
@@ -387,7 +494,7 @@ function confirmedMessage(pair, result) {
     `ADX ${result.values.adx.toFixed(1)}  ·  ATR ${(result.values.atrRatio * 100).toFixed(0)}% of avg`,
     `Candle ${result.values.time} UTC (~${ageMin} min ago)`,
     "",
-    `_Risk 1%. Stop is 2x the signal candle — size from the stop distance, not a fixed lot._`,
+    ...sizeLines(sizing, cfg),
     ...outsideLondonNote(result),
   ].join("\n");
 }
@@ -442,7 +549,13 @@ async function earlyPass(env) {
       }
 
       const minsLeft = minutesToClose(forming);
-      const delivery = await deliver(env, formingMessage(pair, result, minsLeft), result.levels, pair.symbol, candles, result.side);
+      const cfg = sizingConfig(env);
+      cfg.toUsd = await accountToUsd(env, apiKey, cfg.currency);
+      const sizing = computeLots({
+        balance: cfg.balance, riskPct: cfg.riskPct, toUsd: cfg.toUsd,
+        stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
+      });
+      const delivery = await deliver(env, formingMessage(pair, result, minsLeft, sizing, cfg), result.levels, pair.symbol, candles, result.side);
 
       if (env.ALERT_STATE) {
         await env.ALERT_STATE.put(warnKey, "1", { expirationTtl: 60 * 30 });
@@ -490,7 +603,13 @@ async function closePass(env) {
 
       const result = evaluateTMA(closed, { minDist: pair.minDist });
       if (result.ok && result.side === flagged.side) {
-        const delivery = await deliver(env, confirmedMessage(pair, result), result.levels, pair.symbol, closed, result.side);
+        const cfg = sizingConfig(env);
+        cfg.toUsd = await accountToUsd(env, apiKey, cfg.currency);
+        const sizing = computeLots({
+          balance: cfg.balance, riskPct: cfg.riskPct, toUsd: cfg.toUsd,
+          stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
+        });
+        const delivery = await deliver(env, confirmedMessage(pair, result, sizing, cfg), result.levels, pair.symbol, closed, result.side);
         await env.ALERT_STATE.put(`${pair.symbol}:day:${dayStamp(last.time)}`, "1", { expirationTtl: 60 * 60 * 36 });
         results.push({ symbol: pair.symbol, confirmed: result.side, ...delivery });
       } else {
@@ -541,6 +660,7 @@ export default {
           TWELVEDATA_API_KEY: Boolean(await resolveSecret(env.TWELVEDATA_API_KEY)),
           ALERT_STATE_KV: Boolean(env.ALERT_STATE),
         },
+        sizing: (() => { const c = sizingConfig(env); return { balance: c.balance, currency: c.currency, riskPct: c.riskPct }; })(),
         pairs: PAIRS.map((p) => p.symbol),
         session: `${SESSION_START_HOUR}:00-${SESSION_END_HOUR}:00 Europe/London, Mon-Fri`,
       });
