@@ -1,9 +1,0 @@
-{
-  "name": "forex-setup-backtester",
-  "private": true,
-  "type": "module",
-  "description": "Offline CSV backtester for the trend/arrow/RSI setup used by telegram-relay/src/index.js. No external dependencies.",
-  "scripts": {
-    "backtest": "node backtest.js"
-  }
-}

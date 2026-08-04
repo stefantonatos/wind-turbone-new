@@ -30,7 +30,7 @@ tables and are not otherwise distinguishable.
 | `webapp/` | the Streamlit backtesting app | **active — this is the product** |
 | `research/` | the strategy backtests + optimization pipelines the app runs | **active** |
 | `telegram-relay/`, `pine/` | the earlier Telegram/TradingView alert bot (documented below) | legacy |
-| `backtester/`, `quantconnect/`, `copier/` | earlier experiments — a JS backtester, QuantConnect ports, and an MT5 trade copier | legacy, not wired to anything |
+| `quantconnect/`, `copier/` | earlier experiments — QuantConnect ports and an MT5 trade copier | legacy, not wired to anything |
 
 Everything below this line documents the **legacy alert bot**, which was this
 repo's original purpose and is kept for reference. It is independent of the
@@ -103,9 +103,10 @@ track the zone instead, so the chart and the bot stay in agreement year-round.
 > the same 21/50/200 stack, pattern and `RSI > 50`, over an 08:00–02:30 London
 > window. It had no ADX gate, no volatility gate, no momentum check, no minimum
 > SMMA separation, and it never compared RSI to its own average. It therefore
-> fired on setups the current strategy rejects. That logic still lives in
-> `telegram-relay/src/strategy.js` because `backtester/backtest.js` imports it;
-> the live alerts now use `telegram-relay/src/tma-strategy.js` instead.
+> fired on setups the current strategy rejects. That logic has been deleted
+> along with the JS backtester that was its only remaining consumer — two files
+> both claiming to be "the strategy" is how you end up unsure which one is live.
+> The rules now live in one place: `telegram-relay/src/tma-strategy.js`.
 
 Monitors **6 pairs** — AUD/USD, EUR/USD, GBP/USD, NZD/USD, USD/CAD, USD/JPY.
 That number is set by the free TwelveData tier, not by preference:
@@ -127,9 +128,11 @@ The Worker counts its own API calls per UTC day into KV and reports
 `quotaUsedToday` from `?debug=1`, so you can check real usage rather than trust
 the arithmetic above.
 
-`pine/tma-trend-scalper.pine` is the same rules as a TradingView strategy, with
-a live confluence table so you can see which gate is blocking a signal and
-check the bot against the chart row by row.
+`pine/tma-trend-scalper.pine` is the same rules as a TradingView **indicator**,
+with a live confluence table so you can see which gate is blocking a signal and
+check the bot against the chart row by row. Deliberately not a `strategy()`:
+its job is alerts and eyeballing signals, and backtesting properly happens in
+`webapp/` against real costs and a holdout rather than on ~5000 free-plan bars.
 
 `pine/combined-setup-alert.pine` mirrors the same logic as a TradingView
 indicator, purely so you can visually sanity-check the `BUY`/`SELL`
@@ -141,20 +144,18 @@ as a `strategy()` so TradingView's own Strategy Tester (Performance
 Summary, List of Trades) can backtest it directly on the chart. Free-plan
 history is limited to ~5000 bars (~2-3 weeks on 5-min candles), and the
 dollar P&L it shows isn't precise for forex without proper lot sizing —
-treat win rate and trade count as the numbers worth comparing against
-`backtester/backtest.js`'s output, not the $ figures.
+treat win rate and trade count as the numbers worth looking at, not the $
+figures. For a real backtest with real costs and an out-of-sample holdout, use
+the Streamlit app in `webapp/` rather than TradingView.
 
 ## Backtesting on QuantConnect (free, real historical data)
 
 `quantconnect/main.py` is the same strategy again, ported to QuantConnect's
-free cloud backtester (Python/LEAN). This is worth using instead of (or
-alongside) `backtester/backtest.js` because QuantConnect has real forex
-history going back years — our own backtester has only tested 17 days of
-manually-copied EUR/USD data so far, which is a small sample. The indicator
-math was checked line-for-line against `strategy.js` on the same real
-EUR/USD data and produced byte-identical signals (128/128 matching
-timestamps, sides, and RSI values) before being shipped here, so this
-isn't a re-derived guess — it's a verified port.
+free cloud backtester (Python/LEAN), covering real forex history going back
+years. Its indicator math was checked line-for-line against the JS
+implementation of the day on the same real EUR/USD data and produced
+byte-identical signals (128/128 matching timestamps, sides, and RSI values),
+so this isn't a re-derived guess — it was a verified port at the time.
 
 1. Sign up free at https://www.quantconnect.com (email only, no card).
 2. Create a new Algorithm Project (Python).
@@ -164,10 +165,8 @@ isn't a re-derived guess — it's a verified port.
    on our own 17-day sample — see git history for that result), change
    `self.REVERSE_SIGNALS = False` to `True` near the top and re-run.
 
-Only one trade is held at a time in this version (a new signal is ignored
-while a previous trade is still open) — slightly different from
-`backtester/backtest.js`, which opens an independent trade on every
-qualifying bar even if overlapping. This is closer to how a real account
+Only one trade is held at a time in this version — a new signal is ignored
+while a previous trade is still open, which is closer to how a real account
 would actually be managed.
 
 ## 1. Get a free TwelveData API key
@@ -262,10 +261,11 @@ Most of this lives in `telegram-relay/src/index.js`:
 - `PAIRS` — symbol list and pip size per symbol
 - `INTERVAL` — candle timeframe (must be a value TwelveData supports:
   `1min`, `5min`, `15min`, `30min`, `1h`, `4h`, ...)
-- `isWithinTradingWindow` — active hours
+- `sessWindow` / `SESSION_START_HOUR` / `SESSION_END_HOUR` — active hours
 
-Indicator periods (`RSI_LEN`, `MA_LENS`, `CONFIRM_BARS`) live in
-`telegram-relay/src/strategy.js` instead, since that file is shared
-with the backtester.
+Indicator periods and gate thresholds (`SMMA_*`, `RSI_LEN`, `ADX_MIN`,
+`ATR_MIN_MULT`, `MOMENTUM_*`) live in `telegram-relay/src/tma-strategy.js`.
+Change them there and in `research/tma_trend_scalper_forex_dukascopy_backtest.py`
+together — the two are kept numerically identical on purpose.
 
 Redeploy with `npx wrangler deploy` after any change.
