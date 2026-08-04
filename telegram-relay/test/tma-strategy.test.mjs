@@ -10,7 +10,7 @@ import { test } from "node:test";
 
 import {
   MIN_BARS, adxSeries, atrSeries, evaluateTMA, firstBlockingGate,
-  inSession, isForming, minutesToClose, rmaSeries, rsiSeries, smaSeries, splitCandles,
+  inSession, isForming, londonTimeParts, minutesToClose, rmaSeries, rsiSeries, smaSeries, splitCandles,
 } from "../src/tma-strategy.js";
 
 // --- helpers ---------------------------------------------------------------
@@ -117,11 +117,28 @@ test("atrSeries and adxSeries produce finite values on a real-shaped series", ()
 
 // --- session ---------------------------------------------------------------
 
-test("session accepts 07:00-14:59 UTC on a weekday and rejects the edges", () => {
-  assert.equal(inSession("2026-01-05 07:00:00"), true); // Monday
+test("in WINTER (GMT) the window is 07:00-15:00 UTC, because London is UTC+0", () => {
+  assert.equal(inSession("2026-01-05 07:00:00"), true); // Monday, 07:00 London
   assert.equal(inSession("2026-01-05 14:55:00"), true);
   assert.equal(inSession("2026-01-05 06:55:00"), false);
   assert.equal(inSession("2026-01-05 15:00:00"), false);
+});
+
+test("in SUMMER (BST) the same window is 06:00-14:00 UTC, because London is UTC+1", () => {
+  // THE REASON THIS TRACKS A TIMEZONE RATHER THAN A FIXED UTC OFFSET. Pinning the
+  // gate to 07:00-15:00 UTC would, every summer, start an hour after London opens
+  // and stop an hour before it closes - drifting off the session it is named after.
+  assert.equal(inSession("2026-08-03 06:00:00"), true, "06:00Z = 07:00 London in BST");
+  assert.equal(inSession("2026-08-03 13:55:00"), true, "13:55Z = 14:55 London in BST");
+  assert.equal(inSession("2026-08-03 05:55:00"), false);
+  assert.equal(inSession("2026-08-03 14:00:00"), false, "14:00Z = 15:00 London, window closed");
+});
+
+test("the same UTC instant is in session in summer and out of it in winter", () => {
+  // 06:30Z: 07:30 London under BST (in), 06:30 London under GMT (out). One assertion
+  // that would be impossible to satisfy with a fixed-UTC window.
+  assert.equal(inSession("2026-08-03 06:30:00"), true);
+  assert.equal(inSession("2026-01-05 06:30:00"), false);
 });
 
 test("session rejects weekends", () => {
@@ -129,8 +146,22 @@ test("session rejects weekends", () => {
   assert.equal(inSession("2026-01-04 10:00:00"), false); // Sunday
 });
 
-test("session is evaluated in UTC, not the worker's local timezone", () => {
-  // 23:30Z is outside the window regardless of where the isolate happens to run.
+test("the weekday is read in London too, not UTC", () => {
+  // 23:30Z on Sunday 2026-08-02 is already Monday 00:30 in London under BST. Both
+  // are outside the hour window, but the weekday must come from the London clock or
+  // a Friday/Saturday boundary can let a weekend bar through.
+  const { weekday } = londonTimeParts(new Date("2026-08-02T23:30:00Z"));
+  assert.equal(weekday, 1, "London says Monday");
+  assert.equal(new Date("2026-08-02T23:30:00Z").getUTCDay(), 0, "UTC still says Sunday");
+});
+
+test("midnight in London reads as hour 0, never 24", () => {
+  // en-GB defaults can render midnight as "24" depending on the ICU build, which
+  // would silently fall outside every hour comparison. hourCycle h23 pins it.
+  assert.equal(londonTimeParts(new Date("2026-01-05T00:30:00Z")).hour, 0);
+});
+
+test("session is evaluated against a timezone, not the worker's own locale", () => {
   assert.equal(inSession("2026-01-05 23:30:00"), false);
 });
 

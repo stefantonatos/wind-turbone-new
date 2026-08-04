@@ -39,8 +39,8 @@ riskPct   = input.float(1.0,   "Risk % per trade",           minval=0.1, maxval=
 stopMult  = input.float(2.0,   "Stop = N x candle size",     minval=0.5, step=0.5,  group="Risk")
 targetMult= input.float(4.0,   "Target = N x candle size",   minval=0.5, step=0.5,  group="Risk")
 
-sessStart = input.int(7,  "Session start hour (UTC)", minval=0, maxval=23, group="Session")
-sessEnd   = input.int(15, "Session end hour (UTC)",   minval=1, maxval=24, group="Session")
+sessWindow = input.session("0700-1500", "Session (London local time)", group="Session",
+     tooltip="London local, NOT UTC. The two agree only in winter - London runs UTC+1 under BST from late March to late October, so a UTC-pinned window slides an hour against the session it is named after every October.")
 
 minDist   = input.float(0.001, "Min SMMA separation", step=0.0001, tooltip="0.001 for EURUSD/GBPUSD/AUDUSD, 0.10 for JPY pairs, 100 for BTC/ETH", group="Filters")
 adxMin    = input.float(25.0,  "ADX minimum",   minval=0, group="Filters")
@@ -50,11 +50,14 @@ oneTradePerDay = input.bool(true, "One trade per day maximum", group="Filters", 
 showTable      = input.bool(true, "Show confluence table", group="Display")
 
 // ============================================
-// SESSION (UTC hours, weekdays only)
+// SESSION (London local time, weekdays only)
 // ============================================
-
-isWeekday = dayofweek != dayofweek.saturday and dayofweek != dayofweek.sunday
-inSession = hour >= sessStart and hour < sessEnd and isWeekday
+// The ":23456" day codes are Monday-Friday (Pine numbers days 1=Sunday..7=Saturday),
+// so the weekday filter, the hours and the timezone are all handled by one call
+// rather than by a hand-rolled `hour >=` comparison against the chart's own zone -
+// which is what makes this agree with the Worker's Europe/London gate instead of
+// drifting from it whenever the chart timezone or BST changes.
+inSession = not na(time(timeframe.period, sessWindow + ":23456", "Europe/London"))
 bgcolor(inSession ? color.new(color.blue, 92) : na, title="Session")
 
 // ============================================
@@ -196,9 +199,9 @@ if showTable and barstate.islast
     patOK   = dirBull ? bullPattern   : bearPattern
     rsiOK   = dirBull ? rsiBullish    : rsiBearish
 
-    rows = array.from("Session 7-15 UTC", "SMMA stack + gap", "ADX > " + str.tostring(adxMin, "#.#"), "ATR volatility", "Price vs 200", "Momentum", "Pattern", "RSI")
+    rows = array.from("Session " + sessWindow + " London", "SMMA stack + gap", "ADX > " + str.tostring(adxMin, "#.#"), "ATR volatility", "Price vs 200", "Momentum", "Pattern", "RSI")
     oks  = array.from(inSession, stackOK, isTrending, hasVolatility, posOK, momOK, patOK, rsiOK)
-    vals = array.from(str.format("{0,time,HH:mm} UTC", time), str.tostring(math.abs(smma21 - smma50), format.mintick), str.tostring(adxVal, "#.#"), str.tostring(atrVal / atrAvg * 100, "#") + "%", str.tostring(close - smma200, format.mintick), str.tostring(close - ta.sma(close, 5), format.mintick), patternName == "" ? "-" : patternName, str.tostring(osc, "#.#"))
+    vals = array.from(str.format_time(time, "HH:mm", "Europe/London") + " LDN", str.tostring(math.abs(smma21 - smma50), format.mintick), str.tostring(adxVal, "#.#"), str.tostring(atrVal / atrAvg * 100, "#") + "%", str.tostring(close - smma200, format.mintick), str.tostring(close - ta.sma(close, 5), format.mintick), patternName == "" ? "-" : patternName, str.tostring(osc, "#.#"))
 
     for i = 0 to array.size(rows) - 1
         ok = array.get(oks, i)

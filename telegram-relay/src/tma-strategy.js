@@ -39,8 +39,15 @@ export const MOMENTUM_LOOKBACK = 5;
 export const STOP_CANDLE_MULT = 2.0;
 export const TARGET_CANDLE_MULT = 4.0;
 
-export const SESSION_START_HOUR = 7; // UTC, inclusive
-export const SESSION_END_HOUR = 15; // UTC, exclusive
+// Session hours in LONDON LOCAL time, not UTC. The strategy doc writes the window as
+// "7:00-15:00 UTC", but those are only the same thing for half the year: London runs
+// UTC+1 under BST from late March to late October and UTC+0 the rest of the time. A
+// window pinned to UTC therefore slides an hour against the market it is named after
+// every October - it would start an hour before London opens and stop 1.5 hours
+// before it closes. Tracking the zone keeps the window on the session all year.
+export const SESSION_TZ = "Europe/London";
+export const SESSION_START_HOUR = 7; // London local, inclusive
+export const SESSION_END_HOUR = 15; // London local, exclusive
 
 // Bars of history needed before the first evaluable signal: the 200 SMMA plus the
 // 50-period RSI SMMA stacked on top of a 14-period RSI, plus slack.
@@ -198,11 +205,34 @@ export function splitCandles(candles, now = new Date()) {
   return { closed: candles, forming: null };
 }
 
+const WEEKDAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+/**
+ * Hour and weekday as they read in London, for an instant given in UTC.
+ *
+ * hourCycle "h23" is deliberate: the default for en-GB is h12/h24 depending on the
+ * runtime's ICU build, and h24 renders midnight as "24", which would silently fall
+ * outside every hour comparison below.
+ *
+ * The weekday is read in London too, not UTC. Those disagree either side of
+ * midnight, and a Friday-night/Saturday-morning boundary read in the wrong zone is
+ * exactly the sort of thing that lets a weekend bar through.
+ */
+export function londonTimeParts(date) {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: SESSION_TZ,
+    hour: "2-digit",
+    hourCycle: "h23",
+    weekday: "short",
+  }).formatToParts(date);
+  const hour = Number(parts.find((p) => p.type === "hour").value);
+  const weekday = WEEKDAY_INDEX[parts.find((p) => p.type === "weekday").value];
+  return { hour, weekday };
+}
+
 export function inSession(timeStr) {
-  const d = parseUTC(timeStr);
-  const day = d.getUTCDay(); // 0=Sunday .. 6=Saturday
-  if (day === 0 || day === 6) return false;
-  const hour = d.getUTCHours();
+  const { hour, weekday } = londonTimeParts(parseUTC(timeStr));
+  if (weekday === 0 || weekday === 6) return false;
   return hour >= SESSION_START_HOUR && hour < SESSION_END_HOUR;
 }
 

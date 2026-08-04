@@ -52,7 +52,7 @@ being forward-tested. All seven gates must hold on a closed 5-minute candle:
 
 | Gate | Rule |
 |---|---|
-| Session | 07:00–15:00 UTC, Monday–Friday |
+| Session | 07:00–15:00 **London local**, Monday–Friday |
 | Trend stack | SMMA 21/50/200 in order, each separated by at least `minDist` |
 | Trend strength | ADX(14) > 25 |
 | Volatility | ATR(14) > 70% of its own 50-bar average |
@@ -81,6 +81,23 @@ a timer, not a signal.
 
 The close pass only spends an API call on pairs the early pass actually flagged,
 which is what makes two passes per candle affordable on the free tier at all.
+
+### The session tracks London, not a fixed UTC offset
+
+The strategy doc writes the window as "7:00–15:00 UTC", but those are the same
+thing for only half the year — London runs UTC+1 under BST from late March to
+late October:
+
+| | 07:00–15:00 London is… |
+|---|---|
+| Winter (GMT) | 07:00–15:00 UTC |
+| Summer (BST) | 06:00–14:00 UTC |
+
+Pinned to UTC, the window would every summer start an hour after London opens
+and stop an hour before it closes — drifting off the session it is named after,
+twice a year, silently. Both the Worker (`Europe/London` via `Intl`) and
+`pine/tma-trend-scalper.pine` (a `time()` session string with the same zone)
+track the zone instead, so the chart and the bot stay in agreement year-round.
 
 > **Note on the earlier version of this bot.** It alerted on a simpler setup:
 > the same 21/50/200 stack, pattern and `RSI > 50`, over an 08:00–02:30 London
