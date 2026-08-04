@@ -59,6 +59,12 @@ const OUTPUT_SIZE = 400; // > MIN_BARS (200 SMMA + 50-period RSI SMMA + slack)
 // Which cron fired. wrangler.toml registers the early pass first.
 const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 
+// Bumped whenever the deployed behaviour changes, and reported by /?health=1. Without
+// a marker like this there is no way to tell a Worker running new code from one still
+// serving a stale deployment - the dashboard shows a version hash that means nothing
+// against a git commit.
+const BUILD = "tma-vfinal-2026-08-04-two-pass";
+
 // QuickChart renders the chart server-side. No account and no API key, which is the
 // whole reason it is here rather than chart-img - see fetchChartImage below. If the
 // call fails for any reason the alert still goes out as text; a missing picture must
@@ -425,9 +431,44 @@ export default {
 
   async fetch(request, env) {
     const url = new URL(request.url);
+
+    // UNAUTHENTICATED HEALTH CHECK, and why it has to be unauthenticated: every other
+    // endpoint needs WEBHOOK_SECRET, so when that binding goes missing there is no way
+    // in to find out that it is missing. The first Git deploy did exactly that - it
+    // stripped the Secrets Store bindings, and the only symptom available was a bare
+    // "Unauthorized", indistinguishable from mistyping the password.
+    //
+    // It reports which bindings EXIST and what code is running. Never any value, never
+    // any market data - a binding name and a boolean give an attacker nothing they
+    // could not guess from the public repo.
+    if (url.searchParams.get("health") === "1") {
+      return Response.json({
+        build: BUILD,
+        bindings: {
+          WEBHOOK_SECRET: Boolean(await resolveSecret(env.WEBHOOK_SECRET)),
+          TELEGRAM_BOT_TOKEN: Boolean(await resolveSecret(env.TELEGRAM_BOT_TOKEN)),
+          TELEGRAM_CHAT_ID: Boolean(await resolveSecret(env.TELEGRAM_CHAT_ID)),
+          TWELVEDATA_API_KEY: Boolean(await resolveSecret(env.TWELVEDATA_API_KEY)),
+          ALERT_STATE_KV: Boolean(env.ALERT_STATE),
+        },
+        pairs: PAIRS.map((p) => p.symbol),
+        session: `${SESSION_START_HOUR}:00-${SESSION_END_HOUR}:00 Europe/London, Mon-Fri`,
+      });
+    }
+
     const secret = url.searchParams.get("secret");
     const expected = await resolveSecret(env.WEBHOOK_SECRET);
-    if (!expected || secret !== expected) return new Response("Unauthorized", { status: 401 });
+    // Two different failures, two different fixes. Collapsing them into one message
+    // sent us chasing a wrong password when the binding was simply gone.
+    if (!expected) {
+      return new Response(
+        "WEBHOOK_SECRET is not bound to this Worker - nothing to check the URL against.\n" +
+        "This is a deploy/config problem, not a wrong password.\n" +
+        "Try /?health=1 to see which bindings are missing.", { status: 503 });
+    }
+    if (secret !== expected) {
+      return new Response("Unauthorized - WEBHOOK_SECRET is bound, but the ?secret= in this URL does not match it.", { status: 401 });
+    }
 
     if (url.searchParams.get("ping") === "1") {
       await sendText(env, "✅ TMA Trend Scalper alert worker is alive.");
