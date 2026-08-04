@@ -465,11 +465,26 @@ export default {
           const { closed, forming } = splitCandles(candles);
           const onClosed = evaluateTMA(closed, { minDist: pair.minDist });
           const onForming = forming ? evaluateTMA(candles, { minDist: pair.minDist }) : null;
+          // DATA FRESHNESS, measured rather than assumed. Being early is the entire
+          // point of the FORMING alert, so the two numbers that decide whether it can
+          // work at all are reported here instead of taken on trust:
+          //   formingBar null  -> the feed only publishes bars after they close, so
+          //                       there is nothing to warn about early and the early
+          //                       pass can never fire. Not a bug in the strategy.
+          //   feedLagSeconds   -> how stale the newest bar is versus the wall clock.
+          //                       A lag near or above the 2-minute head start means
+          //                       the "early" warning is not actually early.
+          const newest = candles.at(-1);
+          const feedLagSeconds = newest
+            ? Math.round((Date.now() - parseUTC(newest.time).getTime()) / 1000)
+            : null;
           rows.push({
             symbol: pair.symbol,
             closedBar: closed.at(-1)?.time,
             formingBar: forming?.time ?? null,
             minsToClose: forming ? Number(minutesToClose(forming).toFixed(1)) : null,
+            newestBar: newest?.time ?? null,
+            feedLagSeconds,
             closed: onClosed.ok ? { side: onClosed.side, blockedBy: firstBlockingGate(onClosed.gates), gates: onClosed.gates, adx: Number(onClosed.values.adx.toFixed(1)), rsi: Number(onClosed.values.rsi.toFixed(1)), rsiSmma: Number(onClosed.values.rsiSmma.toFixed(1)) } : onClosed.reason,
             forming: onForming?.ok ? { side: onForming.side, blockedBy: firstBlockingGate(onForming.gates) } : null,
           });

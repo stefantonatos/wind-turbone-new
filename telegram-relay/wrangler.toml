@@ -31,3 +31,39 @@ crons = [
 [[kv_namespaces]]
 binding = "ALERT_STATE"
 id = "68f5be9ec3a54af2b7bbcbde75d7a9f1"
+
+# SECRETS STORE BINDINGS - and why they have to be declared here.
+#
+# There are two kinds of secret on a Worker and they behave differently under a
+# deploy. Plain Worker secrets (`wrangler secret put`) live on the worker itself,
+# are not in this file, and survive a deploy untouched. SECRETS STORE bindings are
+# account-level entries that the worker is *linked* to, and that link is config -
+# it lives here. A deploy applies this file wholesale, so a deploy from a config
+# that does not declare them REMOVES the links.
+#
+# That is exactly what happened on the first Git deploy: all four bindings vanished
+# and every request came back Unauthorized, because env.WEBHOOK_SECRET was suddenly
+# undefined. The values were never lost - they are account-level and were sitting in
+# the store the whole time - but the worker could no longer see them.
+#
+# store_id and secret_name are identifiers, not values. The secrets themselves stay
+# in Cloudflare and never appear in this repo.
+[[secrets_store_secrets]]
+binding = "TELEGRAM_BOT_TOKEN"
+store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
+secret_name = "TELEGRAM_BOT_TOKEN"
+
+[[secrets_store_secrets]]
+binding = "TELEGRAM_CHAT_ID"
+store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
+secret_name = "TELEGRAM_CHAT_ID"
+
+[[secrets_store_secrets]]
+binding = "TWELVEDATA_API_KEY"
+store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
+secret_name = "TWELVEDATA_API_KEY"
+
+[[secrets_store_secrets]]
+binding = "WEBHOOK_SECRET"
+store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
+secret_name = "WEBHOOK_SECRET"
