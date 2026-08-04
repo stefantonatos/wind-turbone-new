@@ -68,7 +68,7 @@ const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 // a marker like this there is no way to tell a Worker running new code from one still
 // serving a stale deployment - the dashboard shows a version hash that means nothing
 // against a git commit.
-const BUILD = "tma-vfinal-2026-08-04-two-pass";
+const BUILD = "tma-base-2026-08-04-no-extra-filters";
 
 // QuickChart renders the chart server-side. No account and no API key, which is the
 // whole reason it is here rather than chart-img - see fetchChartImage below. If the
