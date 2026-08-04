@@ -47,10 +47,33 @@ import {
 //
 // `minDist` is the strategy's own per-pair SMMA separation. It is an ABSOLUTE price
 // distance, so JPY pairs need a different number, not a scaled one.
+//
+// `spreadPips` is a typical retail round-trip spread, used ONLY to warn when a stop
+// is too tight to be real. It is not a cost model - the backtester has one of those.
 const PAIRS = [
-  { symbol: "AUD/USD", pip: 0.0001, minDist: 0.001 },
-  { symbol: "EUR/USD", pip: 0.0001, minDist: 0.001 },
+  { symbol: "AUD/USD", pip: 0.0001, minDist: 0.001, spreadPips: 1.2 },
+  { symbol: "EUR/USD", pip: 0.0001, minDist: 0.001, spreadPips: 0.8 },
 ];
+
+// SIZING GUARD RAILS, added after a live alert asked for 9.60 lots on a 1.4 pip stop.
+//
+// The stop is 2x the signal candle's own range. On a bar that is three minutes old
+// and has moved 0.7 pips, that is a 1.4 pip stop - and since lots = risk / stop, a
+// stop approaching zero sends the size to infinity. The £99.97 of risk was correct;
+// the position needed to carry it was 960,000 AUD, about 67:1 on a £10,000 account.
+// Two things were wrong with it and neither was the arithmetic:
+//
+//   1. No broker would accept it. UK retail leverage on major FX is capped at 30:1.
+//   2. A 1.4 pip stop sits INSIDE the ~1.2 pip spread. Entry alone puts the trade
+//      most of the way to its stop, so it is not a stop, it is a coin flip on the
+//      first tick.
+//
+// So the size is capped at MAX_LEVERAGE and the alert says when the cap bit, and a
+// stop under MIN_STOP_SPREAD_MULT x the spread is called out as untradeable rather
+// than quietly sized up. The strategy's own stop rule is NOT changed - that belongs
+// in the backtest, not in a patch to the alerter.
+const MAX_LEVERAGE = 30;
+const MIN_STOP_SPREAD_MULT = 3;
 
 // The base strategy has no daily cap - that was one of the added rules, so it comes
 // off with the rest of them. Expect more than one alert per pair per day now; that is
@@ -68,7 +91,7 @@ const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 // a marker like this there is no way to tell a Worker running new code from one still
 // serving a stale deployment - the dashboard shows a version hash that means nothing
 // against a git commit.
-const BUILD = "tma-base-2026-08-04-no-extra-filters";
+const BUILD = "tma-base-2026-08-04-sizing-guards";
 
 // QuickChart renders the chart server-side. No account and no API key, which is the
 // whole reason it is here rather than chart-img - see fetchChartImage below. If the
@@ -149,14 +172,24 @@ async function accountToUsd(env, apiKey, currency) {
  * Rounded DOWN to the broker's 0.01 step, so the rounding always risks slightly less
  * than intended rather than slightly more.
  */
-function computeLots({ balance, riskPct, toUsd, stopDistance, pip }) {
+export function computeLots({ balance, riskPct, toUsd, stopDistance, pip, price, spreadPips }) {
   if (!toUsd || !(stopDistance > 0)) return null;
   const riskAccount = balance * (riskPct / 100);
   const riskUsd = riskAccount * toUsd;
   const stopPips = stopDistance / pip;
   const usdPerPipPerLot = LOT_UNITS * pip;
   const raw = riskUsd / (stopPips * usdPerPipPerLot);
-  const lots = Math.floor(raw / MIN_LOT) * MIN_LOT;
+
+  // Leverage cap. On a USD-quoted pair one lot is LOT_UNITS of base currency, worth
+  // LOT_UNITS x price in USD, and the account converts to USD at `toUsd`. Both sides
+  // are in USD here on purpose - comparing a GBP balance against a USD notional is
+  // how a 30:1 cap silently becomes 40:1.
+  const capped = price > 0
+    ? (MAX_LEVERAGE * balance * toUsd) / (LOT_UNITS * price)
+    : Infinity;
+  const wanted = Math.min(raw, capped);
+
+  const lots = Math.floor(wanted / MIN_LOT) * MIN_LOT;
   return {
     lots: Number(lots.toFixed(2)),
     rawLots: raw,
@@ -165,7 +198,15 @@ function computeLots({ balance, riskPct, toUsd, stopDistance, pip }) {
     riskUsd,
     // What the rounded-down size actually risks - not what was asked for.
     actualRiskUsd: lots * stopPips * usdPerPipPerLot,
-    belowMinimum: raw < MIN_LOT,
+    belowMinimum: wanted < MIN_LOT,
+    // Reported so the message can say the size was cut and why, rather than showing a
+    // number that no longer matches the stated 1% and letting you work it out.
+    leverageCapped: raw > capped,
+    maxLotsAtCap: capped,
+    notionalUsd: lots * LOT_UNITS * price,
+    // A stop this tight is not a stop. Flagged, never silently sized around.
+    stopInsideSpread: spreadPips > 0 && stopPips < spreadPips * MIN_STOP_SPREAD_MULT,
+    spreadPips,
   };
 }
 
@@ -455,11 +496,29 @@ function sizeLines(sizing, cfg) {
     ];
   }
   const actualPct = (sizing.actualRiskUsd / cfg.toUsd / cfg.balance) * 100;
-  return [
+  const lines = [
     "",
     `*Lot size* \`${sizing.lots.toFixed(2)}\`  (${sizing.stopPips.toFixed(1)} pip stop)`,
     `Risks ${cfg.symbolCcy}${(sizing.actualRiskUsd / cfg.toUsd).toFixed(2)} of ${cfg.symbolCcy}${cfg.balance.toLocaleString()} = ${actualPct.toFixed(2)}%`,
   ];
+
+  // The two ways this number can be a lie, each said plainly rather than left for you
+  // to notice from the size looking odd.
+  if (sizing.stopInsideSpread) {
+    lines.push(
+      "",
+      `\u{26D4} *DO NOT TRADE — the stop is inside the spread.*`,
+      `${sizing.stopPips.toFixed(1)} pip stop vs a ~${sizing.spreadPips} pip spread. You would be most of the way to the stop the moment you enter.`,
+      `The signal candle was only ${(sizing.stopPips / 2).toFixed(1)} pips tall, and the stop is 2x that.`);
+  }
+  if (sizing.leverageCapped) {
+    lines.push(
+      "",
+      `\u{26A0}️ *Size capped at ${MAX_LEVERAGE}:1 leverage.*`,
+      `1% of the account wanted ${sizing.rawLots.toFixed(2)} lots; the cap allows ${sizing.maxLotsAtCap.toFixed(2)}.`,
+      `Actual risk above is what ${sizing.lots.toFixed(2)} lots really risks — less than ${cfg.riskPct}%.`);
+  }
+  return lines;
 }
 
 const outsideLondonNote = (result) => (result.inLondonSession ? [] : [
@@ -558,6 +617,7 @@ async function earlyPass(env) {
       const sizing = computeLots({
         balance: cfg.balance, riskPct: cfg.riskPct, toUsd: cfg.toUsd,
         stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
+        price: result.levels.entry, spreadPips: pair.spreadPips,
       });
       const delivery = await deliver(env, formingMessage(pair, result, minsLeft, sizing, cfg), result.levels, pair.symbol, candles, result.side);
 
@@ -612,6 +672,7 @@ async function closePass(env) {
         const sizing = computeLots({
           balance: cfg.balance, riskPct: cfg.riskPct, toUsd: cfg.toUsd,
           stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
+          price: result.levels.entry, spreadPips: pair.spreadPips,
         });
         const delivery = await deliver(env, confirmedMessage(pair, result, sizing, cfg), result.levels, pair.symbol, closed, result.side);
         await env.ALERT_STATE.put(`${pair.symbol}:day:${dayStamp(last.time)}`, "1", { expirationTtl: 60 * 60 * 36 });

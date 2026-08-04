@@ -3,28 +3,23 @@
 // Position sizing. Every other bug in this repo produces a wrong message; this one
 // produces a wrong trade, so the numbers are checked against hand-worked arithmetic
 // rather than against themselves.
+//
+// THIS IMPORTS THE REAL FUNCTION. It used to hold a copy of computeLots with a
+// comment saying "mirrors src/index.js", which meant the suite was testing the copy:
+// the leverage cap and the spread check were added to the real one and every test
+// here still passed, green and meaningless. A test that re-implements its subject
+// verifies nothing except that the author can type it twice.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-const MIN_LOT = 0.01;
-const LOT_UNITS = 100000;
+import { computeLots } from "../src/index.js";
 
-// Mirrors computeLots in src/index.js.
-function computeLots({ balance, riskPct, toUsd, stopDistance, pip }) {
-  if (!toUsd || !(stopDistance > 0)) return null;
-  const riskAccount = balance * (riskPct / 100);
-  const riskUsd = riskAccount * toUsd;
-  const stopPips = stopDistance / pip;
-  const usdPerPipPerLot = LOT_UNITS * pip;
-  const raw = riskUsd / (stopPips * usdPerPipPerLot);
-  const lots = Math.floor(raw / MIN_LOT) * MIN_LOT;
-  return {
-    lots: Number(lots.toFixed(2)), rawLots: raw, stopPips, riskAccount, riskUsd,
-    actualRiskUsd: lots * stopPips * usdPerPipPerLot,
-    belowMinimum: raw < MIN_LOT,
-  };
-}
+const MIN_LOT = 0.01;
+
+// --- the original arithmetic ------------------------------------------------
+// No `price` is passed in these, so the leverage cap is inactive and they measure
+// the risk maths alone, exactly as before.
 
 test("worked example: 10k GBP, 1%, 20-pip stop on a USD-quoted pair", () => {
   // £10,000 x 1% = £100. At 1.27 that is $127.
@@ -80,4 +75,58 @@ test("JPY pip size is handled, not assumed to be 0.0001", () => {
   const r = computeLots({ balance: 10000, riskPct: 1, toUsd: 1.27, stopDistance: 0.20, pip: 0.01 });
   assert.equal(r.stopPips, 20);
   assert.ok(r.rawLots > 0 && Number.isFinite(r.rawLots));
+});
+
+// --- guard rails ------------------------------------------------------------
+// Taken from a real alert: AUD/USD, entry 0.70403, stop 0.70389. A 1.4 pip stop, and
+// the message that went out asked for 9.60 lots - 960,000 AUD against a £10,000
+// account. The risk arithmetic was right; the trade was impossible.
+
+const LIVE = {
+  balance: 10000, riskPct: 1, toUsd: 1.345, pip: 0.0001,
+  price: 0.70403, spreadPips: 1.2,
+};
+
+test("the live 1.4 pip stop is flagged as inside the spread", () => {
+  const r = computeLots({ ...LIVE, stopDistance: 0.00014 });
+  assert.equal(r.stopPips.toFixed(1), "1.4");
+  assert.equal(r.stopInsideSpread, true,
+    "1.4 pips against a 1.2 pip spread is not a stop and must be called out");
+});
+
+test("a normal stop on the same pair is neither capped nor flagged", () => {
+  const r = computeLots({ ...LIVE, stopDistance: 0.0012 }); // 12 pips
+  assert.equal(r.stopInsideSpread, false);
+  assert.equal(r.leverageCapped, false);
+  const pct = (r.actualRiskUsd / LIVE.toUsd / LIVE.balance) * 100;
+  assert.ok(pct > 0.9 && pct <= 1.0, `should still risk ~1%, got ${pct}%`);
+});
+
+test("leverage is capped at 30:1 instead of the 9.60 lots the risk maths asked for", () => {
+  const r = computeLots({ ...LIVE, stopDistance: 0.00014 });
+  // The number that actually went out in the alert.
+  assert.ok(r.rawLots > 9 && r.rawLots < 10, `rawLots ${r.rawLots}`);
+  assert.equal(r.leverageCapped, true);
+  assert.ok(r.lots < r.rawLots, "the capped size must be smaller than the requested size");
+
+  // Both sides in USD on purpose - a GBP balance against a USD notional turns a 30:1
+  // cap into roughly 40:1 without anything looking wrong.
+  const accountUsd = LIVE.balance * LIVE.toUsd;
+  assert.ok(r.notionalUsd <= accountUsd * 30 + 1e-6,
+    `notional $${r.notionalUsd} exceeds 30x $${accountUsd}`);
+});
+
+test("a capped trade reports what it REALLY risks, not the 1% that was requested", () => {
+  const r = computeLots({ ...LIVE, stopDistance: 0.00014 });
+  const pct = (r.actualRiskUsd / LIVE.toUsd / LIVE.balance) * 100;
+  // Once the cap bites the position can no longer carry the intended risk. Reporting
+  // "1%" at that point would be the message lying about the trade it just sent.
+  assert.ok(pct < 1.0, `capped trade should risk less than 1%, got ${pct}%`);
+});
+
+test("omitting price leaves the cap inactive, so old call sites are unaffected", () => {
+  const r = computeLots({ balance: 10000, riskPct: 1, toUsd: 1.345, stopDistance: 0.00014, pip: 0.0001 });
+  assert.equal(r.leverageCapped, false);
+  assert.equal(r.stopInsideSpread, false);
+  assert.ok(Math.abs(r.lots - Math.floor(r.rawLots / MIN_LOT) * MIN_LOT) < 1e-9);
 });
