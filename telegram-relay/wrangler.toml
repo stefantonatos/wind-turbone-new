@@ -32,38 +32,27 @@ crons = [
 binding = "ALERT_STATE"
 id = "68f5be9ec3a54af2b7bbcbde75d7a9f1"
 
-# SECRETS STORE BINDINGS - and why they have to be declared here.
+# SECRETS ARE DELIBERATELY NOT DECLARED IN THIS FILE.
 #
-# There are two kinds of secret on a Worker and they behave differently under a
-# deploy. Plain Worker secrets (`wrangler secret put`) live on the worker itself,
-# are not in this file, and survive a deploy untouched. SECRETS STORE bindings are
-# account-level entries that the worker is *linked* to, and that link is config -
-# it lives here. A deploy applies this file wholesale, so a deploy from a config
-# that does not declare them REMOVES the links.
+# Cloudflare has two kinds, and only one of them survives this deploy model:
 #
-# That is exactly what happened on the first Git deploy: all four bindings vanished
-# and every request came back Unauthorized, because env.WEBHOOK_SECRET was suddenly
-# undefined. The values were never lost - they are account-level and were sitting in
-# the store the whole time - but the worker could no longer see them.
+#   Plain Worker secrets - set once in the dashboard (Variables and Secrets -> add,
+#     type Secret) or via `wrangler secret put`. They live ON the worker, are not
+#     config, and a deploy does not touch them. `env.NAME` is a plain string.
 #
-# store_id and secret_name are identifiers, not values. The secrets themselves stay
-# in Cloudflare and never appear in this repo.
-[[secrets_store_secrets]]
-binding = "TELEGRAM_BOT_TOKEN"
-store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
-secret_name = "TELEGRAM_BOT_TOKEN"
-
-[[secrets_store_secrets]]
-binding = "TELEGRAM_CHAT_ID"
-store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
-secret_name = "TELEGRAM_CHAT_ID"
-
-[[secrets_store_secrets]]
-binding = "TWELVEDATA_API_KEY"
-store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
-secret_name = "TWELVEDATA_API_KEY"
-
-[[secrets_store_secrets]]
-binding = "WEBHOOK_SECRET"
-store_id = "7b939d7f084e45d1bfd60d73858ad1bd"
-secret_name = "WEBHOOK_SECRET"
+#   Secrets Store bindings - account-level entries the worker is LINKED to. The link
+#     is config. A deploy applies this file wholesale, so any deploy from a config
+#     that omits them removes the links.
+#
+# This worker started on Secrets Store, and the first Git deploy silently unbound all
+# four - every request returned Unauthorized because env.WEBHOOK_SECRET had become
+# undefined, while the values themselves sat untouched in the account-level store.
+# Declaring [[secrets_store_secrets]] here to restore the links did not work either;
+# /?health=1 still reported every binding false after a successful deploy.
+#
+# Rather than keep debugging a binding mechanism that is fighting the deploy model,
+# the four secrets are now plain Worker secrets. They cannot be removed by a deploy,
+# they need nothing in this file, and there is no store id to keep in sync. The
+# one-time cost was re-entering four values; the recurring cost is zero.
+#
+# resolveSecret() in src/index.js still accepts both shapes, so either kind works.
