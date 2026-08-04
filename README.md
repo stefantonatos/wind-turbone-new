@@ -180,6 +180,28 @@ would actually be managed.
 
 ## 3. Deploy the relay (Cloudflare Worker, free tier)
 
+**This worker deploys itself from GitHub.** Cloudflare Workers Builds is connected
+to this repo, so a push to the deploy branch builds and ships automatically - no
+terminal, which matters because the account is driven from an iPhone.
+
+| setting | value | why |
+|---|---|---|
+| Worker name | `tmarsi` | must match the existing worker, or wrangler creates a second one and the old bot keeps alerting alongside the new one |
+| Root directory | `telegram-relay` | `wrangler.toml` lives in this subfolder, not at the repo root |
+| Branch | `claude/hello-k2yenv` | where the code is; `main` does not have it |
+| Deploy command | `npx wrangler deploy` | default, no build step needed |
+
+Two things that are easy to get wrong:
+
+- **Connecting the repo does not trigger a build.** Workers Builds fires on the next
+  push after connecting; it does not backfill. If the Deployments tab says "No builds
+  exist yet", push any commit.
+- **Secrets are not in the repo and are not touched by a deploy.** They live in
+  Cloudflare and survive redeploys, so they are set once. `wrangler.toml` carries only
+  non-secret config - the KV namespace id is an identifier, not a credential.
+
+### Setting the secrets (one time)
+
 ```bash
 cd telegram-relay
 npm install
