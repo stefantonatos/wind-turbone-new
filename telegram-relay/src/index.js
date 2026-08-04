@@ -91,7 +91,7 @@ const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 // a marker like this there is no way to tell a Worker running new code from one still
 // serving a stale deployment - the dashboard shows a version hash that means nothing
 // against a git commit.
-const BUILD = "tma-base-2026-08-04-text-first";
+const BUILD = "tma-base-2026-08-04-chart-timezones";
 
 // QuickChart renders the chart server-side. No account and no API key, which is the
 // whole reason it is here rather than chart-img - see fetchChartImage below. If the
@@ -324,13 +324,31 @@ function chartConfig(symbol, candles, levels, side, { candlestick }) {
   });
 
 
+  // Both zones spelled out for the signal bar, so the picture can be lined up against
+  // a TradingView chart on any timezone setting without arithmetic.
+  const lastAt = new Date(at[at.length - 1]);
+  const hhmm = (tz) => new Intl.DateTimeFormat("en-GB", {
+    timeZone: tz, hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(lastAt);
+  const titleLines = [
+    `${symbol} 5m — ${side}`,
+    `signal bar ${hhmm("UTC")} UTC  ·  ${hhmm("Europe/London")} London  ·  axis is UTC`,
+  ];
+
   const common = {
     // The signal is always the LAST bar, which lands hard against the right-hand
     // y-axis. Without this padding its marker is drawn on top of the axis and reads
     // as missing - the first attempt looked like the marker had not been added at all.
     layout: { padding: { right: 28, top: 4 } },
     plugins: {
-      title: { display: true, text: `${symbol} 5m — ${side}`, color: "#e6edf3", font: { size: 16 } },
+      // THE TITLE CARRIES THE CLOCK, and it has to, because four of them are in play:
+      // QuickChart renders this axis in UTC (measured, not assumed - a 12:20-17:20 UTC
+      // window came back labelled "1 PM" to "5 PM"), the strategy's session is London,
+      // and the phone reading the alert is on neither. Comparing this picture against
+      // a TradingView chart on a third zone made the bot look two hours stale when it
+      // was thirty seconds behind. Bare "HH:mm" on an axis is not a time; a time needs
+      // its zone attached.
+      title: { display: true, text: titleLines, color: "#e6edf3", font: { size: 14 } },
       legend: { labels: { color: "#9aa7b8", boxWidth: 12, font: { size: 10 } } },
     },
     scales: {
