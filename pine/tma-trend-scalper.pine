@@ -35,7 +35,11 @@ showLevels = input.bool(true, "Draw entry/SL/TP on signals", group="Levels")
 
 sessWindow = input.session("0700-1500", "Session (London local time)", group="Session",
      tooltip="London LOCAL, not UTC. The two agree only in winter: London runs UTC+1 under BST from late March to late October, so a UTC-pinned window slides an hour off the session every year.")
-useSession = input.bool(true, "Restrict to session", group="Session")
+// DEFAULT OFF, to match the live worker. tma-strategy.js currently runs
+// SESSION_START_HOUR=0 / SESSION_END_HOUR=24, so leaving this on made the chart
+// refuse signals the bot would happily alert on - the two disagreeing is the exact
+// failure this pairing exists to catch. Turn both back on together, never one.
+useSession = input.bool(false, "Restrict to session", group="Session")
 
 // The reference's written spec and its code disagree here. Spec: the fourth candle
 // closes beyond "the open of the 1st red candle" (open[3]) - i.e. one candle undoes
