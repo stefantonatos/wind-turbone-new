@@ -29,21 +29,26 @@ import {
 
 // TwelveData free tier: 800 requests/day, 8/minute.
 //
-// BUDGET. The session gate is currently WIDE OPEN (all hours, see tma-strategy.js),
-// which triples what the 07:00-15:00 window cost and forces the pair count down:
+// BUDGET, recomputed for two reasons at once:
 //
-//   24h x 12 fires/h = 288 early fires/day
-//     x 2 pairs =   576/day  fits, ~200 spare
-//     x 3 pairs =   864/day  OVER - goes silent partway through the day
-//     x 6 pairs = 1,728/day  OVER by more than the entire cap
+//   1. Session is back to 07:00-15:00 London (8h/weekday), not all-hours - a 3x cut.
+//   2. closePass no longer skips pairs the early pass didn't flag (see closePass for
+//      why that was a real bug, not a saving) - so it now costs the SAME as the early
+//      pass, not "free most of the time" the way the old budget comment assumed.
 //
-// So all-hours and six pairs cannot both hold. Hours were the explicit ask, so the
-// pair list pays for it: AUD/USD (the strategy's own recommended pair) and EUR/USD.
-// Restoring the 07:00-15:00 window frees the budget for six again.
+//   8h x 12 fires/h = 96 fires/day, PER PASS, and there are two passes:
+//     96 x 2 passes x pairs = 192 x pairs calls/day (weekdays; weekends fetch nothing)
 //
-// Going silent is the failure that matters here - the quota runs out mid-morning and
-// the bot simply stops alerting, with nothing to say it has. ?debug=1 reports
-// quotaUsedToday against the cap so that state is visible rather than inferred.
+//     x 3 pairs =   576/day  fits, ~220 spare
+//     x 4 pairs =   768/day  fits, ~30 spare - tight, but London-only is a hard
+//                            floor under the cap either way, unlike all-hours x 3+.
+//     x 6 pairs = 1,152/day  OVER even under London-only, now that close pass is not
+//                            free - six needs either fewer fires/bar or a paid tier.
+//
+// Four pairs, chosen for London-session liquidity: the original two plus GBP/USD (the
+// London session's own currency) and NZD/USD. ?debug=1 reports quotaUsedToday against
+// the cap - going silent mid-session is the failure that matters, so that number is
+// worth a glance if alerts feel like they've gone quiet.
 //
 // `minDist` is the strategy's own per-pair SMMA separation. It is an ABSOLUTE price
 // distance, so JPY pairs need a different number, not a scaled one.
@@ -53,6 +58,8 @@ import {
 const PAIRS = [
   { symbol: "AUD/USD", pip: 0.0001, minDist: 0.001, spreadPips: 1.2 },
   { symbol: "EUR/USD", pip: 0.0001, minDist: 0.001, spreadPips: 0.8 },
+  { symbol: "GBP/USD", pip: 0.0001, minDist: 0.001, spreadPips: 1.0 },
+  { symbol: "NZD/USD", pip: 0.0001, minDist: 0.001, spreadPips: 1.8 },
 ];
 
 // SIZING GUARD RAILS, added after a live alert asked for 9.60 lots on a 1.4 pip stop.
@@ -91,7 +98,7 @@ const CRON_EARLY = "3,8,13,18,23,28,33,38,43,48,53,58 * * * *";
 // a marker like this there is no way to tell a Worker running new code from one still
 // serving a stale deployment - the dashboard shows a version hash that means nothing
 // against a git commit.
-const BUILD = "tma-base-2026-08-04-chart-timezones";
+const BUILD = "tma-base-2026-08-04-close-pass-fix";
 
 // QuickChart renders the chart server-side. No account and no API key, which is the
 // whole reason it is here rather than chart-img - see fetchChartImage below. If the
@@ -244,9 +251,13 @@ async function quotaUsed(env) {
   return Number((await env.ALERT_STATE.get(key)) || 0);
 }
 
-// How many bars of context the chart shows. Enough to read the swing that produced
-// the setup without shrinking the signal candle to a hairline.
-const CHART_BARS = 60;
+// How many bars of context the chart shows. Was 60 on a 900px-wide image - once the
+// axis, its labels and the right-side padding are subtracted, that is roughly 13px
+// per candle, which is a hairline on a phone screen and exactly the "can't tell"
+// complaint. Fewer bars, bigger image: ~830px of usable plot / 32 bars = ~26px each,
+// more than double the width per candle, still enough bars either side of the signal
+// to read the swing that produced it.
+const CHART_BARS = 32;
 
 /**
  * X AXIS, and the trap that cost a render.
@@ -431,8 +442,12 @@ async function fetchChartImage(env, symbol, candles, levels, side) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chart: chartConfig(symbol, candles, levels, side, { candlestick }),
-        width: 900,
-        height: 500,
+        width: 1200,
+        height: 640,
+        // Rendered at 2x and let Telegram scale down, rather than rendered at 1x and
+        // stretched up - the second one is what "squashed" looks like on a retina
+        // phone screen even when the layout math is fine.
+        devicePixelRatio: 2,
         format: "png",
         backgroundColor: "#0a0e17",
         version: "4",
@@ -584,11 +599,18 @@ function formingMessage(pair, result, minsLeft, closeAt, sizing, cfg) {
   ].join("\n");
 }
 
-function confirmedMessage(pair, result, sizing, cfg) {
+function confirmedMessage(pair, result, sizing, cfg, { warned = false } = {}) {
   const arrow = result.side === "BUY" ? "\u{1F7E2}" : "\u{1F534}";
   const ageMin = Math.round((Date.now() - parseUTC(result.values.time).getTime()) / 60000);
+  // "CONFIRMED" only means something if there was an earlier warning to confirm.
+  // Most signals now arrive with no warning before them, because most patterns cannot
+  // exist until the bar closes - calling those "confirmed" would imply a heads-up that
+  // was never sent.
+  const heading = warned
+    ? `\u{2705} *CONFIRMED — ${result.side}* ${arrow} ${pair.symbol}  \`5m closed\``
+    : `\u{1F6A8} *SIGNAL — ${result.side}* ${arrow} ${pair.symbol}  \`5m closed\``;
   return [
-    `\u{2705} *CONFIRMED — ${result.side}* ${arrow} ${pair.symbol}  \`5m closed\``,
+    heading,
     "",
     ...levelLines(pair, result.levels),
     "",
@@ -686,16 +708,37 @@ async function earlyPass(env) {
 // PASS 2 - confirm or cancel, only for pairs the early pass flagged
 // ---------------------------------------------------------------------------
 
+/**
+ * EVERY PAIR, EVERY BAR. This used to open with
+ *
+ *     const raw = await env.ALERT_STATE.get(`pending:${pair.symbol}`);
+ *     if (!raw) continue;   // nothing flagged - costs no API call, which is the point
+ *
+ * and that one line is why a signal could appear on the chart and the bot say nothing
+ * at all. A pair was only ever scored at the close if the EARLY pass had already
+ * flagged it three minutes before, on a bar that was 60% formed.
+ *
+ * Most of these patterns cannot exist before the close. An engulfing candle is not
+ * engulfing until it has a close to compare; a 3-Line Strike needs the fourth bar's
+ * close to clear open[1]. So the setups that only become true at the close - which is
+ * the ordinary case, not an edge case - were never flagged early, therefore never
+ * checked at the close, therefore never reported. Not late. Never.
+ *
+ * Saving an API call was the stated reason. It was saving them on exactly the bars
+ * that mattered.
+ *
+ * The pending flag still does its old job of telling CONFIRMED from CANCELLED, but it
+ * no longer decides whether to look.
+ */
 async function closePass(env) {
-  if (!env.ALERT_STATE) return [{ skipped: "no KV binding, cannot track pending warnings" }];
+  if (!env.ALERT_STATE) return [{ skipped: "no KV binding, cannot dedupe alerts" }];
   const apiKey = await resolveSecret(env.TWELVEDATA_API_KEY);
   const results = [];
 
   for (const pair of PAIRS) {
     const raw = await env.ALERT_STATE.get(`pending:${pair.symbol}`);
-    if (!raw) continue; // nothing flagged - costs no API call, which is the point
-    const flagged = JSON.parse(raw);
-    await env.ALERT_STATE.delete(`pending:${pair.symbol}`);
+    const flagged = raw ? JSON.parse(raw) : null;
+    if (raw) await env.ALERT_STATE.delete(`pending:${pair.symbol}`);
 
     try {
       const candles = await fetchCandles(pair.symbol, apiKey, env);
@@ -704,27 +747,56 @@ async function closePass(env) {
       // this two-pass split exists to avoid.
       const { closed } = splitCandles(candles);
       const last = closed[closed.length - 1];
-      if (!last || last.time !== flagged.bar) {
-        results.push({ symbol: pair.symbol, skipped: `expected closed bar ${flagged.bar}, newest closed is ${last?.time}` });
+      if (!last) {
+        results.push({ symbol: pair.symbol, skipped: "no closed bar" });
+        continue;
+      }
+
+      // Dedupe on the BAR, not on the pass. The close cron and a manual ?pass=close
+      // can both land on the same bar, and the alert must go out once.
+      const sentKey = `${pair.symbol}:sent:${last.time}`;
+      if (await env.ALERT_STATE.get(sentKey)) {
+        results.push({ symbol: pair.symbol, skipped: `already alerted on ${last.time}` });
         continue;
       }
 
       const result = evaluateTMA(closed, { minDist: pair.minDist });
-      if (result.ok && result.side === flagged.side) {
-        const cfg = sizingConfig(env);
-        cfg.toUsd = await accountToUsd(env, apiKey, cfg.currency);
-        const sizing = computeLots({
-          balance: cfg.balance, riskPct: cfg.riskPct, toUsd: cfg.toUsd,
-          stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
-          price: result.levels.entry, spreadPips: pair.spreadPips,
-        });
-        const delivery = await deliver(env, confirmedMessage(pair, result, sizing, cfg), result.levels, pair.symbol, closed, result.side);
-        await env.ALERT_STATE.put(`${pair.symbol}:day:${dayStamp(last.time)}`, "1", { expirationTtl: 60 * 60 * 36 });
-        results.push({ symbol: pair.symbol, confirmed: result.side, ...delivery });
-      } else {
-        await sendText(env, cancelledMessage(pair, flagged, result));
-        results.push({ symbol: pair.symbol, cancelled: flagged.side, blockedBy: result.ok ? firstBlockingGate(result.gates) : result.reason });
+
+      // A flag that named a DIFFERENT bar is stale - the early pass warned about a bar
+      // that has since been superseded. Cancelling on it would be a message about the
+      // wrong candle, so it is dropped rather than reported against this one.
+      const flagMatches = flagged && flagged.bar === last.time;
+
+      if (!result.ok || !result.side) {
+        if (flagMatches) {
+          await sendText(env, cancelledMessage(pair, flagged, result));
+          results.push({ symbol: pair.symbol, cancelled: flagged.side, blockedBy: result.ok ? firstBlockingGate(result.gates) : result.reason });
+        } else {
+          results.push({ symbol: pair.symbol, noSignal: result.ok ? firstBlockingGate(result.gates) : result.reason });
+        }
+        continue;
       }
+
+      if (flagMatches && flagged.side !== result.side) {
+        await sendText(env, cancelledMessage(pair, flagged, result));
+        results.push({ symbol: pair.symbol, cancelled: flagged.side, blockedBy: `flipped to ${result.side}` });
+        continue;
+      }
+
+      const cfg = sizingConfig(env);
+      cfg.toUsd = await accountToUsd(env, apiKey, cfg.currency);
+      const sizing = computeLots({
+        balance: cfg.balance, riskPct: cfg.riskPct, toUsd: cfg.toUsd,
+        stopDistance: Math.abs(result.levels.entry - result.levels.stop), pip: pair.pip,
+        price: result.levels.entry, spreadPips: pair.spreadPips,
+      });
+      const delivery = await deliver(
+        env, confirmedMessage(pair, result, sizing, cfg, { warned: flagMatches }),
+        result.levels, pair.symbol, closed, result.side);
+
+      await env.ALERT_STATE.put(sentKey, "1", { expirationTtl: 60 * 60 * 2 });
+      await env.ALERT_STATE.put(`${pair.symbol}:day:${dayStamp(last.time)}`, "1", { expirationTtl: 60 * 60 * 36 });
+      results.push({ symbol: pair.symbol, confirmed: result.side, warnedEarly: flagMatches, ...delivery });
     } catch (err) {
       results.push({ symbol: pair.symbol, error: String(err) });
     }

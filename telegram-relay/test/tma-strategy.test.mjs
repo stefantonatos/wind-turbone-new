@@ -164,24 +164,25 @@ test("midnight in London reads as hour 0, never 24", () => {
   assert.equal(londonTimeParts(new Date("2026-01-05T00:30:00Z")).hour, 0);
 });
 
-test("the LIVE gate is currently wide open, but still excludes weekends", () => {
-  // SESSION_START_HOUR/END are temporarily 0-24 so signals can be seen without
-  // waiting for a London morning. Weekends stay shut regardless: forex is closed, so
-  // any "signal" would be assembled from Friday's last bars.
-  assert.equal(inSession("2026-01-05 23:30:00"), true, "23:30 on a Monday now passes");
-  assert.equal(inSession("2026-01-05 03:00:00"), true, "03:00 on a Monday now passes");
+test("the LIVE gate matches the strategy's real 07:00-15:00 London window", () => {
+  // Was wide open (SESSION_START_HOUR/END = 0/24) so the first signals could be seen
+  // without waiting for a London morning; that has happened, and the gate is back to
+  // the real rule. inSession and inLondonSession are now the SAME function in
+  // different clothes - this pins that down explicitly so a future "widen it again
+  // for testing" cannot drift the two apart without a test noticing.
+  assert.equal(inSession("2026-01-05 10:00:00"), true, "10:00 London Monday - in session");
+  assert.equal(inSession("2026-01-05 23:30:00"), false, "23:30 London Monday - outside the window now");
+  assert.equal(inSession("2026-01-05 03:00:00"), false, "03:00 London Monday - outside the window now");
   assert.equal(inSession("2026-01-03 10:00:00"), false, "Saturday still blocked");
   assert.equal(inSession("2026-01-04 10:00:00"), false, "Sunday still blocked");
 });
 
-test("the strategy's real window is still recorded, so alerts can be tagged against it", () => {
-  // Both are true inside 07:00-15:00 London; outside it the live gate passes and the
-  // London one does not, which is exactly the pair the alert text uses to warn that a
-  // signal is not one the strategy would take.
-  assert.equal(inSession("2026-01-05 10:00:00"), true);
-  assert.equal(inLondonSession("2026-01-05 10:00:00"), true);
-  assert.equal(inSession("2026-01-05 03:00:00"), true);
-  assert.equal(inLondonSession("2026-01-05 03:00:00"), false);
+test("the strategy's real window and the live gate agree everywhere, on purpose", () => {
+  // Sampled across the boundary and outside it. If these two constants are ever
+  // widened again independently, this is the test that should turn red.
+  for (const t of ["2026-01-05 06:59:00", "2026-01-05 07:00:00", "2026-01-05 10:00:00", "2026-01-05 14:59:00", "2026-01-05 15:00:00", "2026-01-05 20:00:00"]) {
+    assert.equal(inSession(t), inLondonSession(t), `inSession and inLondonSession disagree at ${t}`);
+  }
 });
 
 // --- setup evaluation ------------------------------------------------------
@@ -217,11 +218,18 @@ test("a weekend setup produces no signal even with the hours wide open", () => {
 });
 
 test("evaluateTMA reports whether the bar was inside the real London window", () => {
+  // The live session gate is back to the real 07:00-15:00 London rule, so a bar at
+  // hour 3 is now rejected outright by `sessionOK`, not merely flagged - this used to
+  // assert it still fired because the gate was temporarily wide open. inLondonSession
+  // itself is unconditional and always tells the truth about the bar regardless of
+  // what the live gate is doing, which is what the second assertion checks.
   const inside = evaluateTMA(addEngulfing(series(1, { hour: 9 }), 1, 9), { minDist: 0.0001 });
   const outside = evaluateTMA(addEngulfing(series(1, { hour: 3 }), 1, 3), { minDist: 0.0001 });
   assert.equal(inside.inLondonSession, true);
+  assert.equal(inside.side, "BUY");
   assert.equal(outside.inLondonSession, false);
-  assert.equal(outside.side, "BUY", "still a signal - the live gate is open");
+  assert.equal(outside.side, null, "hour 3 is outside the live session gate too now, so no signal at all");
+  assert.equal(outside.gates.session, false);
 });
 
 test("RSI must beat its own SMMA, not merely sit above 50", () => {

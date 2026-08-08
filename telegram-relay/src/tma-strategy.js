@@ -55,22 +55,15 @@ export const TARGET_CANDLE_MULT = 4.0;
 // just do not veto a signal while this is false.
 export const EXTRA_FILTERS = false;
 
-// SESSION WINDOW - currently WIDE OPEN, deliberately.
+// SESSION WINDOW - back to the strategy's real rule: 07:00-15:00 London.
 //
-// The strategy's own rule is 07:00-15:00 London. That is still what the backtest and
-// the Pine indicator use, and it is what LONDON_START/LONDON_END below record. The
-// live alerts are temporarily running all hours so signals can actually be seen
-// without waiting for the next London morning.
-//
-// Consequence, stated plainly: an alert outside 07:00-15:00 London is NOT a signal
-// the strategy would take. evaluateTMA still reports whether the bar fell inside the
-// real window (`inLondonSession`) so the alert can say so rather than quietly
-// implying every ping is strategy-sanctioned.
-//
-// To put it back: set SESSION_START_HOUR/SESSION_END_HOUR to 7 and 15.
+// This was WIDE OPEN (all hours) so the first signals could be seen without waiting
+// for a London morning. That has been seen. All-hours also cost 3x the API budget,
+// which was the reason the pair list was stuck at two - restoring the real window
+// frees that budget straight back to more pairs, see PAIRS in index.js.
 export const SESSION_TZ = "Europe/London";
-export const SESSION_START_HOUR = 0;  // London local, inclusive
-export const SESSION_END_HOUR = 24;   // London local, exclusive
+export const SESSION_START_HOUR = 7;  // London local, inclusive
+export const SESSION_END_HOUR = 15;   // London local, exclusive
 
 // The strategy's real window, kept separate so alerts can be tagged against it.
 export const LONDON_START = 7;
